@@ -93,7 +93,7 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 	_asm mov CurrentShaderNum, edx
 	char* LastUnderline;
 	char* FxFilePath;
-	//unsigned int CurrentEffectSize = 0;
+	unsigned int CurrentEffectSize = 0;
 	_asm mov eax, CurrentShaderNum
 	_asm mov eax, ds:0x00A6408C[eax]
 	_asm mov FxFilePath, eax
@@ -107,7 +107,7 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 	if (CheckIfFileExists(FilenameBuf))
 	{
 		HRESULT result;
-		//D3DXCreateBuffer(2048, &pBuffer);
+		D3DXCreateBuffer(2048, &pBuffer);
 		result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
 		if (SUCCEEDED(result))
 		{
@@ -123,10 +123,10 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 
 			// we better keep it in memory instead of writing to disk...
 
-			//ppEffect = *(LPD3DXEFFECT*)(pEffectBuffer + 3);
-			//CurrentEffectSize = *(unsigned int*)(pEffectBuffer + 2);
-			//WriteFileFromMemory("temp_shader.cso", *(void**)(pEffectBuffer + 3), CurrentEffectSize);
-			//result = D3DXCreateEffectFromFile(pDevice, "temp_shader.cso", pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
+			ppEffect = (LPD3DXEFFECT*)(pEffectBuffer + 3);
+			CurrentEffectSize = *(unsigned int*)(pEffectBuffer + 2);
+			WriteFileFromMemory("temp_shader.cso", *(void**)(pEffectBuffer + 3), CurrentEffectSize);
+			result = D3DXCreateEffectFromFile(pDevice, "temp_shader.cso", pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
 
 			result = D3DXCreateEffect(pDevice, *(void**)(pEffectBuffer + 3), *(unsigned int*)(pEffectBuffer + 2), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
 			if (!SUCCEEDED(result))
