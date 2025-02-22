@@ -93,9 +93,15 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 	_asm mov CurrentShaderNum, edx
 	char* LastUnderline;
 	char* FxFilePath;
-	unsigned int CurrentEffectSize = 0;
+	// unsigned int CurrentEffectSize = 0;
 	_asm mov eax, CurrentShaderNum
-	_asm mov eax, ds:0x00A6408C[eax]
+
+	// Carbon:
+	// _asm mov eax, ds:0x00A6408C[eax]
+
+	// NFSMS:
+	_asm mov eax, ds:0x008AE7D4[eax]  // Access shader info in MW
+
 	_asm mov FxFilePath, eax
 	strcpy(FilenameBuf, FxFilePath);
 
@@ -107,7 +113,7 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 	if (CheckIfFileExists(FilenameBuf))
 	{
 		HRESULT result;
-		D3DXCreateBuffer(2048, &pBuffer);
+		// D3DXCreateBuffer(2048, &pBuffer);
 		result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
 		if (SUCCEEDED(result))
 		{
@@ -123,10 +129,10 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 
 			// we better keep it in memory instead of writing to disk...
 
-			ppEffect = (LPD3DXEFFECT*)(pEffectBuffer + 3);
-			CurrentEffectSize = *(unsigned int*)(pEffectBuffer + 2);
-			WriteFileFromMemory("temp_shader.cso", *(void**)(pEffectBuffer + 3), CurrentEffectSize);
-			result = D3DXCreateEffectFromFile(pDevice, "temp_shader.cso", pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
+			// ppEffect = (LPD3DXEFFECT*)(pEffectBuffer + 3);
+			// CurrentEffectSize = *(unsigned int*)(pEffectBuffer + 2);
+			// WriteFileFromMemory("temp_shader.cso", *(void**)(pEffectBuffer + 3), CurrentEffectSize);
+			// result = D3DXCreateEffectFromFile(pDevice, "temp_shader.cso", pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
 
 			result = D3DXCreateEffect(pDevice, *(void**)(pEffectBuffer + 3), *(unsigned int*)(pEffectBuffer + 2), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
 			if (!SUCCEEDED(result))
@@ -155,7 +161,12 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 
 int Init()
 {
-	injector::MakeCALL(0x0072B6D4, D3DXCreateEffectFromResourceHook, true);
+	// Carbon:
+	// injector::MakeCALL(0x0072B6D4, D3DXCreateEffectFromResourceHook, true); 
+
+	// NFSMW:
+	injector::MakeCALL(0x006C60D2, D3DXCreateEffectFromResourceHook, true);
+	
 	return 0;
 }
 
@@ -163,11 +174,11 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*lpReserved*/)
 {
 	if (reason == DLL_PROCESS_ATTACH)
 	{
-		if (bConsoleExists())
-		{
-			freopen("CON", "w", stdout);
-			freopen("CON", "w", stderr);
-		}
+		// if (bConsoleExists())
+		// {
+		// 	freopen("CON", "w", stdout);
+		// 	freopen("CON", "w", stderr);
+		// }
 		Init();
 	}
 	return TRUE;

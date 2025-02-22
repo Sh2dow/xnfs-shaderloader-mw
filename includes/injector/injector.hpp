@@ -2,7 +2,6 @@
  *  Injectors - Base Header
  *
  *  Copyright (C) 2012-2014 LINK/2012 <dma_2012@hotmail.com>
- *  Copyright (C) 2014 Deji <the_zone@hotmail.co.uk>
  *
  *  This software is provided 'as-is', without any express or implied
  *  warranty. In no event will the authors be held liable for any damages
@@ -673,7 +672,7 @@ inline bool game_version_manager::Detect()
             
     // Look for game and version thought the entry-point
     // Thanks to Silent for many of the entry point offsets
-    switch (base + nt->OptionalHeader.AddressOfEntryPoint + 0x400000 - (DWORD)GetModuleHandle(NULL))
+    switch (base + nt->OptionalHeader.AddressOfEntryPoint + (0x400000 - base))
     {
         case 0x5C1E70:  // GTA III 1.0
             game = '3', major = 1, minor = 0, region = 0, steam = false;
@@ -734,8 +733,16 @@ inline bool game_version_manager::Detect()
             game = 'I', major = 1, minor = 0, majorRevision = 0, minorRevision = 7, region = 'U', steam = false;
             return true;
 
+        case 0xCF529E:  // GTA IV 1.0.0.8 US
+            game = 'I', major = 1, minor = 0, majorRevision = 0, minorRevision = 8, region = 'U', steam = false;
+            return true;
+
         case 0xD0AF06:  // GTA EFLC 1.1.2.0 US
             game = 'E', major = 1, minor = 1, majorRevision = 2, minorRevision = 0, region = 'U', steam = false;
+            return true;
+
+        case 0xCF4BAD:  // GTA EFLC 1.1.3.0 US
+            game = 'E', major = 1, minor = 1, majorRevision = 3, minorRevision = 0, region = 'U', steam = false;
             return true;
 
         default:
