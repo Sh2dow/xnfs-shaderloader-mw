@@ -1,186 +1,180 @@
-﻿// NFSC Shader Compiler & Loader
-// Compiles and/or loads shaders outside the executable
-// Put HLSL effect .fx files in the fx folder in the game directory
-// Or put compiled shader objects with resource names next to executable
-
-#include "stdafx.h"
-#include "stdio.h"
+﻿// dllmain.cpp - entry point for XNFS-ShaderLoader-MW (Motion Blur Injection)
 #include <windows.h>
-#include "includes\injector\injector.hpp"
-#include <D3D9.h>
+#include <filesystem>
+#include <string>
+#include <fstream>
+#include <iostream>
+#include <d3d9.h>
 #include <d3dx9effect.h>
+#include "includes/injector/injector.hpp"
 
-unsigned int CurrentShaderNum;
-ID3DXEffectCompiler* pEffectCompiler;
-ID3DXBuffer* pBuffer, *pEffectBuffer;
-char FilenameBuf[2048];
+HMODULE g_hModule = nullptr;
+std::wstring g_FxOverridePath;
 
-char* ErrorString;
+IDirect3DTexture9* g_MotionBlurTex = nullptr;
+IDirect3DSurface9* g_MotionBlurSurface = nullptr;
 
-bool bConsoleExists(void)
+using Direct3DCreate9_t = IDirect3D9* (WINAPI*)(UINT);
+Direct3DCreate9_t oDirect3DCreate9 = nullptr;
+
+using EndScene_t = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9);
+EndScene_t oEndScene = nullptr;
+
+using D3DXCreateEffectFromFileW_t = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9, LPCWSTR, CONST D3DXMACRO*, LPD3DXINCLUDE, DWORD,
+                                                     LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*);
+D3DXCreateEffectFromFileW_t oD3DXCreateEffectFromFileW = nullptr;
+
+void Log(const std::string& msg)
 {
-	CONSOLE_SCREEN_BUFFER_INFO csbi;
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(g_hModule, path, MAX_PATH);
+    std::filesystem::path base = path;
+    base = base.remove_filename();
+    std::filesystem::path logFile = base / L"motionblur_log.txt";
 
-	if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
-		return false;
-
-	return true;
+    std::ofstream log(logFile, std::ios::app);
+    log << msg << std::endl;
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
+    std::cout << msg << std::endl;
 }
 
-// custom print methods which include console attachment checks...
-int __cdecl cusprintf(const char* Format, ...)
+IDirect3D9* WINAPI hkDirect3DCreate9(UINT SDKVersion)
 {
-	va_list ArgList;
-	int Result = 0;
+    Log("hkDirect3DCreate9 called");
+    if (!oDirect3DCreate9)
+    {
+        Log("oDirect3DCreate9 is NULL!");
+        return nullptr;
+    }
 
-	if (bConsoleExists())
-	{
-		__crt_va_start(ArgList, Format);
-		Result = vprintf(Format, ArgList);
-		__crt_va_end(ArgList);
-	}
-
-	return Result;
+    return oDirect3DCreate9(SDKVersion);
 }
 
-int __cdecl cus_puts(char* buf)
+uintptr_t GetOriginalCallTarget(uintptr_t callSite)
 {
-	if (bConsoleExists())
-		return puts(buf);
-	return 0;
+    // call instruction is E8 <rel32>
+    int32_t relOffset = *reinterpret_cast<int32_t*>(callSite + 1);
+    return callSite + 5 + relOffset;
 }
 
-bool CheckIfFileExists(const char* FileName)
+HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
 {
-	FILE *fin = fopen(FileName, "rb");
-	if (fin == NULL)
-	{
-		char secondarypath[MAX_PATH];
-		strcpy(secondarypath, "fx\\");
-		strcat(secondarypath, FileName);
-		fin = fopen(secondarypath, "rb");
-		if (fin == NULL)
-			return 0;
-		strcpy((char*)FileName, secondarypath);
-	}
-	fclose(fin);
-	return 1;
+    static bool initialized = false;
+    if (!initialized)
+    {
+        D3DVIEWPORT9 vp;
+        if (SUCCEEDED(device->GetViewport(&vp)))
+        {
+            if (SUCCEEDED(device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET,
+                D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_MotionBlurTex, nullptr)))
+            {
+                g_MotionBlurTex->GetSurfaceLevel(0, &g_MotionBlurSurface);
+                Log("Created MOTIONBLUR_TEXTURE");
+            }
+            else
+            {
+                Log("FAILED to create MOTIONBLUR_TEXTURE");
+            }
+        }
+        initialized = true;
+    }
+
+    if (g_MotionBlurTex && g_MotionBlurSurface)
+    {
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (SUCCEEDED(device->GetRenderTarget(0, &backBuffer)))
+        {
+            device->StretchRect(backBuffer, nullptr, g_MotionBlurSurface, nullptr, D3DTEXF_LINEAR);
+            Log("Updated MOTIONBLUR_TEXTURE from backbuffer");
+            backBuffer->Release();
+        }
+    }
+
+    return oEndScene(device); // Call original
 }
 
-bool WriteFileFromMemory(const char* FileName, const void* buffer, long size)
+HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
+    LPDIRECT3DDEVICE9 pDevice,
+    HMODULE hSrcModule,
+    LPCSTR pResource,
+    CONST D3DXMACRO* pDefines,
+    LPD3DXINCLUDE pInclude,
+    DWORD Flags,
+    LPD3DXEFFECTPOOL pPool,
+    LPD3DXEFFECT* ppEffect,
+    LPD3DXBUFFER* ppCompilationErrors)
 {
-	FILE *fout = fopen(FileName, "wb");
-	if (fout == NULL)
-		return 0;
+    Log("Intercepted D3DXCreateEffectFromResourceA");
 
-	fwrite(buffer, 1, size, fout);
+    // Create the effect with the original call
+    auto orig = reinterpret_cast<decltype(&D3DXCreateEffectFromResourceA)>(
+        GetProcAddress(GetModuleHandleA("d3dx9_26.dll"), "D3DXCreateEffectFromResourceA"));
 
-	fclose(fout);
-	return 1;
+    HRESULT hr = orig(pDevice, hSrcModule, pResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+
+    // Hook EndScene if not already
+    if (SUCCEEDED(hr) && ppEffect && *ppEffect && g_MotionBlurTex)
+    {
+        (*ppEffect)->SetTexture("MOTIONBLUR_TEXTURE", g_MotionBlurTex);
+        Log("Bound MOTIONBLUR_TEXTURE to shader via Resource hook");
+    }
+
+    if (oEndScene == nullptr && pDevice)
+    {
+        void** vtable = *reinterpret_cast<void***>(pDevice);
+        oEndScene = reinterpret_cast<EndScene_t>(vtable[42]); // Index 42 = EndScene
+        injector::WriteMemory<uintptr_t>(&vtable[42], (uintptr_t)hkEndScene, true);
+        Log("Hooked EndScene");
+    }
+
+    return hr;
 }
 
-HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
-	HMODULE           hSrcModule,
-	LPCTSTR           pSrcResource,
-	const D3DXMACRO         *pDefines,
-	LPD3DXINCLUDE     pInclude,
-	DWORD             Flags,
-	LPD3DXEFFECTPOOL  pPool,
-	LPD3DXEFFECT      *ppEffect,
-	LPD3DXBUFFER      *ppCompilationErrors
-)
+void InitFXOverride()
 {
-	_asm mov CurrentShaderNum, edx
-	char* LastUnderline;
-	char* FxFilePath;
-	// unsigned int CurrentEffectSize = 0;
-	_asm mov eax, CurrentShaderNum
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(g_hModule, path, MAX_PATH);
+    std::filesystem::path base = path;
+    base = base.remove_filename();
+    Log("Init base path: " + base.string());
 
-	// Carbon:
-	// _asm mov eax, ds:0x00A6408C[eax]
+    // Save the original
+    uintptr_t d3dCreate9CallSite = 0x006E6A40;
+    oDirect3DCreate9 = reinterpret_cast<Direct3DCreate9_t>(GetOriginalCallTarget(d3dCreate9CallSite));
 
-	// NFSMS:
-	_asm mov eax, ds:0x008AE7D4[eax]  // Access shader info in MW
+    // Patch the call
+    injector::MakeCALL(d3dCreate9CallSite, (uintptr_t)&hkDirect3DCreate9, true);
+    injector::MakeCALL(0x006C60D2, (uintptr_t)&hkD3DXCreateEffectFromResourceA, true);
 
-	_asm mov FxFilePath, eax
-	strcpy(FilenameBuf, FxFilePath);
-
-	LastUnderline = strrchr(FilenameBuf, '.');
-	LastUnderline[1] = 'f';
-	LastUnderline[2] = 'x';
-	LastUnderline[3] = '\0';
-
-	if (CheckIfFileExists(FilenameBuf))
-	{
-		HRESULT result;
-		// D3DXCreateBuffer(2048, &pBuffer);
-		result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
-		if (SUCCEEDED(result))
-		{
-			cusprintf("Compiling shader %s\n", FilenameBuf);
-			result = pEffectCompiler->CompileEffect(0, &pEffectBuffer, &pBuffer);
-			if (!SUCCEEDED(result))
-			{
-				cus_puts(*(char**)(pBuffer + 3));
-				cusprintf("HRESULT: %X\n", result);
-				return result;
-			}
-			cusprintf("Compilation successful!\n");
-
-			// we better keep it in memory instead of writing to disk...
-
-			// ppEffect = (LPD3DXEFFECT*)(pEffectBuffer + 3);
-			// CurrentEffectSize = *(unsigned int*)(pEffectBuffer + 2);
-			// WriteFileFromMemory("temp_shader.cso", *(void**)(pEffectBuffer + 3), CurrentEffectSize);
-			// result = D3DXCreateEffectFromFile(pDevice, "temp_shader.cso", pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
-
-			result = D3DXCreateEffect(pDevice, *(void**)(pEffectBuffer + 3), *(unsigned int*)(pEffectBuffer + 2), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
-			if (!SUCCEEDED(result))
-			{
-				cusprintf("Effect creation failed: HRESULT: %X\n", result);
-				cus_puts(*(char**)(pBuffer + 3));
-			}
-			//remove("temp_shader.cso");
-			return result;
-		}
-		else
-		{
-			cusprintf("Error compiling shader: HRESULT: %X\n", result);
-			cus_puts(*(char**)(pBuffer + 3));
-		}
-	}
-
-	if (CheckIfFileExists(pSrcResource))
-	{
-		return D3DXCreateEffectFromFile(pDevice, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-	}
-
-
-	return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+    Log("Patched Direct3DCreate9 call site and stored original");
+    Log("Patched Direct3DCreate9 call site");
 }
 
-int Init()
+void InitializeMWShaderLoader()
 {
-	// Carbon:
-	// injector::MakeCALL(0x0072B6D4, D3DXCreateEffectFromResourceHook, true); 
-
-	// NFSMW:
-	injector::MakeCALL(0x006C60D2, D3DXCreateEffectFromResourceHook, true);
-	
-	return 0;
+    InitFXOverride();
+    Log(">>> InitializeMWShaderLoader complete");
 }
 
-BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*lpReserved*/)
+void CleanupMWShaderLoader()
 {
-	if (reason == DLL_PROCESS_ATTACH)
-	{
-		// if (bConsoleExists())
-		// {
-		// 	freopen("CON", "w", stdout);
-		// 	freopen("CON", "w", stderr);
-		// }
-		Init();
-	}
-	return TRUE;
+    Log("Shutdown complete");
 }
 
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+{
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+        g_hModule = hModule;
+        DisableThreadLibraryCalls(hModule);
+        Log(">>> DllMain start");
+        InitializeMWShaderLoader();
+        break;
+    case DLL_PROCESS_DETACH:
+        CleanupMWShaderLoader();
+        break;
+    }
+    return TRUE;
+}
