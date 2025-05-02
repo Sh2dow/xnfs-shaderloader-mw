@@ -88,17 +88,18 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 	LPD3DXEFFECTPOOL  pPool,
 	LPD3DXEFFECT      *ppEffect,
 	LPD3DXBUFFER      *ppCompilationErrors
-){
+)
+{
     char* LastUnderline;
-    const char* FxFilePath = nullptr;
+	char* FxFilePath;
 
-    __try {
-        DWORD offset = (CurrentShaderNum + CurrentShaderNum * 8) << 4;
-        FxFilePath = *(const char**)(0x008F9B60 + offset);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        cusprintf("Invalid shader index: %u\n", CurrentShaderNum);
-        return E_FAIL;
-    }
+	__try {
+		DWORD offset = (CurrentShaderNum + CurrentShaderNum * 8) << 4;
+		FxFilePath = *(char**)(0x008F9B60 + offset); // MW table location
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		cusprintf("Invalid shader index: %u\n", CurrentShaderNum);
+		return E_FAIL;
+	}
 
     strcpy(FilenameBuf, FxFilePath);
     LastUnderline = strrchr(FilenameBuf, '.');
@@ -111,8 +112,8 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 
     if (GetFileAttributesA(FilenameBuf) != INVALID_FILE_ATTRIBUTES)
     {
-        HRESULT result;
-        result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
+    	HRESULT result;
+    	result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
         if (SUCCEEDED(result))
         {
             cusprintf("Compiling shader %s\n", FilenameBuf);
@@ -129,6 +130,14 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
                 return result;
             }
             cusprintf("Compilation successful!\n");
+
+        	// we better keep it in memory instead of writing to disk...
+
+        	//ppEffect = *(LPD3DXEFFECT*)(pEffectBuffer + 3);
+        	//CurrentEffectSize = *(unsigned int*)(pEffectBuffer + 2);
+        	//WriteFileFromMemory("temp_shader.cso", *(void**)(pEffectBuffer + 3), CurrentEffectSize);
+        	//result = D3DXCreateEffectFromFile(pDevice, "temp_shader.cso", pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
+        	
             result = D3DXCreateEffect(pDevice, pEffectBuffer->GetBufferPointer(), pEffectBuffer->GetBufferSize(), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
             if (!SUCCEEDED(result))
             {
@@ -139,7 +148,8 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
                     cus_puts(err);
                 }
             }
-            return result;
+        	//remove("temp_shader.cso");
+        	return result;
         }
         else
         {
@@ -152,24 +162,12 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
         }
     }
 
-    if (GetFileAttributesA(pSrcResource) != INVALID_FILE_ATTRIBUTES)
+	if (CheckIfFileExists(pSrcResource))
     {
         return D3DXCreateEffectFromFile(pDevice, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
     }
 
     return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-}
-
-__declspec(naked) void ShaderHookStub()
-{
-    __asm {
-        push edx
-        pushad
-        mov CurrentShaderNum, edx
-        popad
-        pop edx
-        jmp D3DXCreateEffectFromResourceHook
-    }
 }
 
 int Init()
