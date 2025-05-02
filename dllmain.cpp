@@ -1,4 +1,4 @@
-﻿// dllmain.cpp - entry point for XNFS-ShaderLoader-MW (Motion Blur Injection)
+﻿// dllmain.cpp - entry point for NFSMW-RenderTarget (Motion Blur Injection)
 #include <windows.h>
 #include <filesystem>
 #include <string>
@@ -14,6 +14,11 @@ std::wstring g_FxOverridePath;
 IDirect3DTexture9* g_MotionBlurTex = nullptr;
 IDirect3DSurface9* g_MotionBlurSurface = nullptr;
 LPD3DXEFFECT g_LastEffect = nullptr;
+
+unsigned int CurrentShaderNum;
+ID3DXEffectCompiler* pEffectCompiler;
+ID3DXBuffer* pBuffer = nullptr, *pEffectBuffer = nullptr;
+char FilenameBuf[2048];
 
 using Direct3DCreate9_t = IDirect3D9* (WINAPI*)(UINT);
 Direct3DCreate9_t oDirect3DCreate9 = nullptr;
@@ -38,6 +43,23 @@ void Log(const std::string& msg)
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     std::cout << msg << std::endl;
+}
+
+bool CheckIfFileExists(const char* FileName)
+{
+    FILE* fin = fopen(FileName, "rb");
+    if (!fin)
+    {
+        char alt[MAX_PATH];
+        strcpy(alt, "fx\\");
+        strcat(alt, FileName);
+        fin = fopen(alt, "rb");
+        if (!fin)
+            return false;
+        strcpy((char*)FileName, alt);
+    }
+    fclose(fin);
+    return true;
 }
 
 IDirect3D9* WINAPI hkDirect3DCreate9(UINT SDKVersion)
@@ -98,7 +120,7 @@ HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
         }
     }
 
-    return oEndScene(device);
+    return oEndScene(device); // Call original
 }
 
 HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
@@ -115,6 +137,51 @@ HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
     Log(std::string("Resource requested: ") + (pResource ? pResource : "NULL"));
     Log("Intercepted D3DXCreateEffectFromResourceA");
 
+    if (pResource && strstr(pResource, ".fxo"))
+    {
+        strcpy(FilenameBuf, pResource);
+        char* ext = strrchr(FilenameBuf, '.');
+        if (ext) strcpy(ext, ".fx");
+
+        if (CheckIfFileExists(FilenameBuf))
+        {
+            HRESULT hr = D3DXCreateEffectCompilerFromFile(FilenameBuf, nullptr, nullptr, 0, &pEffectCompiler, &pBuffer);
+            if (SUCCEEDED(hr))
+            {
+                Log("Compiling: " + std::string(FilenameBuf));
+                hr = pEffectCompiler->CompileEffect(0, &pEffectBuffer, &pBuffer);
+                if (SUCCEEDED(hr))
+                {
+                    hr = D3DXCreateEffect(pDevice, *(void**)(pEffectBuffer->GetBufferPointer()),
+                                          (UINT)pEffectBuffer->GetBufferSize(), pDefines, pInclude,
+                                          Flags, pPool, ppEffect, &pBuffer);
+
+                    if (SUCCEEDED(hr))
+                    {
+                        Log("Compiled and created effect successfully from FX file");
+                        if (g_MotionBlurTex && *ppEffect)
+                            (*ppEffect)->SetTexture("MOTIONBLUR_TEXTURE", g_MotionBlurTex);
+                        g_LastEffect = *ppEffect;
+                        return hr;
+                    }
+                    else
+                    {
+                        Log("Failed to create effect from compiled FX");
+                    }
+                }
+                else
+                {
+                    Log("Compilation failed");
+                }
+            }
+            else
+            {
+                Log("Compiler init failed");
+            }
+        }
+    }
+
+    // fallback: original resource loading
     auto orig = reinterpret_cast<D3DXCreateEffectFromResourceA_t>(
         GetProcAddress(GetModuleHandleA("d3dx9_43.dll"), "D3DXCreateEffectFromResourceA"));
 
@@ -122,10 +189,36 @@ HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
 
     if (SUCCEEDED(hr) && ppEffect && *ppEffect)
     {
-        g_LastEffect = *ppEffect;
-        Log("Captured effect pointer for motion blur binding");
+        Log("Effect created successfully");
+
+        if (g_MotionBlurTex)
+        {
+            (*ppEffect)->SetTexture("MOTIONBLUR_TEXTURE", g_MotionBlurTex);
+            Log("Bound MOTIONBLUR_TEXTURE to shader via Resource hook");
+        }
+
+        // Optional: Log available techniques WITHOUT Begin()
+        for (UINT i = 0;; ++i)
+        {
+            D3DXHANDLE tech = (*ppEffect)->GetTechnique(i);
+            if (!tech)
+                break; // No more techniques
+
+            D3DXTECHNIQUE_DESC desc;
+            if (SUCCEEDED((*ppEffect)->GetTechniqueDesc(tech, &desc)))
+            {
+                Log("Found technique: " + std::string(desc.Name));
+                if (strcmp(desc.Name, "t0") == 0)
+                {
+                    // Optional: only if you are sure this effect is safe to override
+                    // (*ppEffect)->SetTechnique(tech);
+                    Log("Technique 't0' is present");
+                }
+            }
+        }
     }
 
+    // Hook EndScene if not yet done
     if (!oEndScene && pDevice)
     {
         void** vtable = *reinterpret_cast<void***>(pDevice);
