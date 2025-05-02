@@ -88,129 +88,88 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
 	LPD3DXEFFECTPOOL  pPool,
 	LPD3DXEFFECT      *ppEffect,
 	LPD3DXBUFFER      *ppCompilationErrors
-)
-{
-    HRESULT result = E_FAIL;
-    ID3DXEffectCompiler* pEffectCompiler = nullptr;
-    ID3DXBuffer* pEffectBuffer = nullptr;
-    ID3DXBuffer* pBuffer = nullptr;
-    char FilenameBuf[MAX_PATH];
+){
+    char* LastUnderline;
+    const char* FxFilePath = nullptr;
 
-    // Resolve shader filename from table
-    char* LastDot;
-    char* FxFilePath = nullptr;
     __try {
-        __asm {
-            mov eax, CurrentShaderNum
-            lea ecx, [eax + eax * 8]
-            shl ecx, 4
-            mov eax, dword ptr ds : [0x008F9B60 + ecx]
-            mov FxFilePath, eax
-        }
-        if (!FxFilePath || IsBadStringPtrA(FxFilePath, 64)) {
-            cusprintf("Shader filename pointer is invalid or null.\n");
-            return E_FAIL;
-        }
-
-        strcpy(FilenameBuf, FxFilePath);
-        LastDot = strrchr(FilenameBuf, '.');
-        if (LastDot) {
-            LastDot[1] = 'f';
-            LastDot[2] = 'x';
-            LastDot[3] = '\0';
-        }
+        DWORD offset = (CurrentShaderNum + CurrentShaderNum * 8) << 4;
+        FxFilePath = *(const char**)(0x008F9B60 + offset);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         cusprintf("Invalid shader index: %u\n", CurrentShaderNum);
         return E_FAIL;
     }
 
-	// Try loading precompiled .fxo
-	char fxoFilename[MAX_PATH];
-	strcpy(fxoFilename, FilenameBuf);
-	char* dot = strrchr(fxoFilename, '.');
-	if (dot) {
-		dot[1] = 'f'; dot[2] = 'x'; dot[3] = 'o'; dot[4] = '\0';
+    strcpy(FilenameBuf, FxFilePath);
+    LastUnderline = strrchr(FilenameBuf, '.');
+    if (LastUnderline)
+    {
+        LastUnderline[1] = 'f';
+        LastUnderline[2] = 'x';
+        LastUnderline[3] = '\0';
+    }
 
-		if (GetFileAttributesA(fxoFilename) != INVALID_FILE_ATTRIBUTES) {
-			cusprintf("Loading compiled shader %s\n", fxoFilename);
-			result = D3DXCreateEffectFromFile(pDevice, fxoFilename, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-			if (SUCCEEDED(result))
-				return result;
-			else
-				cusprintf("Failed to load compiled shader. HRESULT: %X\n", result);
-		}
-	}
-
-    // Try compiling from .fx file
-    if (GetFileAttributesA(FilenameBuf) != INVALID_FILE_ATTRIBUTES) {
-        result = D3DXCreateEffectCompilerFromFile(FilenameBuf, nullptr, nullptr, 0, &pEffectCompiler, &pBuffer);
-        if (SUCCEEDED(result)) {
+    if (GetFileAttributesA(FilenameBuf) != INVALID_FILE_ATTRIBUTES)
+    {
+        HRESULT result;
+        result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
+        if (SUCCEEDED(result))
+        {
             cusprintf("Compiling shader %s\n", FilenameBuf);
             result = pEffectCompiler->CompileEffect(0, &pEffectBuffer, &pBuffer);
-            if (!SUCCEEDED(result)) {
-            cusprintf("HRESULT: %X", result);
-            if (pBuffer) {
-                SIZE_T len = pBuffer->GetBufferSize();
-                const BYTE* raw = (const BYTE*)pBuffer->GetBufferPointer();
-                if (len >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
-                    const wchar_t* wstr = (const wchar_t*)raw;
-                    MessageBoxW(NULL, wstr, L"Shader Compilation Error", MB_ICONERROR);
-                    WideCharToMultiByte(CP_ACP, 0, wstr, -1, FilenameBuf, sizeof(FilenameBuf), NULL, NULL);
-                    cus_puts(FilenameBuf);
-                } else {
-                    char* tempError = new char[len + 1];
-                    memcpy(tempError, raw, len);
-                    tempError[len] = '\0';
-                    cus_puts(tempError);
-                    MessageBoxA(NULL, tempError, "Shader Compilation Error", MB_ICONERROR);
-                    delete[] tempError;
+            if (!SUCCEEDED(result))
+            {
+                if (pBuffer)
+                {
+                    char* err = (char*)pBuffer->GetBufferPointer();
+                    MessageBoxA(NULL, err, "Shader Compilation Error", MB_ICONERROR);
+                    cus_puts(err);
                 }
-            } else {
-                MessageBoxA(NULL, "Unknown shader compile error — no buffer!", "Shader Error", MB_ICONERROR);
+                cusprintf("HRESULT: %X\n", result);
+                return result;
+            }
+            cusprintf("Compilation successful!\n");
+            result = D3DXCreateEffect(pDevice, pEffectBuffer->GetBufferPointer(), pEffectBuffer->GetBufferSize(), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
+            if (!SUCCEEDED(result))
+            {
+                cusprintf("Effect creation failed: HRESULT: %X\n", result);
+                if (pBuffer)
+                {
+                    char* err = (char*)pBuffer->GetBufferPointer();
+                    cus_puts(err);
+                }
             }
             return result;
-            }
-
-            cusprintf("Compilation successful!\n");
-
-            if (pEffectBuffer && pEffectBuffer->GetBufferPointer() && pEffectBuffer->GetBufferSize()) {
-                if (pBuffer) {
-                    pBuffer->Release();
-                    pBuffer = nullptr;
-                }
-                result = D3DXCreateEffect(
-                    pDevice,
-                    pEffectBuffer->GetBufferPointer(),
-                    pEffectBuffer->GetBufferSize(),
-                    pDefines,
-                    pInclude,
-                    Flags,
-                    pPool,
-                    ppEffect,
-                    &pBuffer
-                );
-                if (!SUCCEEDED(result)) {
-                    cusprintf("Effect creation failed: HRESULT: %X\n", result);
-                    if (pBuffer) cus_puts((char*)pBuffer->GetBufferPointer());
-                }
-                return result;
-            } else {
-                cusprintf("Invalid compiled shader buffer.\n");
-                return E_FAIL;
-            }
-        } else {
+        }
+        else
+        {
             cusprintf("Error compiling shader: HRESULT: %X\n", result);
-            if (pBuffer) cus_puts((char*)pBuffer->GetBufferPointer());
+            if (pBuffer)
+            {
+                char* err = (char*)pBuffer->GetBufferPointer();
+                cus_puts(err);
+            }
         }
     }
 
-    // Fallback to file-based load
-    if (GetFileAttributesA(pSrcResource) != INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributesA(pSrcResource) != INVALID_FILE_ATTRIBUTES)
+    {
         return D3DXCreateEffectFromFile(pDevice, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
     }
 
-    // Fallback to original resource load
     return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+}
+
+__declspec(naked) void ShaderHookStub()
+{
+    __asm {
+        push edx
+        pushad
+        mov CurrentShaderNum, edx
+        popad
+        pop edx
+        jmp D3DXCreateEffectFromResourceHook
+    }
 }
 
 int Init()
