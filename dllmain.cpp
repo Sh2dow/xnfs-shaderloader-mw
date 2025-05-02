@@ -1,4 +1,4 @@
-﻿// dllmain.cpp - entry point for XNFS-ShaderLoader-MW (Motion Blur Injection)
+﻿// dllmain.cpp - entry point for XNFS-RenderTarget-MW (Motion Blur Injection)
 #include <windows.h>
 #include <filesystem>
 #include <string>
@@ -98,7 +98,7 @@ HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
         }
     }
 
-    return oEndScene(device);
+    return oEndScene(device); // Call original
 }
 
 HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
@@ -122,10 +122,36 @@ HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
 
     if (SUCCEEDED(hr) && ppEffect && *ppEffect)
     {
-        g_LastEffect = *ppEffect;
-        Log("Captured effect pointer for motion blur binding");
+        Log("Effect created successfully");
+
+        if (g_MotionBlurTex)
+        {
+            (*ppEffect)->SetTexture("MOTIONBLUR_TEXTURE", g_MotionBlurTex);
+            Log("Bound MOTIONBLUR_TEXTURE to shader via Resource hook");
+        }
+
+        // Optional: Log available techniques WITHOUT Begin()
+        for (UINT i = 0;; ++i)
+        {
+            D3DXHANDLE tech = (*ppEffect)->GetTechnique(i);
+            if (!tech)
+                break; // No more techniques
+
+            D3DXTECHNIQUE_DESC desc;
+            if (SUCCEEDED((*ppEffect)->GetTechniqueDesc(tech, &desc)))
+            {
+                Log("Found technique: " + std::string(desc.Name));
+                if (strcmp(desc.Name, "t0") == 0)
+                {
+                    // Optional: only if you are sure this effect is safe to override
+                    // (*ppEffect)->SetTechnique(tech);
+                    Log("Technique 't0' is present");
+                }
+            }
+        }
     }
 
+    // Hook EndScene if not yet done
     if (!oEndScene && pDevice)
     {
         void** vtable = *reinterpret_cast<void***>(pDevice);
