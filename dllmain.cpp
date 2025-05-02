@@ -13,6 +13,7 @@ std::wstring g_FxOverridePath;
 
 IDirect3DTexture9* g_MotionBlurTex = nullptr;
 IDirect3DSurface9* g_MotionBlurSurface = nullptr;
+LPD3DXEFFECT g_LastEffect = nullptr;
 
 using Direct3DCreate9_t = IDirect3D9* (WINAPI*)(UINT);
 Direct3DCreate9_t oDirect3DCreate9 = nullptr;
@@ -20,9 +21,9 @@ Direct3DCreate9_t oDirect3DCreate9 = nullptr;
 using EndScene_t = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9);
 EndScene_t oEndScene = nullptr;
 
-using D3DXCreateEffectFromFileW_t = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9, LPCWSTR, CONST D3DXMACRO*, LPD3DXINCLUDE, DWORD,
-                                                     LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*);
-D3DXCreateEffectFromFileW_t oD3DXCreateEffectFromFileW = nullptr;
+using D3DXCreateEffectFromResourceA_t = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9, HMODULE, LPCSTR, CONST D3DXMACRO*, LPD3DXINCLUDE, DWORD,
+                                                        LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*);
+D3DXCreateEffectFromResourceA_t oD3DXCreateEffectFromResourceA = nullptr;
 
 void Log(const std::string& msg)
 {
@@ -88,10 +89,16 @@ HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
             device->StretchRect(backBuffer, nullptr, g_MotionBlurSurface, nullptr, D3DTEXF_LINEAR);
             Log("Updated MOTIONBLUR_TEXTURE from backbuffer");
             backBuffer->Release();
+
+            if (g_LastEffect)
+            {
+                g_LastEffect->SetTexture("MOTIONBLUR_TEXTURE", g_MotionBlurTex);
+                Log("Rebound MOTIONBLUR_TEXTURE in EndScene");
+            }
         }
     }
 
-    return oEndScene(device); // Call original
+    return oEndScene(device);
 }
 
 HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
@@ -105,22 +112,21 @@ HRESULT WINAPI hkD3DXCreateEffectFromResourceA(
     LPD3DXEFFECT* ppEffect,
     LPD3DXBUFFER* ppCompilationErrors)
 {
+    Log(std::string("Resource requested: ") + (pResource ? pResource : "NULL"));
     Log("Intercepted D3DXCreateEffectFromResourceA");
 
-    // Create the effect with the original call
-    auto orig = reinterpret_cast<decltype(&D3DXCreateEffectFromResourceA)>(
-        GetProcAddress(GetModuleHandleA("d3dx9_26.dll"), "D3DXCreateEffectFromResourceA"));
+    auto orig = reinterpret_cast<D3DXCreateEffectFromResourceA_t>(
+        GetProcAddress(GetModuleHandleA("d3dx9_43.dll"), "D3DXCreateEffectFromResourceA"));
 
     HRESULT hr = orig(pDevice, hSrcModule, pResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
 
-    // Hook EndScene if not already
-    if (SUCCEEDED(hr) && ppEffect && *ppEffect && g_MotionBlurTex)
+    if (SUCCEEDED(hr) && ppEffect && *ppEffect)
     {
-        (*ppEffect)->SetTexture("MOTIONBLUR_TEXTURE", g_MotionBlurTex);
-        Log("Bound MOTIONBLUR_TEXTURE to shader via Resource hook");
+        g_LastEffect = *ppEffect;
+        Log("Captured effect pointer for motion blur binding");
     }
 
-    if (oEndScene == nullptr && pDevice)
+    if (!oEndScene && pDevice)
     {
         void** vtable = *reinterpret_cast<void***>(pDevice);
         oEndScene = reinterpret_cast<EndScene_t>(vtable[42]); // Index 42 = EndScene
