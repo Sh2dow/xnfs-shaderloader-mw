@@ -15,27 +15,19 @@ char FilenameBuf[2048];
 
 static LPD3DXEFFECT g_LastValidEffect = nullptr;
 
-bool bConsoleExists(void)
-{
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    return GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
-}
-
 int __cdecl cusprintf(const char* Format, ...)
 {
     va_list ArgList;
-    int Result = 0;
-    if (bConsoleExists()) {
-        __crt_va_start(ArgList, Format);
-        Result = vprintf(Format, ArgList);
-        __crt_va_end(ArgList);
-    }
+    int Result;
+    va_start(ArgList, Format);
+    Result = vprintf(Format, ArgList);
+    va_end(ArgList);
     return Result;
 }
 
 int __cdecl cus_puts(const char* buf)
 {
-    return bConsoleExists() ? puts(buf) : 0;
+    return puts(buf);
 }
 
 HRESULT __stdcall D3DXCreateEffectFromResourceHook(
@@ -60,27 +52,29 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
     uintptr_t tableBase = 0x008F9BE8;
     uintptr_t entryOffset = shaderIndex * 0x36;
 
+    cusprintf("Shader index received: %u\n", shaderIndex);
+    cusprintf("Shader table base: 0x%X\n", tableBase);
+    cusprintf("Shader entry offset: 0x%X\n", entryOffset);
+
+    if (shaderIndex >= 64) {
+        cusprintf("Shader index %u is out of range. Clamping to 0.\n", shaderIndex);
+        shaderIndex = 0;
+        CurrentShaderNum = 0;
+        entryOffset = 0;
+    }
+
     __try {
-        if (shaderIndex >= 64)
-            throw 1;
-
         FxFilePath = *(char**)(tableBase + entryOffset);
-        if (!FxFilePath || IsBadReadPtr(FxFilePath, 4))
-            throw 2;
-
+        if (!FxFilePath || IsBadReadPtr(FxFilePath, 4)) {
+            throw 1;
+        }
         cusprintf("Resolved shader path: %s\n", FxFilePath);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         char msg[128];
         sprintf(msg, "Invalid shader index or null pointer (idx=%u)", shaderIndex);
         MessageBoxA(NULL, msg, "Shader Loader Error", MB_ICONERROR);
-
-        if (g_LastValidEffect && !IsBadReadPtr(g_LastValidEffect, sizeof(ID3DXEffect))) {
-            *ppEffect = g_LastValidEffect;
-            g_LastValidEffect->AddRef();
-            return S_OK;
-        }
-        return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+        return E_FAIL;
     }
 
     if (strncmp(FxFilePath, "IDI_", 4) == 0 || strncmp(FxFilePath, "IDI\\", 4) == 0) {
@@ -181,8 +175,7 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
 __declspec(naked) void ShaderHookStub()
 {
     __asm {
-        mov CurrentShaderNum, edx // save shader index
-        // now jump directly to the hook while preserving all arguments
+        mov CurrentShaderNum, edx
         jmp D3DXCreateEffectFromResourceHook
     }
 }
@@ -197,10 +190,9 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*lpReserved*/)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
-        if (bConsoleExists()) {
-            freopen("CON", "w", stdout);
-            freopen("CON", "w", stderr);
-        }
+        AllocConsole();
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
         Init();
     }
     return TRUE;
