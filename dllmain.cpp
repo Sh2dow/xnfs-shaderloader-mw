@@ -11,6 +11,8 @@ ID3DXEffectCompiler* pEffectCompiler;
 ID3DXBuffer* pBuffer, *pEffectBuffer;
 char FilenameBuf[2048];
 
+#define SafeRelease(p) { if(p) { (p)->Release(); (p)=nullptr; } }
+
 bool bConsoleExists(void)
 {
     CONSOLE_SCREEN_BUFFER_INFO csbi;
@@ -73,67 +75,72 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
         return E_FAIL;
     }
 
-    strncpy(FilenameBuf, FxFilePath, sizeof(FilenameBuf) - 1);
-    FilenameBuf[sizeof(FilenameBuf) - 1] = '\0';
-
-    LastDot = strrchr(FilenameBuf, '.');
-    if (LastDot)
+    if (strncmp(FxFilePath, "IDI_", 4) == 0)
     {
-        LastDot[1] = 'f';
-        LastDot[2] = 'x';
-        LastDot[3] = '\0';
+        snprintf(FilenameBuf, sizeof(FilenameBuf), "fx\\%s.fx", FxFilePath + 4);
+    }
+    else
+    {
+        strcpy(FilenameBuf, FxFilePath);
+        LastDot = strrchr(FilenameBuf, '.');
+        if (LastDot)
+        {
+            LastDot[1] = 'f';
+            LastDot[2] = 'x';
+            LastDot[3] = '\0';
+        }
     }
 
     cusprintf("Final FX path: %s\n", FilenameBuf);
-    DWORD fileAttr = GetFileAttributesA(FilenameBuf);
-    cusprintf("File exists: %s\n", (fileAttr != INVALID_FILE_ATTRIBUTES) ? "YES" : "NO");
 
-    if (fileAttr != INVALID_FILE_ATTRIBUTES)
+    // Check file size as debug aid
+    FILE* fcheck = fopen(FilenameBuf, "rb");
+    if (fcheck)
     {
-        HRESULT result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
-        if (SUCCEEDED(result))
-        {
-            cusprintf("Compiling shader %s\n", FilenameBuf);
-            result = pEffectCompiler->CompileEffect(0, &pEffectBuffer, &pBuffer);
-            if (!SUCCEEDED(result))
-            {
-                if (pBuffer)
-                {
-                    char* err = (char*)pBuffer->GetBufferPointer();
-                    MessageBoxA(NULL, err, "Shader Compilation Error", MB_ICONERROR);
-                    cus_puts(err);
-                }
-                cusprintf("HRESULT: %X\n", result);
-                return result;
-            }
-            cusprintf("Compilation successful!\n");
-            result = D3DXCreateEffect(pDevice, pEffectBuffer->GetBufferPointer(), pEffectBuffer->GetBufferSize(), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
-            if (!SUCCEEDED(result))
-            {
-                cusprintf("Effect creation failed: HRESULT: %X\n", result);
-                if (pBuffer)
-                {
-                    char* err = (char*)pBuffer->GetBufferPointer();
-                    cus_puts(err);
-                }
-            }
-            return result;
-        }
+        fseek(fcheck, 0, SEEK_END);
+        long size = ftell(fcheck);
+        fclose(fcheck);
+        cusprintf("FX file size: %ld bytes\n", size);
+    }
+    else
+    {
+        cusprintf("Failed to open FX file for size check.\n");
+    }
+
+    DWORD compileFlags = D3DXSHADER_DEBUG | D3DXSHADER_SKIPOPTIMIZATION;
+    HRESULT result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, compileFlags, &pEffectCompiler, &pBuffer);
+    cusprintf("D3DXCreateEffectCompilerFromFile returned: %X\n", result);
+
+    if (FAILED(result)) {
+        MessageBoxA(NULL, "Failed to create effect compiler", "Shader Compilation Error", MB_ICONERROR);
         if (pBuffer)
-        {
-            char* err = (char*)pBuffer->GetBufferPointer();
-            MessageBoxA(NULL, err, "Shader Compilation Error", MB_ICONERROR);
-            cus_puts(err);
-        }
-        cusprintf("Error compiling shader: HRESULT: %X\n", result);
+            cus_puts((char*)pBuffer->GetBufferPointer());
+        SafeRelease(pEffectCompiler);
+        return E_FAIL;
     }
 
-    if (GetFileAttributesA(pSrcResource) != INVALID_FILE_ATTRIBUTES)
-    {
-        return D3DXCreateEffectFromFile(pDevice, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+    cusprintf("Compiling shader %s\n", FilenameBuf);
+    result = pEffectCompiler->CompileEffect(0, &pEffectBuffer, &pBuffer);
+    if (FAILED(result)) {
+        MessageBoxA(NULL, "Failed to compile effect", "Shader Compilation Error", MB_ICONERROR);
+        if (pBuffer)
+            cus_puts((char*)pBuffer->GetBufferPointer());
+        SafeRelease(pEffectCompiler);
+        return E_FAIL;
     }
 
-    return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+    result = D3DXCreateEffect(pDevice, pEffectBuffer->GetBufferPointer(), pEffectBuffer->GetBufferSize(), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
+    if (FAILED(result)) {
+        MessageBoxA(NULL, "Failed to create effect from compiled buffer", "Shader Compilation Error", MB_ICONERROR);
+        if (pBuffer)
+            cus_puts((char*)pBuffer->GetBufferPointer());
+        SafeRelease(pEffectCompiler);
+        return E_FAIL;
+    }
+
+    cusprintf("Shader compiled and created successfully.\n");
+    SafeRelease(pEffectCompiler);
+    return result;
 }
 
 __declspec(naked) void ShaderHookStub()
