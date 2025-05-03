@@ -1,4 +1,8 @@
-﻿// NFSMW Shader Compiler & Loader (Trampoline Style)
+﻿// NFSMW Shader Compiler & Loader
+// Compiles and/or loads shaders outside the executable
+// Put HLSL effect .fx files in the fx folder in the game directory
+// Or put compiled shader objects with resource names next to executable
+
 #include "stdafx.h"
 #include "stdio.h"
 #include <windows.h>
@@ -11,189 +15,174 @@ ID3DXEffectCompiler* pEffectCompiler;
 ID3DXBuffer* pBuffer, *pEffectBuffer;
 char FilenameBuf[2048];
 
-#define SafeRelease(p) { if(p) { (p)->Release(); (p)=nullptr; } }
+char* ErrorString;
 
-static LPD3DXEFFECT g_LastValidEffect = nullptr;
+bool bConsoleExists(void)
+{
+	CONSOLE_SCREEN_BUFFER_INFO csbi;
 
+	if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
+		return false;
+
+	return true;
+}
+
+// custom print methods which include console attachment checks...
 int __cdecl cusprintf(const char* Format, ...)
 {
-    va_list ArgList;
-    int Result;
-    va_start(ArgList, Format);
-    Result = vprintf(Format, ArgList);
-    va_end(ArgList);
-    return Result;
+	va_list ArgList;
+	int Result = 0;
+
+	if (bConsoleExists())
+	{
+		__crt_va_start(ArgList, Format);
+		Result = vprintf(Format, ArgList);
+		__crt_va_end(ArgList);
+	}
+
+	return Result;
 }
 
-int __cdecl cus_puts(const char* buf)
+int __cdecl cus_puts(char* buf)
 {
-    return puts(buf);
+	if (bConsoleExists())
+		return puts(buf);
+	return 0;
 }
 
-HRESULT __stdcall D3DXCreateEffectFromResourceHook(
-    LPDIRECT3DDEVICE9 pDevice,
-    HMODULE hSrcModule,
-    LPCTSTR pSrcResource,
-    CONST D3DXMACRO* pDefines,
-    LPD3DXINCLUDE pInclude,
-    DWORD Flags,
-    LPD3DXEFFECTPOOL pPool,
-    LPD3DXEFFECT* ppEffect,
-    LPD3DXBUFFER* ppCompilationErrors)
+bool CheckIfFileExists(const char* FileName)
 {
-    char* LastDot;
-    char* FxFilePath = nullptr;
+	FILE *fin = fopen(FileName, "rb");
+	if (fin == NULL)
+	{
+		char secondarypath[MAX_PATH];
+		strcpy(secondarypath, "fx\\");
+		strcat(secondarypath, FileName);
+		fin = fopen(secondarypath, "rb");
+		if (fin == NULL)
+			return 0;
+		strcpy((char*)FileName, secondarypath);
+	}
+	fclose(fin);
+	return 1;
+}
 
-    DWORD shaderIndex;
-    __asm mov shaderIndex, edx;
-    CurrentShaderNum = shaderIndex;
-    cusprintf("Shader index received: %u\n", shaderIndex);
+bool WriteFileFromMemory(const char* FileName, const void* buffer, long size)
+{
+	FILE *fout = fopen(FileName, "wb");
+	if (fout == NULL)
+		return 0;
 
-    uintptr_t tableBase = 0x008F9BE8;
-    uintptr_t entryOffset = shaderIndex * 0x36;
+	fwrite(buffer, 1, size, fout);
 
-    cusprintf("Shader index received: %u\n", shaderIndex);
-    cusprintf("Shader table base: 0x%X\n", tableBase);
-    cusprintf("Shader entry offset: 0x%X\n", entryOffset);
+	fclose(fout);
+	return 1;
+}
 
-    if (shaderIndex >= 64) {
-        cusprintf("Shader index %u is out of range. Clamping to 0.\n", shaderIndex);
-        shaderIndex = 0;
-        CurrentShaderNum = 0;
-        entryOffset = 0;
-    }
+HRESULT __stdcall D3DXCreateEffectFromResourceHook(LPDIRECT3DDEVICE9 pDevice,
+	HMODULE           hSrcModule,
+	LPCTSTR           pSrcResource,
+	const D3DXMACRO         *pDefines,
+	LPD3DXINCLUDE     pInclude,
+	DWORD             Flags,
+	LPD3DXEFFECTPOOL  pPool,
+	LPD3DXEFFECT      *ppEffect,
+	LPD3DXBUFFER      *ppCompilationErrors
+)
+{
+    char* LastUnderline;
+	char* FxFilePath;
 
-    __try {
-        FxFilePath = *(char**)(tableBase + entryOffset);
-        if (!FxFilePath || IsBadReadPtr(FxFilePath, 4)) {
-            throw 1;
-        }
-        cusprintf("Resolved shader path: %s\n", FxFilePath);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        char msg[128];
-        sprintf(msg, "Invalid shader index or null pointer (idx=%u)", shaderIndex);
-        MessageBoxA(NULL, msg, "Shader Loader Error", MB_ICONERROR);
-        return E_FAIL;
-    }
-
-    if (strncmp(FxFilePath, "IDI_", 4) == 0 || strncmp(FxFilePath, "IDI\\", 4) == 0) {
-        cusprintf("Skipping IDI_* shader: %s\n", FxFilePath);
-        if (g_LastValidEffect && !IsBadReadPtr(g_LastValidEffect, sizeof(ID3DXEffect))) {
-            *ppEffect = g_LastValidEffect;
-            g_LastValidEffect->AddRef();
-            return S_OK;
-        }
-        return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-    }
+	__try {
+		DWORD offset = (CurrentShaderNum + CurrentShaderNum * 8) << 4;
+		FxFilePath = *(char**)(0x008F9B60 + offset); // MW table location
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		cusprintf("Invalid shader index: %u\n", CurrentShaderNum);
+		return E_FAIL;
+	}
 
     strcpy(FilenameBuf, FxFilePath);
-    LastDot = strrchr(FilenameBuf, '.');
-    if (LastDot)
+    LastUnderline = strrchr(FilenameBuf, '.');
+    if (LastUnderline)
     {
-        LastDot[1] = 'f';
-        LastDot[2] = 'x';
-        LastDot[3] = '\0';
+        LastUnderline[1] = 'f';
+        LastUnderline[2] = 'x';
+        LastUnderline[3] = '\0';
     }
 
-    cusprintf("Final FX path: %s\n", FilenameBuf);
-
-    FILE* fcheck = fopen(FilenameBuf, "rb");
-    if (!fcheck)
+    if (CheckIfFileExists(FilenameBuf))
     {
-        cusprintf("FX file not found: skipping shader load. Falling back to original resource.\n");
-        if (g_LastValidEffect && !IsBadReadPtr(g_LastValidEffect, sizeof(ID3DXEffect))) {
-            *ppEffect = g_LastValidEffect;
-            g_LastValidEffect->AddRef();
-            return S_OK;
+    	HRESULT result;
+    	cusprintf("[Debug] Will try to compile: %s\n", FilenameBuf);
+    	result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, 0, &pEffectCompiler, &pBuffer);
+        if (SUCCEEDED(result))
+        {
+            cusprintf("Compiling shader %s\n", FilenameBuf);
+            result = pEffectCompiler->CompileEffect(0, &pEffectBuffer, &pBuffer);
+            if (!SUCCEEDED(result))
+            {
+                if (pBuffer)
+                {
+                    char* err = (char*)pBuffer->GetBufferPointer();
+                    MessageBoxA(NULL, err, "Shader Compilation Error", MB_ICONERROR);
+                    cus_puts(err);
+                }
+                cusprintf("HRESULT: %X\n", result);
+                return result;
+            }
+            cusprintf("Compilation successful!\n");
+
+        	// we better keep it in memory instead of writing to disk...
+
+        	//ppEffect = *(LPD3DXEFFECT*)(pEffectBuffer + 3);
+        	//CurrentEffectSize = *(unsigned int*)(pEffectBuffer + 2);
+        	//WriteFileFromMemory("temp_shader.cso", *(void**)(pEffectBuffer + 3), CurrentEffectSize);
+        	//result = D3DXCreateEffectFromFile(pDevice, "temp_shader.cso", pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
+        	
+            result = D3DXCreateEffect(pDevice, pEffectBuffer->GetBufferPointer(), pEffectBuffer->GetBufferSize(), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
+            if (!SUCCEEDED(result))
+            {
+            	cusprintf("Effect creation failed: HRESULT: %X\n", result);
+            	cus_puts(*(char**)(pBuffer + 3));
+            }
+        	//remove("temp_shader.cso");
+        	return result;
         }
-        return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-    }
-    fseek(fcheck, 0, SEEK_END);
-    long size = ftell(fcheck);
-    fclose(fcheck);
-    cusprintf("FX file size: %ld bytes\n", size);
-
-    DWORD compileFlags = D3DXSHADER_DEBUG | D3DXSHADER_SKIPOPTIMIZATION;
-    HRESULT result = D3DXCreateEffectCompilerFromFile(FilenameBuf, NULL, NULL, compileFlags, &pEffectCompiler, &pBuffer);
-    cusprintf("D3DXCreateEffectCompilerFromFile returned: %X\n", result);
-
-    if (FAILED(result)) {
-        MessageBoxA(NULL, "Failed to create effect compiler", "Shader Compilation Error", MB_ICONERROR);
-        if (pBuffer)
-            cus_puts((char*)pBuffer->GetBufferPointer());
-        SafeRelease(pEffectCompiler);
-        SafeRelease(pBuffer);
-        if (g_LastValidEffect && !IsBadReadPtr(g_LastValidEffect, sizeof(ID3DXEffect))) {
-            *ppEffect = g_LastValidEffect;
-            g_LastValidEffect->AddRef();
-            return S_OK;
+        else
+        {
+            cusprintf("Error compiling shader: HRESULT: %X\n", result);
+            if (pBuffer)
+            {
+                char* err = (char*)pBuffer->GetBufferPointer();
+                cus_puts(err);
+            }
         }
-        return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
     }
 
-    cusprintf("Compiling shader %s\n", FilenameBuf);
-    result = pEffectCompiler->CompileEffect(0, &pEffectBuffer, &pBuffer);
-    if (FAILED(result)) {
-        MessageBoxA(NULL, "Failed to compile effect", "Shader Compilation Error", MB_ICONERROR);
-        if (pBuffer)
-            cus_puts((char*)pBuffer->GetBufferPointer());
-        SafeRelease(pEffectCompiler);
-        SafeRelease(pBuffer);
-        if (g_LastValidEffect && !IsBadReadPtr(g_LastValidEffect, sizeof(ID3DXEffect))) {
-            *ppEffect = g_LastValidEffect;
-            g_LastValidEffect->AddRef();
-            return S_OK;
-        }
-        return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+	if (CheckIfFileExists(pSrcResource))
+    {
+        return D3DXCreateEffectFromFile(pDevice, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
     }
 
-    SafeRelease(pBuffer);
-    result = D3DXCreateEffect(pDevice, pEffectBuffer->GetBufferPointer(), pEffectBuffer->GetBufferSize(), pDefines, pInclude, Flags, pPool, ppEffect, &pBuffer);
-    if (FAILED(result)) {
-        MessageBoxA(NULL, "Failed to create effect from compiled buffer", "Shader Compilation Error", MB_ICONERROR);
-        if (pBuffer)
-            cus_puts((char*)pBuffer->GetBufferPointer());
-        SafeRelease(pEffectCompiler);
-        SafeRelease(pBuffer);
-        if (g_LastValidEffect && !IsBadReadPtr(g_LastValidEffect, sizeof(ID3DXEffect))) {
-            *ppEffect = g_LastValidEffect;
-            g_LastValidEffect->AddRef();
-            return S_OK;
-        }
-        return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-    }
-
-    g_LastValidEffect = *ppEffect;
-    g_LastValidEffect->AddRef();
-    cusprintf("Shader compiled and created successfully.\n");
-    SafeRelease(pEffectCompiler);
-    SafeRelease(pBuffer);
-    return result;
-}
-
-__declspec(naked) void ShaderHookStub()
-{
-    __asm {
-        mov CurrentShaderNum, edx
-        jmp D3DXCreateEffectFromResourceHook
-    }
+    return D3DXCreateEffectFromResource(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
 }
 
 int Init()
 {
-    injector::MakeCALL(0x006C60D2, ShaderHookStub, true);
-    return 0;
+	injector::MakeCALL(0x006C60D2, D3DXCreateEffectFromResourceHook, true);
+	return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*lpReserved*/)
 {
-    if (reason == DLL_PROCESS_ATTACH)
-    {
-        AllocConsole();
-        freopen("CONOUT$", "w", stdout);
-        freopen("CONOUT$", "w", stderr);
-        Init();
-    }
-    return TRUE;
+	if (reason == DLL_PROCESS_ATTACH)
+	{
+		if (bConsoleExists())
+		{
+			freopen("CON", "w", stdout);
+			freopen("CON", "w", stderr);
+		}
+		Init();
+	}
+	return TRUE;
 }
