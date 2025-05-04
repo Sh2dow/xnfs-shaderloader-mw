@@ -1,5 +1,4 @@
-﻿
-// NFSMW Shader Compiler & Loader (Trampoline Style)
+﻿// NFSMW Shader Compiler & Loader (Trampoline Style)
 #include "stdafx.h"
 #include <windows.h>
 #include <d3d9.h>
@@ -18,14 +17,25 @@ static const unsigned int kMaxShaderEntries = 512;
 static LPD3DXEFFECT g_LastValidEffect = nullptr;
 
 // Utility for logging
-void cusprintf(const char* fmt, ...)
+int __cdecl cusprintf(const char* Format, ...)
 {
-    char buf[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    OutputDebugStringA(buf);
+    va_list ArgList;
+    int Result;
+    va_start(ArgList, Format);
+    Result = vprintf(Format, ArgList);
+    va_end(ArgList);
+    return Result;
+}
+
+void DetectEffectBinding(LPD3DXEFFECT fx)
+{
+    for (uintptr_t addr = 0x00980000; addr < 0x00990000; addr += 4)
+    {
+        if (*(LPD3DXEFFECT*)addr == fx)
+        {
+            cusprintf("[Detect] Effect pointer %p stored at 0x%08X\n", fx, (unsigned int)addr);
+        }
+    }
 }
 
 // If override compile or resource load fails, fallback here
@@ -56,13 +66,24 @@ static HRESULT ReturnWithFallback(
 
 static void ShowSafeShaderErrorMessage(ID3DXBuffer* pErrBuf)
 {
-    if (!pErrBuf || pErrBuf->GetBufferSize() == 0)
+    if (!pErrBuf || !pErrBuf->GetBufferPointer() || pErrBuf->GetBufferSize() == 0)
     {
-        cusprintf("Shader error: empty or null error buffer.\n");
+        cusprintf("Shader error: empty or null error buffer.");
         return;
     }
-    const char* msg = (const char*)pErrBuf->GetBufferPointer();
-    cusprintf("Shader compile error:\n%s\n", msg);
+
+    const BYTE* raw = (const BYTE*)pErrBuf->GetBufferPointer();
+    SIZE_T rawLen = pErrBuf->GetBufferSize();
+
+    printf("Shader error raw buffer (%zu bytes):\n", rawLen);
+    for (size_t i = 0; i < rawLen; ++i)
+    {
+        printf("%02X ", raw[i]);
+        if ((i + 1) % 16 == 0) printf("\n");
+    }
+    printf("\n");
+
+    cusprintf("Shader error: see console for raw dump.");
 }
 
 // Hook stub placeholder (captures edx into CurrentShaderIndex then jumps)
@@ -80,8 +101,13 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
     ID3DXEffect** ppEffect,
     ID3DXBuffer** ppCompilationErrors)
 {
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    cusprintf("[Init] Shader hook fired at: %02d:%02d:%02d.%03d\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
     unsigned int idx = CurrentShaderIndex;
     cusprintf("[Hook] Shader index received: %u\n", idx);
+    cusprintf("Table address: 0x%08X + %u * 4 = 0x%08X\n", 0x008F9BE8, idx, 0x008F9BE8 + idx * 4);
 
     // 1) Out-of-bounds: fallback immediately
     if (idx >= kMaxShaderEntries)
@@ -109,6 +135,7 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
     }
 
     const char* rawPath = *entryPtr;
+    cusprintf("Resolved entryPtr: 0x%p\n", entryPtr);
     cusprintf("Raw shader name: %s\n", rawPath);
 
     // 3) IDI_* resources: use game-provided compile
@@ -178,26 +205,27 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
 __declspec(naked) void ShaderHookStub()
 {
     __asm {
-        mov eax, edx               // edx holds shader index passed by compiler
+        mov eax, edx // edx holds shader index passed by compiler
         mov CurrentShaderIndex, eax
         jmp D3DXCreateEffectFromResourceHook
-    }
+        }
 }
 
 // Initialization: insert hook
 int InitShaderHook()
 {
     // Make a trampoline to our stub
-    injector::MakeCALL(0x006C60D2, ShaderHookStub);
+    injector::MakeCALL(0x006C60D2, ShaderHookStub, true);
     return 0;
 }
 
-// DLL entry
-BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*lpReserved*/)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
-        AllocConsole(); freopen("CONOUT$","w", stdout);
+        AllocConsole();
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
         InitShaderHook();
     }
     return TRUE;
