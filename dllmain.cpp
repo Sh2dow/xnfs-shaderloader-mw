@@ -56,7 +56,6 @@ static HRESULT ReturnWithFallback(
         *ppEffect = g_LastValidEffect;
         return S_OK;
     }
-    // Call original loader
     return D3DXCreateEffectFromResource(
         pDevice, hSrcModule, pSrcResource,
         pDefines, pInclude, Flags,
@@ -86,10 +85,8 @@ static void ShowSafeShaderErrorMessage(ID3DXBuffer* pErrBuf)
     cusprintf("Shader error: see console for raw dump.");
 }
 
-// Hook stub placeholder (captures edx into CurrentShaderIndex then jumps)
 unsigned int CurrentShaderIndex;
 
-// Main hook function
 HRESULT __stdcall D3DXCreateEffectFromResourceHook(
     IDirect3DDevice9* pDevice,
     HMODULE hSrcModule,
@@ -109,47 +106,48 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
     cusprintf("[Hook] Shader index received: %u\n", idx);
     cusprintf("Table address: 0x%08X + %u * 4 = 0x%08X\n", 0x008F9BE8, idx, 0x008F9BE8 + idx * 4);
 
-    // 1) Out-of-bounds: fallback immediately
+    if (!pSrcResource || IsBadReadPtr(pSrcResource, 4)) {
+        cusprintf("[Hook] Invalid pSrcResource!\n");
+        return E_FAIL;
+    }
+
     if (idx >= kMaxShaderEntries)
     {
         cusprintf("Shader index out of bounds (%u), falling back.\n", idx);
-        return ReturnWithFallback(
-            pDevice, hSrcModule, pSrcResource,
-            pDefines, pInclude, Flags,
-            pPool, ppEffect, ppCompilationErrors
-        );
+        return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
     }
 
-    // 2) Read the shader path pointer from the game table
     const uintptr_t tableBase = 0x008F9BE8;
     uintptr_t entryOffset = idx * sizeof(char*);
+
+    if ((tableBase + entryOffset) > 0x00900000) {
+        cusprintf("[Hook] Calculated entry pointer is out-of-bounds!\n");
+        return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+    }
+
     char** entryPtr = reinterpret_cast<char**>(tableBase + entryOffset);
     if (!entryPtr || IsBadReadPtr(entryPtr, sizeof(char*)) || !*entryPtr)
     {
         cusprintf("Invalid shader pointer for index %u, falling back.\n", idx);
-        return ReturnWithFallback(
-            pDevice, hSrcModule, pSrcResource,
-            pDefines, pInclude, Flags,
-            pPool, ppEffect, ppCompilationErrors
-        );
+        return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
     }
 
     const char* rawPath = *entryPtr;
     cusprintf("Resolved entryPtr: 0x%p\n", entryPtr);
     cusprintf("Raw shader name: %s\n", rawPath);
 
-    // 3) IDI_* resources: use game-provided compile
     if (strncmp(rawPath, "IDI_", 4) == 0 || strncmp(rawPath, "IDI\\", 4) == 0)
     {
         cusprintf("Loading IDI_* resource: %s\n", rawPath);
-        return D3DXCreateEffectFromResource(
-            pDevice, hSrcModule, rawPath,
-            pDefines, pInclude, Flags,
-            pPool, ppEffect, ppCompilationErrors
-        );
+        HRESULT result = D3DXCreateEffectFromResource(pDevice, hSrcModule, rawPath, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+        if (SUCCEEDED(result))
+        {
+            LPD3DXEFFECT effect = *ppEffect;
+            DetectEffectBinding(effect); // log only
+        }
+        return result;
     }
 
-    // 4) Try fx/ override file
     char filenameBuf[256];
     strncpy(filenameBuf, rawPath, sizeof(filenameBuf)-1);
     char* dot = strrchr(filenameBuf, '.');
@@ -181,40 +179,30 @@ HRESULT __stdcall D3DXCreateEffectFromResourceHook(
             cusprintf("Override compile failed (0x%08X).\n", hr);
             ShowSafeShaderErrorMessage(errorBuf);
             SafeRelease(errorBuf);
-            return ReturnWithFallback(
-                pDevice, hSrcModule, pSrcResource,
-                pDefines, pInclude, Flags,
-                pPool, ppEffect, ppCompilationErrors
-            );
+            return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
         }
-        // Success: cache and return
         g_LastValidEffect = effect;
         *ppEffect = effect;
         return S_OK;
     }
 
-    // 5) Default fallback to original loader
     cusprintf("No override for %s, using original.\n", rawPath);
-    return ReturnWithFallback(
-        pDevice, hSrcModule, pSrcResource,
-        pDefines, pInclude, Flags,
-        pPool, ppEffect, ppCompilationErrors
-    );
+    return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
 }
 
 __declspec(naked) void ShaderHookStub()
 {
     __asm {
-        mov eax, edx // edx holds shader index passed by compiler
+        push eax
+        mov eax, edx
         mov CurrentShaderIndex, eax
+        pop eax
         jmp D3DXCreateEffectFromResourceHook
-        }
+    }
 }
 
-// Initialization: insert hook
 int InitShaderHook()
 {
-    // Make a trampoline to our stub
     injector::MakeCALL(0x006C60D2, ShaderHookStub, true);
     return 0;
 }
