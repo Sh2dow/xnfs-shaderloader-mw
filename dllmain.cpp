@@ -1,73 +1,141 @@
 ﻿#include <windows.h>
 #include <d3d9.h>
 #include <d3dx9effect.h>
-#include "includes/injector/injector.hpp"
-#include <cstdio>
+#include <unordered_map>
 #include <string>
 #include <vector>
-typedef HRESULT(WINAPI* D3DXCreateEffectFn)(
-    IDirect3DDevice9*,
-    LPCVOID,
-    UINT,
-    const D3DXMACRO*,
-    LPD3DXINCLUDE,
-    DWORD,
-    LPD3DXEFFECTPOOL,
-    LPD3DXEFFECT*,
-    LPD3DXBUFFER*
-);
+#include <cstdio>
+#include <cctype>
+#include "includes/injector/injector.hpp"
 
-D3DXCreateEffectFn RealCreateEffect = nullptr;
+// -------------------- GLOBALS --------------------
 
-// 🔧 CRC32 calculation
-DWORD CRC32(const void* data, size_t length)
+LPDIRECT3DDEVICE9 g_Device = nullptr;
+
+std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
+std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
+
+// -------------------- HELPERS --------------------
+
+std::string ToUpper(const std::string& str)
 {
-    const BYTE* p = (const BYTE*)data;
-    DWORD crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < length; ++i)
-    {
-        crc ^= p[i];
-        for (int j = 0; j < 8; ++j)
-            crc = (crc >> 1) ^ (0xEDB88320 & (-(int)(crc & 1)));
-    }
-    return ~crc;
+    std::string out = str;
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = (char)toupper(out[i]);
+    return out;
 }
+
+// -------------------- INCLUDE HANDLER --------------------
 
 class FXIncludeHandler : public ID3DXInclude
 {
 public:
-    STDMETHOD(Open)(D3DXINCLUDE_TYPE, LPCSTR pFileName, LPCVOID, LPCVOID* ppData, UINT* pBytes)
+    STDMETHOD(Open)(D3DXINCLUDE_TYPE, LPCSTR fileName, LPCVOID, LPCVOID* ppData, UINT* pBytes) override
     {
-        char fullPath[MAX_PATH];
-        snprintf(fullPath, sizeof(fullPath), "fx/%s", pFileName);
+        std::string fullPath = "fx/" + std::string(fileName);
+        printf("[Include] Trying to open: %s\n", fullPath.c_str());
 
-        FILE* f = fopen(fullPath, "rb");
-        if (!f) return E_FAIL;
+        FILE* f = fopen(fullPath.c_str(), "rb");
+        if (!f)
+        {
+            printf("[Include] Failed to open: %s\n", fullPath.c_str());
+            return E_FAIL;
+        }
 
         fseek(f, 0, SEEK_END);
         size_t len = ftell(f);
         fseek(f, 0, SEEK_SET);
-
-        BYTE* data = new BYTE[len];
-        fread(data, 1, len, f);
+        BYTE* buf = new BYTE[len];
+        fread(buf, 1, len, f);
         fclose(f);
 
-        *ppData = data;
+        *ppData = buf;
         *pBytes = (UINT)len;
+        printf("[Include] Opened: %s\n", fullPath.c_str());
         return S_OK;
     }
 
-    STDMETHOD(Close)(LPCVOID pData)
+    STDMETHOD(Close)(LPCVOID pData) override
     {
         delete[] (BYTE*)pData;
         return S_OK;
     }
 };
 
+// -------------------- SHADER OVERRIDE LOADER --------------------
+
+void LoadShaderOverrides()
+{
+    DWORD attrs = GetFileAttributesA("fx");
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        printf("[Error] fx/ folder does not exist or is inaccessible.\n");
+        return;
+    }
+
+    printf("[Init] fx/ folder found, scanning for shaders...\n");
+
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA("fx\\*.fx", &findData);
+
+    if (hFind == INVALID_HANDLE_VALUE)
+    {
+        printf("[Init] No .fx files found in fx/ folder.\n");
+        return;
+    }
+
+    do
+    {
+        std::string fileName = findData.cFileName;
+        std::string name = fileName.substr(0, fileName.find_last_of('.'));
+
+        std::string key = "IDI_" + ToUpper(name) + "_FX";
+        std::string fullPath = "fx/" + fileName;
+
+        printf("[Init] Compiling and caching %s as %s\n", fileName.c_str(), key.c_str());
+
+        FILE* f = fopen(fullPath.c_str(), "rb");
+        if (!f) continue;
+
+        fseek(f, 0, SEEK_END);
+        size_t len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+
+        std::vector<char> data(len);
+        fread(data.data(), 1, len, f);
+        fclose(f);
+
+        ID3DXEffect* fx = nullptr;
+        ID3DXBuffer* errors = nullptr;
+        FXIncludeHandler includeHandler;
+
+        HRESULT hr = D3DXCreateEffect(g_Device, data.data(), (UINT)len, nullptr, &includeHandler,
+            D3DXSHADER_DEBUG, nullptr, &fx, &errors);
+
+        if (FAILED(hr))
+        {
+            printf("[Init] Failed to compile %s\n", fileName.c_str());
+            if (errors)
+            {
+                printf("[Init] Error: %s\n", (char*)errors->GetBufferPointer());
+                errors->Release();
+            }
+            continue;
+        }
+
+        g_ShaderOverridePaths[key] = fullPath;
+        g_ShaderBuffers[key] = data; // stores raw HLSL code
+
+    } while (FindNextFileA(hFind, &findData));
+
+    FindClose(hFind);
+}
+
+// -------------------- HOOK HANDLER --------------------
+
 typedef HRESULT(WINAPI* D3DXCreateEffectFromResourceAFn)(
-    LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*, LPD3DXINCLUDE, DWORD,
-    LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*
-);
+    LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*, LPD3DXINCLUDE,
+    DWORD, LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*);
 
 D3DXCreateEffectFromResourceAFn RealCreateFromResource = nullptr;
 
@@ -82,43 +150,38 @@ HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors)
 {
+    if (!g_Device)
+    {
+        g_Device = device;
+        LoadShaderOverrides(); // first-time shader preload
+    }
+
     printf("[Hook] D3DXCreateEffectFromResourceA called — pResource = %s\n", pResource);
 
-    if (pResource && strcmp(pResource, "IDI_VISUALTREATMENT_FX") == 0)
+    auto it = g_ShaderBuffers.find(pResource);
+    if (it != g_ShaderBuffers.end())
     {
-        FILE* f = fopen("fx/visualtreatment.fx", "rb");
-        if (f)
+        printf("[Hook] Using precompiled override for %s\n", pResource);
+
+        FXIncludeHandler includeHandler;
+        const std::vector<char>& buffer = it->second;
+
+        HRESULT hr = D3DXCreateEffect(device, buffer.data(), (UINT)buffer.size(),
+            defines, &includeHandler, flags, pool, outEffect, outErrors);
+
+        if (FAILED(hr) || !*outEffect)
         {
-            fseek(f, 0, SEEK_END);
-            size_t len = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            std::vector<char> data(len);
-            fread(data.data(), 1, len, f);
-            fclose(f);
-
-            printf("[Hook] Overriding visualtreatment.fx via pResource\n");
-
-            FXIncludeHandler includeHandler;
-
-            HRESULT hr = D3DXCreateEffect(device, data.data(), (UINT)data.size(),
-                defines, &includeHandler, flags, pool, outEffect, outErrors);
-
-            if (FAILED(hr) || !outEffect || !*outEffect)
-            {
-                printf("[Hook] Shader failed to compile or create — falling back to original resource.\n");
-                return RealCreateFromResource(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
-            }
-
-            return hr;
+            printf("[Hook] Shader creation failed, falling back\n");
+            return RealCreateFromResource(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
         }
-        else
-        {
-            printf("[Hook] Failed to open fx/visualtreatment.fx — falling back\n");
-        }
+
+        return hr;
     }
 
     return RealCreateFromResource(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
 }
+
+// -------------------- DllMain --------------------
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
@@ -127,7 +190,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         AllocConsole();
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);
-        printf("[Init] Shader Resource Hook DLL Loaded\n");
+        printf("[Init] Shader override DLL loaded.\n");
 
         HMODULE d3dx = GetModuleHandleA("d3dx9_26.dll");
         if (d3dx)
@@ -140,4 +203,3 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     }
     return TRUE;
 }
-
