@@ -30,6 +30,7 @@ extern "C" const char* g_ResolvedShaderName;
 const void* g_ResolvedNameTrial_2C = nullptr;
 const void* g_ResolvedNameTrial_28 = nullptr;
 const void* g_ResolvedNameTrial_30 = nullptr;
+bool g_PreloadTriggered = false;
 
 // Utility for logging
 int __cdecl cusprintf(const char* Format, ...)
@@ -61,12 +62,14 @@ LPDIRECT3DDEVICE9 g_Device = nullptr;
 class FXIncludeHandler : public ID3DXInclude
 {
 public:
-    STDMETHOD(Open)(D3DXINCLUDE_TYPE type, LPCSTR fileName, LPCVOID, LPCVOID* data, UINT* bytes) override {
+    STDMETHOD(Open)(D3DXINCLUDE_TYPE type, LPCSTR fileName, LPCVOID, LPCVOID* data, UINT* bytes) override
+    {
         std::string path = std::string("fx/") + fileName;
         printf("[Include] Trying to open: %s\n", path.c_str());
 
         FILE* f = fopen(path.c_str(), "rb");
-        if (!f) {
+        if (!f)
+        {
             printf("[Include] Failed to open: %s\n", path.c_str());
             return E_FAIL;
         }
@@ -111,80 +114,11 @@ using D3DXCreateEffectFromResourceFn = HRESULT(WINAPI*)(
     IDirect3DDevice9*, HMODULE, LPCSTR, const D3DXMACRO*, LPD3DXINCLUDE,
     DWORD, ID3DXEffectPool*, ID3DXEffect**, ID3DXBuffer**);
 
-HRESULT WINAPI ShaderWrapper(
-    IDirect3DDevice9* device,
-    HMODULE hModule,
-    LPCSTR pResource,
-    const D3DXMACRO* defines,
-    LPD3DXINCLUDE include,
-    DWORD flags,
-    ID3DXEffectPool* pool,
-    ID3DXEffect** outEffect,
-    ID3DXBuffer** outErrors)
-{
-    g_ResolvedShaderName = pResource;
-    printf("[Wrapper] Shader = %s\n", pResource ? pResource : "(null)");
-
-    std::string shaderKey = pResource ? std::string(pResource) : "";
-
-    // Normalize: IDI_FOO_BAR_FX -> foo_bar.fx
-    std::string fxFileName;
-    if (pResource && strncmp(pResource, "IDI_", 4) == 0)
-    {
-        std::string name = ToLower(pResource + 4); // "VISUALTREATMENT_FX" => "visualtreatment_fx"
-        if (name.size() > 3 && name.substr(name.size() - 3) == "_fx")
-            name = name.substr(0, name.size() - 3); // remove "_fx"
-
-        std::string fxOverridePath = "fx/" + name + ".fx";
-
-        FILE* file = fopen(fxOverridePath.c_str(), "rb");
-        if (file)
-        {
-            fclose(file);
-            cusprintf("[Override] Loading %s instead of resource.\n", fxOverridePath.c_str());
-
-            FXIncludeHandler includeHandler;
-            ID3DXBuffer* err = nullptr;
-            char oldDir[MAX_PATH];
-            GetCurrentDirectoryA(MAX_PATH, oldDir);
-            SetCurrentDirectoryA("fx");
-
-            HRESULT hr = D3DXCreateEffectFromFile(
-                device,
-                fxOverridePath.c_str(), // Use full path here
-                nullptr,
-                &includeHandler,
-                D3DXSHADER_DEBUG,
-                pool,
-                outEffect,
-                &err
-            );
-
-            SetCurrentDirectoryA(oldDir); // restore working directory
-
-            if (FAILED(hr))
-            {
-                if (err)
-                {
-                    cusprintf("[Override] Compilation error: %s\n", (char*)err->GetBufferPointer());
-                    err->Release();
-                }
-                return hr;
-            }
-
-            return S_OK;
-        }
-    }
-
-    // Fallback to game’s original
-    static D3DXCreateEffectFn fallbackThunk = reinterpret_cast<D3DXCreateEffectFn>(0x007E7D76);
-    D3DXCreateEffectFn realFn = OriginalD3DXCreateEffect ? OriginalD3DXCreateEffect : fallbackThunk;
-
-    return realFn(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
-}
 
 void PreloadShaders()
 {
+    printf("[Preload] >>> PreloadShaders() called\n");
+
     if (!g_Device)
     {
         printf("[Error] No valid device to preload shaders.\n");
@@ -223,10 +157,10 @@ void PreloadShaders()
         ID3DXBuffer* errors = nullptr;
         ID3DXEffect* fx = nullptr;
         FXIncludeHandler includeHandler;
-        std::string filename = entry.path().string();
+        std::string localFxName = name + ".fx";
         HRESULT hr = D3DXCreateEffectFromFile(
             g_Device,
-            filename.c_str(),
+            localFxName.c_str(),
             nullptr,
             &includeHandler,
             D3DXSHADER_DEBUG,
@@ -247,8 +181,109 @@ void PreloadShaders()
         }
 
         std::string key = "IDI_" + ToUpper(name) + "_FX";
+        printf("[Preload] Caching shader with key: %s\n", key.c_str()); // This should print "IDI_VISUALTREATMENT_FX"
         g_PrecompiledEffects[key] = fx;
     }
+}
+
+HRESULT WINAPI ShaderWrapper(
+    IDirect3DDevice9* device,
+    HMODULE hModule,
+    LPCSTR pResource,
+    const D3DXMACRO* defines,
+    LPD3DXINCLUDE include,
+    DWORD flags,
+    ID3DXEffectPool* pool,
+    ID3DXEffect** outEffect,
+    ID3DXBuffer** outErrors)
+{
+    g_ResolvedShaderName = pResource;
+    printf("[Wrapper] Shader = %s\n", pResource ? pResource : "(null)");
+
+    // ✅ Assign g_Device here (since Hooked_CreateEffectFromResource is not used)
+    if (!g_Device && device)
+    {
+        g_Device = device;
+        printf("[Wrapper] g_Device assigned = %p\n", g_Device);
+
+        if (!g_PreloadTriggered)
+        {
+            printf("[Wrapper] >>> Calling PreloadShaders()\n");
+            PreloadShaders();
+            g_PreloadTriggered = true;
+        }
+    }
+
+    // Normalize the key (since cache uses uppercase)
+    std::string key = ToUpper(std::string(pResource));
+    auto it = g_PrecompiledEffects.find(key);
+    if (it != g_PrecompiledEffects.end())
+    {
+        *outEffect = it->second;
+        printf("[Wrapper] Using precompiled cache for %s\n", key.c_str());
+        return S_OK;
+    }
+
+    printf("[Wrapper] No cache found for key: %s\n", key.c_str());
+
+    if (pResource && strncmp(pResource, "IDI_", 4) == 0)
+    {
+        std::string name = ToLower(pResource + 4);
+        if (name.size() > 3 && name.substr(name.size() - 3) == "_fx")
+            name = name.substr(0, name.size() - 3);
+
+        std::string fxPath = "fx/" + name + ".fx";
+
+        FILE* f = fopen(fxPath.c_str(), "rb");
+        if (f)
+        {
+            fseek(f, 0, SEEK_END);
+            size_t len = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            std::vector<char> buffer(len);
+            fread(buffer.data(), 1, len, f);
+            fclose(f);
+
+            cusprintf("[Override] Loading %s instead of resource.\n", fxPath.c_str());
+
+            ID3DXBuffer* errors = nullptr;
+            ID3DXEffect* fx = nullptr;
+            FXIncludeHandler includeHandler;
+
+            HRESULT hr = D3DXCreateEffect(
+                device,
+                buffer.data(), (UINT)len,
+                nullptr,
+                &includeHandler,
+                D3DXSHADER_DEBUG,
+                pool,
+                &fx,
+                &errors);
+
+            if (FAILED(hr))
+            {
+                if (errors)
+                {
+                    fwrite(errors->GetBufferPointer(), 1, errors->GetBufferSize(), stderr);
+                    cusprintf("[Override] Compilation error: %s\n", (char*)errors->GetBufferPointer());
+                    errors->Release();
+                }
+                else
+                {
+                    cusprintf("[Override] Failed to compile %s.fx, HRESULT: 0x%X\n", fxPath.c_str(), hr);
+                }
+            }
+
+            *outEffect = fx;
+            return S_OK;
+        }
+    }
+
+    // fallback
+    static D3DXCreateEffectFn fallbackThunk = reinterpret_cast<D3DXCreateEffectFn>(0x007E7D76);
+    D3DXCreateEffectFn realFn = OriginalD3DXCreateEffect ? OriginalD3DXCreateEffect : fallbackThunk;
+
+    return realFn(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
 }
 
 HRESULT WINAPI Hooked_CreateEffectFromResource(
@@ -262,7 +297,19 @@ HRESULT WINAPI Hooked_CreateEffectFromResource(
     ID3DXEffect** outEffect,
     ID3DXBuffer** outErrors)
 {
-    g_Device = device;
+    if (!g_Device)
+    {
+        g_Device = device;
+        printf("[Hook] g_Device initialized = %p\n", g_Device);
+
+        if (!g_PreloadTriggered)
+        {
+            printf("[Hook] >>> Calling PreloadShaders()\n");
+            PreloadShaders();
+            g_PreloadTriggered = true;
+        }
+    }
+
     return ShaderWrapper(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
 }
 
