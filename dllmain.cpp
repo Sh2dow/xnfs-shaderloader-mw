@@ -1,220 +1,404 @@
-﻿// NFSMW Shader Compiler & Loader (Trampoline Style)
-#include "stdafx.h"
-#include <windows.h>
+﻿#include <windows.h>
 #include <d3d9.h>
-#include <d3dx9effect.h>
+#include <d3dx9.h>
+#include <cstdio>
+#include <MinHook.h>
+#include <shlwapi.h> // for PathFileExistsA
 #include <string>
 #include <vector>
-#include <cstdio>
-#include "includes/injector/injector.hpp"
+#include <iostream>
+#include <fstream>
+#include <sstream>
 
-#define SafeRelease(p) { if(p) { (p)->Release(); (p)=nullptr; } }
+#pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "d3dx9.lib")
+#pragma comment(lib, "Shlwapi.lib")
 
-// Maximum number of shader entries expected
-static const unsigned int kMaxShaderEntries = 512;
+// Globals
+typedef HRESULT (WINAPI*EndScene_t)(LPDIRECT3DDEVICE9);
+LPD3DXEFFECT g_pEffect = nullptr;
+EndScene_t g_OriginalEndScene = nullptr;
 
-// Last successfully loaded effect for fallback
-static LPD3DXEFFECT g_LastValidEffect = nullptr;
-
-// Utility for logging
-int __cdecl cusprintf(const char* Format, ...)
+// Utility log
+void Log(const char* fmt, ...)
 {
-    va_list ArgList;
-    int Result;
-    va_start(ArgList, Format);
-    Result = vprintf(Format, ArgList);
-    va_end(ArgList);
-    return Result;
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsprintf(buf, fmt, args);
+    va_end(args);
+    std::cout << "[Hook] " << buf << std::endl;
 }
 
-void DetectEffectBinding(LPD3DXEFFECT fx)
+// Shader loading stub
+void LoadFXFiles(LPDIRECT3DDEVICE9 device)
 {
-    for (uintptr_t addr = 0x00980000; addr < 0x00990000; addr += 4)
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA("FX\\*.fx", &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do
     {
-        if (*(LPD3DXEFFECT*)addr == fx)
-        {
-            cusprintf("[Detect] Effect pointer %p stored at 0x%08X\n", fx, (unsigned int)addr);
-        }
-    }
-}
+        std::string path = "FX\\" + std::string(fd.cFileName);
+        Log("Found shader: %s", path.c_str());
 
-// If override compile or resource load fails, fallback here
-static HRESULT ReturnWithFallback(
-    IDirect3DDevice9* pDevice,
-    HMODULE hSrcModule,
-    LPCSTR pSrcResource,
-    const D3DXMACRO* pDefines,
-    LPD3DXINCLUDE pInclude,
-    DWORD Flags,
-    ID3DXEffectPool* pPool,
-    ID3DXEffect** ppEffect,
-    ID3DXBuffer** ppCompilationErrors)
-{
-    if (g_LastValidEffect)
-    {
-        g_LastValidEffect->AddRef();
-        *ppEffect = g_LastValidEffect;
-        return S_OK;
-    }
-    return D3DXCreateEffectFromResource(
-        pDevice, hSrcModule, pSrcResource,
-        pDefines, pInclude, Flags,
-        pPool, ppEffect, ppCompilationErrors
-    );
-}
+        ID3DXEffect* pEffect = nullptr;
+        ID3DXBuffer* pErrors = nullptr;
+        HRESULT hr = D3DXCreateEffectFromFileA(device, path.c_str(), NULL, NULL, D3DXSHADER_DEBUG, NULL, &pEffect, &pErrors);
+        Log("D3DXCreateEffectFromFileA returned HRESULT: 0x%08X", hr); // <-- add this line
 
-static void ShowSafeShaderErrorMessage(ID3DXBuffer* pErrBuf)
-{
-    if (!pErrBuf || !pErrBuf->GetBufferPointer() || pErrBuf->GetBufferSize() == 0)
-    {
-        cusprintf("Shader error: empty or null error buffer.");
-        return;
-    }
-
-    const BYTE* raw = (const BYTE*)pErrBuf->GetBufferPointer();
-    SIZE_T rawLen = pErrBuf->GetBufferSize();
-
-    printf("Shader error raw buffer (%zu bytes):\n", rawLen);
-    for (size_t i = 0; i < rawLen; ++i)
-    {
-        printf("%02X ", raw[i]);
-        if ((i + 1) % 16 == 0) printf("\n");
-    }
-    printf("\n");
-
-    cusprintf("Shader error: see console for raw dump.");
-}
-
-unsigned int CurrentShaderIndex;
-
-HRESULT __stdcall D3DXCreateEffectFromResourceHook(
-    IDirect3DDevice9* pDevice,
-    HMODULE hSrcModule,
-    LPCSTR pSrcResource,
-    const D3DXMACRO* pDefines,
-    LPD3DXINCLUDE pInclude,
-    DWORD Flags,
-    ID3DXEffectPool* pPool,
-    ID3DXEffect** ppEffect,
-    ID3DXBuffer** ppCompilationErrors)
-{
-    SYSTEMTIME st;
-    GetSystemTime(&st);
-    cusprintf("[Init] Shader hook fired at: %02d:%02d:%02d.%03d\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-    unsigned int idx = CurrentShaderIndex;
-    cusprintf("[Hook] Shader index received: %u\n", idx);
-    cusprintf("Table address: 0x%08X + %u * 4 = 0x%08X\n", 0x008F9BE8, idx, 0x008F9BE8 + idx * 4);
-
-    if (!pSrcResource || IsBadReadPtr(pSrcResource, 4)) {
-        cusprintf("[Hook] Invalid pSrcResource!\n");
-        return E_FAIL;
-    }
-
-    if (idx >= kMaxShaderEntries)
-    {
-        cusprintf("Shader index out of bounds (%u), falling back.\n", idx);
-        return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-    }
-
-    const uintptr_t tableBase = 0x008F9BE8;
-    uintptr_t entryOffset = idx * sizeof(char*);
-
-    if ((tableBase + entryOffset) > 0x00900000) {
-        cusprintf("[Hook] Calculated entry pointer is out-of-bounds!\n");
-        return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-    }
-
-    char** entryPtr = reinterpret_cast<char**>(tableBase + entryOffset);
-    if (!entryPtr || IsBadReadPtr(entryPtr, sizeof(char*)) || !*entryPtr)
-    {
-        cusprintf("Invalid shader pointer for index %u, falling back.\n", idx);
-        return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-    }
-
-    const char* rawPath = *entryPtr;
-    cusprintf("Resolved entryPtr: 0x%p\n", entryPtr);
-    cusprintf("Raw shader name: %s\n", rawPath);
-
-    if (strncmp(rawPath, "IDI_", 4) == 0 || strncmp(rawPath, "IDI\\", 4) == 0)
-    {
-        cusprintf("Loading IDI_* resource: %s\n", rawPath);
-        HRESULT result = D3DXCreateEffectFromResource(pDevice, hSrcModule, rawPath, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
-        if (SUCCEEDED(result))
-        {
-            LPD3DXEFFECT effect = *ppEffect;
-            DetectEffectBinding(effect); // log only
-        }
-        return result;
-    }
-
-    char filenameBuf[256];
-    strncpy(filenameBuf, rawPath, sizeof(filenameBuf)-1);
-    char* dot = strrchr(filenameBuf, '.');
-    if (dot) strcpy(dot, ".fx"); else strcat(filenameBuf, ".fx");
-    std::string overridePath = std::string("fx/") + filenameBuf;
-
-    FILE* f = fopen(overridePath.c_str(), "rb");
-    if (f)
-    {
-        cusprintf("Overriding shader with file: %s\n", overridePath.c_str());
-        fseek(f, 0, SEEK_END);
-        long len = ftell(f);
-        fseek(f, 0, SEEK_SET);
-
-        std::vector<char> data(len);
-        fread(data.data(), 1, len, f);
-        fclose(f);
-
-        ID3DXBuffer* errorBuf = nullptr;
-        ID3DXEffect* effect = nullptr;
-        HRESULT hr = D3DXCreateEffect(
-            pDevice,
-            data.data(), static_cast<UINT>(len),
-            pDefines, pInclude, Flags,
-            pPool, &effect, &errorBuf
-        );
         if (FAILED(hr))
         {
-            cusprintf("Override compile failed (0x%08X).\n", hr);
-            ShowSafeShaderErrorMessage(errorBuf);
-            SafeRelease(errorBuf);
-            return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+            Log("Failed to compile: %s", path.c_str());
+            if (pErrors)
+            {
+                Log("Shader error: %s", (char*)pErrors->GetBufferPointer());
+                pErrors->Release();
+            }
         }
-        g_LastValidEffect = effect;
-        *ppEffect = effect;
-        return S_OK;
+        else
+        {
+            Log("Successfully loaded: %s", path.c_str());
+            pEffect->Release();
+        }
     }
-
-    cusprintf("No override for %s, using original.\n", rawPath);
-    return ReturnWithFallback(pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool, ppEffect, ppCompilationErrors);
+    while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
 }
 
-__declspec(naked) void ShaderHookStub()
+// Hook
+static ID3DXEffect* g_VisualTreatment = nullptr;
+LPDIRECT3DVERTEXBUFFER9 g_pVertexBuffer = nullptr;
+
+struct CUSTOMVERTEX
 {
-    __asm {
-        push eax
-        mov eax, edx
-        mov CurrentShaderIndex, eax
-        pop eax
-        jmp D3DXCreateEffectFromResourceHook
-    }
+    float x, y, z, rhw;
+    float u, v;
+};
+
+#define D3DFVF_CUSTOMVERTEX (D3DFVF_XYZRHW | D3DFVF_TEX1)
+
+struct ScreenVertex
+{
+    float x, y, z, rhw; // Position in screen space
+    float u, v; // Texture coordinates
+};
+
+void DrawFullScreenQuad(LPDIRECT3DDEVICE9 pDevice)
+{
+    D3DVIEWPORT9 vp;
+    pDevice->GetViewport(&vp);
+
+    float w = (float)vp.Width;
+    float h = (float)vp.Height;
+
+    ScreenVertex quad[4] = {
+        {-0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f},
+        {w - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f},
+        {-0.5f, h - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f},
+        {w - 0.5f, h - 0.5f, 0.0f, 1.0f, 1.0f, 1.0f},
+    };
+
+    pDevice->SetRenderState(D3DRS_ZENABLE, FALSE);
+    pDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
+    pDevice->SetFVF(D3DFVF_CUSTOMVERTEX);
+    pDevice->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(ScreenVertex));
 }
 
-int InitShaderHook()
+typedef HRESULT (WINAPI*D3DXCreateEffectFromFileA_t)(
+    LPDIRECT3DDEVICE9 pDevice,
+    LPCSTR pSrcFile,
+    CONST D3DXMACRO* pDefines,
+    LPD3DXINCLUDE pInclude,
+    DWORD Flags,
+    LPD3DXEFFECTPOOL pPool,
+    LPD3DXEFFECT* ppEffect,
+    LPD3DXBUFFER* ppCompilationErrors);
+
+D3DXCreateEffectFromFileA_t OriginalCreateEffectFromFileA = nullptr;
+
+typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceA_t)(
+    LPDIRECT3DDEVICE9 pDevice,
+    HMODULE hSrcModule,
+    LPCSTR pResource,
+    CONST D3DXMACRO* pDefines,
+    LPD3DXINCLUDE pInclude,
+    DWORD Flags,
+    LPD3DXEFFECTPOOL pPool,
+    LPD3DXEFFECT* ppEffect,
+    LPD3DXBUFFER* ppCompilationErrors);
+
+D3DXCreateEffectFromResourceA_t OriginalCreateEffectFromResourceA = nullptr;
+
+HRESULT WINAPI HookedCreateEffectFromResourceA(
+    LPDIRECT3DDEVICE9 pDevice,
+    HMODULE hSrcModule,
+    LPCSTR pResource,
+    CONST D3DXMACRO* pDefines,
+    LPD3DXINCLUDE pInclude,
+    DWORD Flags,
+    LPD3DXEFFECTPOOL pPool,
+    LPD3DXEFFECT* ppEffect,
+    LPD3DXBUFFER* ppCompilationErrors)
 {
-    injector::MakeCALL(0x006C60D2, ShaderHookStub, true);
+    Log("[Hook] D3DXCreateEffectFromResourceA called with resource: %s", pResource ? pResource : "nullptr");
+
+    if (pResource && strcmp(pResource, "IDI_VISUALTREATMENT_FX") == 0)
+    {
+        std::string customPath = "FX\\visualtreatment.fx";
+        if (PathFileExistsA(customPath.c_str()))
+        {
+            Log("[Hook] Loading custom visualtreatment.fx from FX folder\n");
+            HRESULT hr = D3DXCreateEffectFromFileA(
+                pDevice,
+                customPath.c_str(),
+                pDefines,
+                pInclude,
+                Flags,
+                pPool,
+                ppEffect,
+                ppCompilationErrors);
+
+            if (SUCCEEDED(hr) && ppEffect && *ppEffect)
+            {
+                Log("[Hook] Successfully loaded replacement shader.\n");
+                g_VisualTreatment = *ppEffect;
+                return hr;
+            }
+
+            if (ppCompilationErrors && *ppCompilationErrors)
+            {
+                Log("[Hook] Shader compile error: %s", (char*)(*ppCompilationErrors)->GetBufferPointer());
+            }
+
+            Log("[Hook] Failed to compile replacement shader, falling back to original.\n");
+        }
+        else
+        {
+            Log("[Hook] File not found: %s", customPath.c_str());
+        }
+    }
+
+    return OriginalCreateEffectFromResourceA(
+        pDevice, hSrcModule, pResource, pDefines, pInclude,
+        Flags, pPool, ppEffect, ppCompilationErrors);
+}
+
+HRESULT WINAPI HookedEndScene(LPDIRECT3DDEVICE9 pDevice)
+{
+    Log("[Hook] EndScene called.");
+
+    static bool loggedTechniques = false;
+
+    if (g_VisualTreatment)
+    __try {
+        // Set screen size if used by your shader
+        D3DXVECTOR4 screenSize(1280.0f, 720.0f, 1.0f / 1280.0f, 1.0f / 720.0f);
+        g_VisualTreatment->SetVector("gScreenSize", &screenSize);
+
+        if (!loggedTechniques)
+        {
+            for (UINT i = 0; ; ++i)
+            {
+                D3DXHANDLE tech = g_VisualTreatment->GetTechnique(i);
+                if (!tech) break;
+                D3DXTECHNIQUE_DESC desc;
+                if (SUCCEEDED(g_VisualTreatment->GetTechniqueDesc(tech, &desc)))
+                {
+                    Log("Technique[%u]: %s", i, desc.Name);
+                }
+            }
+            loggedTechniques = true;
+        }
+
+        // Select the first technique available
+        D3DXHANDLE hTechnique = nullptr;
+        D3DXEFFECT_DESC effectDesc;
+        if (SUCCEEDED(g_VisualTreatment->GetDesc(&effectDesc)))
+        {
+            for (UINT i = 0; i < effectDesc.Techniques; ++i)
+            {
+                hTechnique = g_VisualTreatment->GetTechnique(i);
+                if (SUCCEEDED(g_VisualTreatment->ValidateTechnique(hTechnique)))
+                {
+                    g_VisualTreatment->SetTechnique(hTechnique);
+                    Log("Using technique index: %u", i);
+                    break;
+                }
+            }
+        }
+
+        UINT passes = 0;
+        if (hTechnique && SUCCEEDED(g_VisualTreatment->Begin(&passes, 0)))
+        {
+            for (UINT i = 0; i < passes; ++i)
+            {
+                g_VisualTreatment->BeginPass(i);
+                DrawFullScreenQuad(pDevice);
+                g_VisualTreatment->EndPass();
+            }
+            g_VisualTreatment->End();
+        }
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("[Hook] Exception occurred in EndScene effect rendering.");
+    }
+
+    if (g_OriginalEndScene)
+        return g_OriginalEndScene(pDevice);
+
+    Log("[Hook] g_OriginalEndScene is null!");
+    return D3D_OK;
+}
+
+HRESULT WINAPI HookedCreateEffectFromFileA(
+    LPDIRECT3DDEVICE9 pDevice,
+    LPCSTR pSrcFile,
+    CONST D3DXMACRO* pDefines,
+    LPD3DXINCLUDE pInclude,
+    DWORD Flags,
+    LPD3DXEFFECTPOOL pPool,
+    LPD3DXEFFECT* ppEffect,
+    LPD3DXBUFFER* ppCompilationErrors)
+{
+    Log("[Hook] D3DXCreateEffectFromFileA called with file: %s", pSrcFile ? pSrcFile : "nullptr");
+
+    return OriginalCreateEffectFromFileA(
+        pDevice, pSrcFile, pDefines, pInclude,
+        Flags, pPool, ppEffect, ppCompilationErrors);
+}
+
+// Entry point
+DWORD WINAPI InitThread(LPVOID)
+{
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+
+    Log("Initializing hook...");
+
+    // Wait for d3dx9_43.dll to be loaded
+    while (!GetModuleHandleA("d3dx9_43.dll")) Sleep(100);
+
+    HMODULE d3dx9 = GetModuleHandleA("d3dx9_43.dll");
+    void* effectFunc = GetProcAddress(d3dx9, "D3DXCreateEffectFromResourceA");
+    if (!effectFunc)
+    {
+        Log("[Hook] Failed to locate D3DXCreateEffectFromResourceA");
+        return 0;
+    }
+
+    void* fxFileFunc = GetProcAddress(d3dx9, "D3DXCreateEffectFromFileA");
+    if (fxFileFunc)
+    {
+        Log("[Hook] Found D3DXCreateEffectFromFileA at %p", fxFileFunc);
+        MH_CreateHook(fxFileFunc, HookedCreateEffectFromFileA,
+                      reinterpret_cast<void**>(&OriginalCreateEffectFromFileA));
+        MH_EnableHook(fxFileFunc);
+    }
+    else
+    {
+        Log("[Hook] D3DXCreateEffectFromFileA not found.");
+    }
+
+    // Create dummy window
+    WNDCLASSEXA wc = {
+        sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L,
+        GetModuleHandle(NULL), NULL, NULL, NULL, NULL,
+        "DummyWindowClass", NULL
+    };
+    RegisterClassExA(&wc);
+    HWND hWnd = CreateWindowA("DummyWindowClass", "Dummy", WS_OVERLAPPEDWINDOW,
+                              0, 0, 100, 100, NULL, NULL, wc.hInstance, NULL);
+
+    if (!hWnd)
+    {
+        Log("[Hook] CreateWindowA failed.");
+        return 0;
+    }
+
+    ShowWindow(hWnd, SW_HIDE);
+    UpdateWindow(hWnd);
+
+    LPDIRECT3D9 pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!pD3D)
+    {
+        Log("[Hook] Direct3DCreate9 failed.");
+        return 0;
+    }
+
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.hDeviceWindow = hWnd;
+
+    LPDIRECT3DDEVICE9 pDevice = nullptr;
+    HRESULT hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL,
+                                    hWnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &pDevice);
+
+    if (FAILED(hr))
+    {
+        Log("[Hook] HAL device failed. Trying REF...");
+        hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_REF,
+                                hWnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &pDevice);
+    }
+
+    if (FAILED(hr) || !pDevice)
+    {
+        Log("[Hook] REF device also failed. HRESULT: 0x%08X", hr);
+        DestroyWindow(hWnd);
+        UnregisterClassA("DummyWindowClass", GetModuleHandle(NULL));
+        pD3D->Release();
+        return 0;
+    }
+
+    // void** vtable = *reinterpret_cast<void***>(pDevice);
+    // void* endSceneAddr = vtable[42];
+    // Log("[Hook] EndScene address: %p", endSceneAddr);
+
+    void* endSceneAddr = (void*)0x71B96420;
+    Log("[Hook] Using hardcoded EndScene address: %p", endSceneAddr);
+
+
+    if (MH_Initialize() != MH_OK)
+    {
+        Log("[Hook] MH_Initialize failed.");
+        return 0;
+    }
+    if (MH_CreateHook(effectFunc, HookedCreateEffectFromResourceA,
+                      reinterpret_cast<void**>(&OriginalCreateEffectFromResourceA)) != MH_OK)
+    {
+        Log("[Hook] Failed to create hook for D3DXCreateEffectFromResourceA");
+    }
+    if (MH_CreateHook(endSceneAddr, &HookedEndScene, reinterpret_cast<void**>(&g_OriginalEndScene)) != MH_OK)
+    {
+        Log("[Hook] Failed to create hook for EndScene");
+    }
+    if (MH_EnableHook(effectFunc) != MH_OK)
+    {
+        Log("[Hook] Failed to enable hook for D3DXCreateEffectFromResourceA");
+    }
+    if (MH_EnableHook(endSceneAddr) != MH_OK)
+    {
+        Log("[Hook] Failed to enable hook for EndScene");
+    }
+
+    Log("[Hook] Hooks installed.");
+
+    pDevice->Release();
+    pD3D->Release();
+    DestroyWindow(hWnd);
+    UnregisterClassA("DummyWindowClass", GetModuleHandle(NULL));
+
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*lpReserved*/)
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
-        AllocConsole();
-        freopen("CONOUT$", "w", stdout);
-        freopen("CONOUT$", "w", stderr);
-        InitShaderHook();
+        DisableThreadLibraryCalls(hModule);
+        InitThread(0);
     }
     return TRUE;
 }

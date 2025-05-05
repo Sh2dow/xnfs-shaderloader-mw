@@ -1,0 +1,13 @@
+[core]
+	repositoryformatversion = 0
+	filemode = false
+	bare = false
+	logallrefupdates = true
+	symlinks = false
+	ignorecase = true
+[submodule]
+	active = .	
+[submodule "Modules/Detours"]
+	url = https://github.com/microsoft/Detours.git
+[submodule "Modules/minhook"]
+	url = https://github.com/TsudaKageyu/minhook.git
