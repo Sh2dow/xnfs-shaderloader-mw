@@ -7,18 +7,68 @@
 #include <cctype>
 #include <unordered_set>
 #include "includes/injector/injector.hpp"
-#include "includes/d3d9.h"
-#include "includes/d3dx9shader.h" // for ID3DXEffectCompiler
+#include "d3d9.h"
+#include "d3dx9shader.h" // for ID3DXEffectCompiler
 
 // -------------------- GLOBALS --------------------
+#define SHADER_TABLE_ADDRESS 0x008F9B60
 
 LPDIRECT3DDEVICE9 g_Device = nullptr;
 
 std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
 std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
 std::unordered_set<std::string> g_FxOverrides;
+ID3DXEffect* g_GameShaderTable[31]; // hypothetical
 
-static std::atomic<int> g_HookCallCount{0};
+struct ShaderInfo
+{
+    std::string key;
+    ID3DXEffect* effect;
+};
+
+std::unordered_map<std::string, ShaderInfo> g_ActiveEffects;
+
+std::unordered_map<std::string, int> g_ShaderSlotMap = {
+    { "IDI_WORLD_FX", 0 },
+    { "IDI_WORLDREFLECT_FX", 1 },
+    { "IDI_WORLDBONE_FX", 2 },
+    { "IDI_WORLDNORMALMAP_FX", 3 },
+    { "IDI_CAR_FX", 4 },
+    { "IDI_GLOSSYWINDOW_FX", 5 },
+    { "IDI_TREE_FX", 6 },
+    { "IDI_WORLDMIN_FX", 7 },
+    { "IDI_WORLDNOFOG_FX", 8 },
+    { "IDI_FE_FX", 9 },
+    { "IDI_FE_MASK_FX", 10 },
+    { "IDI_FILTER_FX", 11 },
+    { "IDI_OVERBRIGHT_FX", 12 },
+    { "IDI_SCREENFILTER_FX", 13 },
+    { "IDI_RAIN_DROP_FX", 14 },
+    { "IDI_RUNWAYLIGHT_FX", 15 },
+    { "IDI_VISUALTREATMENT_FX", 16 },
+    { "IDI_WORLDPRELIT_FX", 17 },
+    { "IDI_PARTICLES_FX", 18 },
+    { "IDI_SKYBOX_FX", 19 },
+    { "IDI_SHADOW_MAP_MESH_FX", 20 },
+    { "IDI_SKYBOX_CG_FX", 21 },
+    { "IDI_SHADOW_CG_FX", 22 },
+    { "IDI_CAR_SHADOW_MAP_FX", 23 },
+    { "IDI_WORLDDEPTH_FX", 24 },
+    { "IDI_WORLDNORMALMAPDEPTH_FX", 25 },
+    { "IDI_CARDEPTH_FX", 26 },
+    { "IDI_GLOSSYWINDOWDEPTH_FX", 27 },
+    { "IDI_TREEDEPTH_FX", 28 },
+    { "IDI_SHADOW_MAP_MESH_DEPTH_FX", 29 },
+    { "IDI_WORLDNORMALMAPNOFOG_FX", 30 }
+};
+
+int LookupShaderSlotFromResource(const std::string& key)
+{
+    auto it = g_ShaderSlotMap.find(key);
+    return (it != g_ShaderSlotMap.end()) ? it->second : -1;
+}
+
+int hkReload = VK_F10; // optionally load from INI too
 // -------------------- HELPERS --------------------
 
 std::string ToUpper(const std::string& str)
@@ -128,6 +178,11 @@ bool CompileAndDumpShader(const std::string& key, const std::string& fxPath)
 
 void LoadShaderOverrides()
 {
+    // 🔄 Clear existing state so we don't accumulate duplicates on reload
+    g_ShaderOverridePaths.clear();
+    g_ShaderBuffers.clear();
+    g_FxOverrides.clear();
+
     DWORD attrs = GetFileAttributesA("fx");
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
     {
@@ -226,7 +281,8 @@ HRESULT WINAPI HookedCreateFromResource(
     }
 
     static int g_HookCallCount = 0;
-    printf("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++, pResource ? pResource : "(null)");
+    printf("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++,
+           pResource ? pResource : "(null)");
 
     if (g_FxOverrides.count(pResource))
     {
@@ -246,7 +302,18 @@ HRESULT WINAPI HookedCreateFromResource(
                                           outEffect, outErrors);
             if (SUCCEEDED(hr) && *outEffect)
             {
-                printf("[Hook] Loaded compiled FX override for %s\n", pResource);
+                g_ActiveEffects[pResource] = {pResource, *outEffect};
+
+                // You must know the shader index! If you don't — track it manually or from EDX
+                // For now assume index known by map:
+                int index = LookupShaderSlotFromResource(pResource);
+                if (index >= 0)
+                {
+                    ID3DXEffect** shaderTable = reinterpret_cast<ID3DXEffect**>(SHADER_TABLE_ADDRESS);
+                    shaderTable[index] = *outEffect;
+                    printf("[Patch] Overwrote shader slot %d with reloaded effect for %s\n", index, pResource);
+                }
+
                 return S_OK;
             }
 
@@ -257,7 +324,7 @@ HRESULT WINAPI HookedCreateFromResource(
             printf("[Hook] Failed to open compiled file: %s\n", path.c_str());
         }
     }
-    
+
     // Fallback: load compiled shader from game root if it exists and wasn't compiled from .fx
     if (!g_FxOverrides.count(pResource) && strncmp(pResource, "IDI_", 4) == 0)
     {
@@ -288,6 +355,76 @@ HRESULT WINAPI HookedCreateFromResource(
     return RealCreateFromResource(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
 }
 
+void ReloadTrackedEffects()
+{
+    for (auto it = g_ActiveEffects.begin(); it != g_ActiveEffects.end(); ++it)
+    {
+        const std::string& key = it->first;
+        ShaderInfo& shader = it->second;
+
+        printf("[ReloadTrack] Recompiling and reloading: %s\n", key.c_str());
+
+        if (shader.effect)
+        {
+            shader.effect = nullptr;
+        }
+
+        LPD3DXEFFECT fx = nullptr;
+        LPD3DXBUFFER err = nullptr;
+
+        FXIncludeHandler includeHandler;
+        HRESULT hr = D3DXCreateEffectFromResourceA(
+            g_Device,
+            GetModuleHandle(nullptr),
+            key.c_str(),
+            nullptr, // D3DXMACRO*
+            &includeHandler, // ID3DXInclude*
+            D3DXSHADER_DEBUG, // Flags
+            nullptr, // LPD3DXEFFECTPOOL
+            &fx, // Output effect
+            &err // Output error buffer
+        );
+
+        if (SUCCEEDED(hr))
+        {
+            shader.effect = fx;
+            printf("[ReloadTrack] Reloaded effect for: %s\n", key.c_str());
+        }
+        else
+        {
+            printf("[ReloadTrack] Failed to reload: %s\n", key.c_str());
+            if (err)
+            {
+                printf("[ReloadTrack] Error: %s\n", (char*)err->GetBufferPointer());
+                err->Release();
+            }
+        }
+    }
+}
+
+DWORD WINAPI HotkeyThread(LPVOID)
+{
+    printf("[HotkeyThread] Started and waiting for F10...\n");
+
+    while (true)
+    {
+        if (GetAsyncKeyState(hkReload) & 1)
+        {
+            printf("[HotkeyThread] F10 pressed — recompiling shaders...\n");
+            LoadShaderOverrides();
+            ReloadTrackedEffects(); // ← 🔁 call the generic reload
+            printf("[HotkeyThread] Shader reload complete.\n");
+
+            while (GetAsyncKeyState(hkReload) & 0x8000)
+                Sleep(10);
+        }
+
+        Sleep(10);
+    }
+
+    return 0;
+}
+
 // -------------------- DllMain --------------------
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
@@ -306,6 +443,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             RealCreateFromResource = (D3DXCreateEffectFromResourceAFn)addr;
             injector::MakeCALL(0x006C60D2, HookedCreateFromResource, true);
             printf("[Init] Hooked D3DXCreateEffectFromResourceA\n");
+            // ✅ Correct: Launch F1 hotkey thread *after* setup
+            HANDLE hThread = CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
+            if (hThread)
+                printf("[Init] Hotkey thread started successfully.\n");
+            else
+                printf("[Init] Failed to start hotkey thread! Error: %lu\n", GetLastError());
         }
     }
     return TRUE;
