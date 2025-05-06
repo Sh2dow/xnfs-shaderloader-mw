@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cctype>
 #include "includes/injector/injector.hpp"
-#include <d3dx9shader.h> // for ID3DXEffectCompiler
+#include "includes/d3dx9shader.h" // for ID3DXEffectCompiler
 #include <unordered_set>
 
 // -------------------- GLOBALS --------------------
