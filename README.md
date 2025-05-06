@@ -1,6 +1,6 @@
-# NFS Carbon Shader Compiler & Loader
+# NFS MW Shader Compiler & Loader
 
-This is a simple hook for the shader loader in NFS Carbon.
+This is a simple hook for the shader loader in NFS Most Wanted.
 
 
 
