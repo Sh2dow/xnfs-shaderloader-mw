@@ -5,7 +5,7 @@ on:
     branches:
       - master
     tags:
-      - 'v*.*.*.*'  # Release tags like v1.2.3.4
+      - 'v*.*.*.*'  # Triggers on tags 
 
 jobs:
   build:
@@ -17,59 +17,65 @@ jobs:
         with:
           submodules: true
 
-      - name: Locate .sln file and set SOLUTION_NAME
-        shell: pwsh
+      - name: Find solution file dynamically
         run: |
-          $sln = Get-ChildItem -Recurse -Filter *.sln | Select-Object -First 1
-          if (-not $sln) {
-            Write-Error "No .sln file found"
-            exit 1
-          }
-          $solutionName = [System.IO.Path]::GetFileNameWithoutExtension($sln.Name)
+          $solution = Get-ChildItem -Recurse -Filter *.sln | Select-Object -First 1
+          $solutionName = [System.IO.Path]::GetFileNameWithoutExtension($solution.Name)
           echo "SOLUTION_NAME=$solutionName" >> $env:GITHUB_ENV
-          echo "SOLUTION_PATH=$($sln.FullName)" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Cache vcpkg
+        uses: actions/cache@v3
+        with:
+          path: |
+            ./vcpkg
+            ./vcpkg_installed
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
+
+      - name: Update submodules
+        run: git submodule update --init --recursive
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v1.0.2
 
-      - name: Install v143 toolset (VS 2022)
-        run: choco install visualstudio2022buildtools --package-parameters "--add Microsoft.VisualStudio.Component.VC.v143" -y
+      - name: Install v142 toolset
+        run: |
+          choco install visualstudio2017buildtools --params "--add Microsoft.VisualStudio.Component.VC.v142"
 
-      - name: Build project
-        run: msbuild "${{ env.SOLUTION_PATH }}" /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=v143
-        shell: pwsh
+      - name: Build
+        run: msbuild ${{ env.SOLUTION_NAME }}.sln /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=v142
 
-      - name: Upload Artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.SOLUTION_NAME }}-artifacts
-          path: Release/**
-          if-no-files-found: error
+          name: XNFS-ShaderLoader-MW-artifacts
+          path: Release/**/*  # Uploads everything in the Release folder
 
       - name: Zip Build Artifacts
         run: |
-          $zipName = "${{ env.SOLUTION_NAME }}.zip"
-          if (Test-Path "Release/${{ env.SOLUTION_NAME }}") {
-            Compress-Archive -Path "Release/${{ env.SOLUTION_NAME }}/*" -DestinationPath $zipName
-          } elseif (Test-Path "Release") {
-            Compress-Archive -Path "Release/*" -DestinationPath $zipName
+          if (Test-Path Release/${{ env.SOLUTION_NAME }}) {
+            Compress-Archive -Path Release/${{ env.SOLUTION_NAME }}/* -DestinationPath ${{ env.SOLUTION_NAME }}.zip
           } else {
-            Write-Error "Release folder not found"
+            echo "Release folder not found, skipping zip step"
             exit 1
           }
         shell: pwsh
 
       - name: Generate Changelog
         run: |
-          git log --pretty=format:"- %h %s" -n 20 > CHANGELOG.txt
+          echo "# Changelog" > ${{ github.workspace }}/CHANGELOG.txt
+          echo "" >> ${{ github.workspace }}/CHANGELOG.txt
+          git log --pretty=format:"- %h %s" -10 >> ${{ github.workspace }}/CHANGELOG.txt
         shell: pwsh
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Create Release with Assets and Changelog
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ${{ github.ref_name }}
           files: ${{ env.SOLUTION_NAME }}.zip
-          body_path: CHANGELOG.txt
+          body_path: ${{ github.workspace }}/CHANGELOG.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
