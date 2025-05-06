@@ -42,7 +42,7 @@ jobs:
 
       - name: Install v142 toolset
         run: |
-          choco install visualstudio2015buildtools --params "--add Microsoft.VisualStudio.Component.VC.v142"
+          choco install visualstudio2017buildtools --params "--add Microsoft.VisualStudio.Component.VC.v142"
 
       - name: Build
         run: msbuild ${{ env.SOLUTION_NAME }}.sln /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=v142
