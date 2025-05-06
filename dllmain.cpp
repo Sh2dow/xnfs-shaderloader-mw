@@ -1,14 +1,12 @@
 ﻿#include <atomic>
 #include <windows.h>
 #include <d3d9.h>
-#include <d3dx9effect.h>
 #include <unordered_map>
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <cctype>
 #include "includes/injector/injector.hpp"
-#include <d3dx9effect.h>
 #include <d3dx9shader.h> // for ID3DXEffectCompiler
 #include <unordered_set>
 
