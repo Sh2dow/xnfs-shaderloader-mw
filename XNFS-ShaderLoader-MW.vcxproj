@@ -92,6 +92,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="stdafx.h" />
+    <ClInclude Include="includes\d3d9.h" />
     <ClInclude Include="includes\d3dx9shader.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>

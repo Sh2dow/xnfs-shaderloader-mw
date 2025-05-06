@@ -1,14 +1,14 @@
 ﻿#include <atomic>
 #include <windows.h>
-#include <d3d9.h>
 #include <unordered_map>
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <cctype>
-#include "includes/injector/injector.hpp"
-#include "includes/d3dx9shader.h" // for ID3DXEffectCompiler
 #include <unordered_set>
+#include "includes/injector/injector.hpp"
+#include "includes/d3d9.h"
+#include "includes/d3dx9shader.h" // for ID3DXEffectCompiler
 
 // -------------------- GLOBALS --------------------
 
