@@ -11,14 +11,13 @@
 #include "d3dx9shader.h" // for ID3DXEffectCompiler
 
 // -------------------- GLOBALS --------------------
-#define SHADER_TABLE_ADDRESS 0x008F9B60
+#define SHADER_TABLE_PTR reinterpret_cast<ID3DXEffect**>(0x0094D9C4)
 
 LPDIRECT3DDEVICE9 g_Device = nullptr;
 
 std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
 std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
 std::unordered_set<std::string> g_FxOverrides;
-ID3DXEffect* g_GameShaderTable[31]; // hypothetical
 
 struct ShaderInfo
 {
@@ -59,12 +58,15 @@ std::unordered_map<std::string, int> g_ShaderSlotMap = {
     { "IDI_GLOSSYWINDOWDEPTH_FX", 27 },
     { "IDI_TREEDEPTH_FX", 28 },
     { "IDI_SHADOW_MAP_MESH_DEPTH_FX", 29 },
-    { "IDI_WORLDNORMALMAPNOFOG_FX", 30 }
+    { "IDI_WORLDNORMALMAPNOFOG_FX", 30 },
+    { "IDI_GLASSREFLECTSHADER_FX", 31 }
 };
 
 int LookupShaderSlotFromResource(const std::string& key)
 {
     auto it = g_ShaderSlotMap.find(key);
+    if (it == g_ShaderSlotMap.end())
+        printf("[Lookup] WARNING: Shader %s not mapped to a slot!\n", key.c_str());
     return (it != g_ShaderSlotMap.end()) ? it->second : -1;
 }
 
@@ -302,20 +304,25 @@ HRESULT WINAPI HookedCreateFromResource(
                                           outEffect, outErrors);
             if (SUCCEEDED(hr) && *outEffect)
             {
-                g_ActiveEffects[pResource] = {pResource, *outEffect};
+                bool patched = false;
 
-                // You must know the shader index! If you don't — track it manually or from EDX
-                // For now assume index known by map:
                 int index = LookupShaderSlotFromResource(pResource);
-                if (index >= 0)
+                if (index >= 0 && index < 64)
                 {
-                    ID3DXEffect** shaderTable = reinterpret_cast<ID3DXEffect**>(SHADER_TABLE_ADDRESS);
-                    shaderTable[index] = *outEffect;
-                    printf("[Patch] Overwrote shader slot %d with reloaded effect for %s\n", index, pResource);
+                    SHADER_TABLE_PTR[index] = *outEffect;
+                    printf("[Patch] ✅ Replaced live shader slot %d for %s\n", index, pResource);
+                    patched = true;
+                }
+
+                if (!patched)
+                {
+                    g_ActiveEffects[pResource] = { pResource, *outEffect };
+                    printf("[Patch] ⚠️ Shader not found in table — stored in internal map instead: %s\n", pResource);
                 }
 
                 return S_OK;
             }
+
 
             printf("[Hook] Failed to create effect from compiled override for %s\n", pResource);
         }
@@ -388,6 +395,12 @@ void ReloadTrackedEffects()
         if (SUCCEEDED(hr))
         {
             shader.effect = fx;
+            int index = LookupShaderSlotFromResource(key);
+            if (index >= 0 && index < 64)
+            {
+                SHADER_TABLE_PTR[index] = fx;
+                printf("[ReloadTrack] ✅ Updated live shader slot %d\n", index);
+            }
             printf("[ReloadTrack] Reloaded effect for: %s\n", key.c_str());
         }
         else
@@ -436,7 +449,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         freopen("CONOUT$", "w", stderr);
         printf("[Init] Shader override DLL loaded.\n");
 
-        HMODULE d3dx = GetModuleHandleA("d3dx9_26.dll");
+        HMODULE d3dx = GetModuleHandleA("d3dx9_43.dll");
         if (d3dx)
         {
             void* addr = GetProcAddress(d3dx, "D3DXCreateEffectFromResourceA");
