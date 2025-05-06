@@ -192,7 +192,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         freopen("CONOUT$", "w", stderr);
         printf("[Init] Shader override DLL loaded.\n");
 
-        HMODULE d3dx = GetModuleHandleA("d3dx9_26.dll");
+        HMODULE d3dx = GetModuleHandleA("d3dx9_43.dll");
         if (d3dx)
         {
             void* addr = GetProcAddress(d3dx, "D3DXCreateEffectFromResourceA");
