@@ -10,10 +10,9 @@
 #include "includes/injector/injector.hpp"
 #include "d3d9.h"
 #include "d3dx9shader.h" // for ID3DXEffectCompiler
+#include <psapi.h>
 
 // -------------------- GLOBALS --------------------
-#define SHADER_TABLE_PTR reinterpret_cast<ID3DXEffect**>(0x0094D9C4)
-
 namespace std
 {
     class mutex;
@@ -32,6 +31,9 @@ std::atomic<bool> g_DeferredApplyRequested = false;
 std::atomic<int> g_ApplyDelayCountdown = 0;
 std::unordered_set<int> g_PendingShaderClearSlots;
 std::mutex g_PendingShaderClearMutex;
+constexpr int kShaderSlotCount = 64;
+constexpr uintptr_t kShaderTableRVA = 0x0054D9C4;
+constexpr uintptr_t kApplyGraphicsSettingsRVA = 0x002D6000;
 
 struct ShaderInfo
 {
@@ -41,46 +43,74 @@ struct ShaderInfo
 
 std::unordered_map<std::string, ShaderInfo> g_ActiveEffects;
 
-std::unordered_map<std::string, int> g_ShaderSlotMap = {
-    {"IDI_WORLD_FX", 0},
-    {"IDI_WORLDREFLECT_FX", 1},
-    {"IDI_WORLDBONE_FX", 2},
-    {"IDI_WORLDNORMALMAP_FX", 3},
-    {"IDI_CAR_FX", 4},
-    {"IDI_GLOSSYWINDOW_FX", 5},
-    {"IDI_TREE_FX", 6},
-    {"IDI_WORLDMIN_FX", 7},
-    {"IDI_WORLDNOFOG_FX", 8},
-    {"IDI_FE_FX", 9},
-    {"IDI_FE_MASK_FX", 10},
-    {"IDI_FILTER_FX", 11},
-    {"IDI_OVERBRIGHT_FX", 12},
-    {"IDI_SCREENFILTER_FX", 13},
-    {"IDI_RAIN_DROP_FX", 14},
-    {"IDI_RUNWAYLIGHT_FX", 15},
-    {"IDI_VISUALTREATMENT_FX", 16},
-    {"IDI_WORLDPRELIT_FX", 17},
-    {"IDI_PARTICLES_FX", 18},
-    {"IDI_SKYBOX_FX", 19},
-    {"IDI_SHADOW_MAP_MESH_FX", 20},
-    {"IDI_SKYBOX_CG_FX", 21},
-    {"IDI_SHADOW_CG_FX", 22},
-    {"IDI_CAR_SHADOW_MAP_FX", 23},
-    {"IDI_WORLDDEPTH_FX", 24},
-    {"IDI_WORLDNORMALMAPDEPTH_FX", 25},
-    {"IDI_CARDEPTH_FX", 26},
-    {"IDI_GLOSSYWINDOWDEPTH_FX", 27},
-    {"IDI_TREEDEPTH_FX", 28},
-    {"IDI_SHADOW_MAP_MESH_DEPTH_FX", 29},
-    {"IDI_WORLDNORMALMAPNOFOG_FX", 30}
+std::unordered_map<std::string, std::vector<int>> g_ShaderSlotMap = {
+    {"IDI_WORLD_FX", {0, 31}},
+    {"IDI_WORLDREFLECT_FX", {1, 32}},
+    {"IDI_WORLDBONE_FX", {2, 33}},
+    {"IDI_WORLDNORMALMAP_FX", {3, 34}},
+    {"IDI_CAR_FX", {4, 35}},
+    {"IDI_GLOSSYWINDOW_FX", {5, 36}},
+    {"IDI_TREE_FX", {6, 37}},
+    {"IDI_WORLDMIN_FX", {7, 38}},
+    {"IDI_WORLDNOFOG_FX", {8, 39}},
+    {"IDI_FE_FX", {9, 40}},
+    {"IDI_FE_MASK_FX", {10, 41}},
+    {"IDI_FILTER_FX", {11, 42}},
+    {"IDI_OVERBRIGHT_FX", {12, 43}},
+    {"IDI_SCREENFILTER_FX", {13, 44}},
+    {"IDI_RAIN_DROP_FX", {14, 45}},
+    {"IDI_RUNWAYLIGHT_FX", {15, 46}},
+    {"IDI_VISUALTREATMENT_FX", {16, 47}},
+    {"IDI_WORLDPRELIT_FX", {17, 48}},
+    {"IDI_PARTICLES_FX", {18, 49}},
+    {"IDI_SKYBOX_FX", {19, 50}},
+    {"IDI_SHADOW_MAP_MESH_FX", {20, 51}},
+    {"IDI_SKYBOX_CG_FX", {21, 52}},
+    {"IDI_SHADOW_CG_FX", {22, 53}},
+    {"IDI_CAR_SHADOW_MAP_FX", {23, 54}},
+    {"IDI_WORLDDEPTH_FX", {24, 55}},
+    {"IDI_WORLDNORMALMAPDEPTH_FX", {25, 56}},
+    {"IDI_CARDEPTH_FX", {26, 57}},
+    {"IDI_GLOSSYWINDOWDEPTH_FX", {27, 58}},
+    {"IDI_TREEDEPTH_FX", {28, 59}},
+    {"IDI_SHADOW_MAP_MESH_DEPTH_FX", {29, 60}},
+    {"IDI_WORLDNORMALMAPNOFOG_FX", {30, 61}}
 };
 
-int LookupShaderSlotFromResource(const std::string& key)
+//─ compute and validate the shader-table pointer at runtime ─────────────
+static constexpr uintptr_t g_ShaderTableRVA = 0x00F9B60;
+// ← replace 0x00F9B60 with the true RVA you discover in the MW exe
+static ID3DXEffect** GetShaderTable()
+{
+    static ID3DXEffect** table = nullptr;
+    if (!table)
+    {
+        auto hMod = GetModuleHandle(nullptr);
+        uintptr_t base = reinterpret_cast<uintptr_t>(hMod);
+        table = reinterpret_cast<ID3DXEffect**>(base + g_ShaderTableRVA);
+
+        MODULEINFO mi{};
+        GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi));
+        uintptr_t start = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+        uintptr_t end = start + mi.SizeOfImage;
+        uintptr_t tptr = reinterpret_cast<uintptr_t>(table);
+        printf("[Init] ShaderTable @ 0x%08X (mod 0x%08X–0x%08X)\n", (unsigned)tptr, (unsigned)start, (unsigned)end);
+        if (tptr < start || tptr + sizeof(ID3DXEffect*) * 64 > end)
+            printf("[Error] ShaderTable is out of module bounds!\n");
+    }
+    return table;
+}
+
+std::vector<int> LookupShaderSlotsFromResource(const std::string& key)
 {
     auto it = g_ShaderSlotMap.find(key);
     if (it == g_ShaderSlotMap.end())
-        printf("[Lookup] WARNING: Shader %s not mapped to a slot!\n", key.c_str());
-    return (it != g_ShaderSlotMap.end()) ? it->second : -1;
+    {
+        printf("[Lookup] WARNING: Shader %s not mapped to any slots!\n", key.c_str());
+        return {};
+    }
+
+    return it->second;
 }
 
 int hkReload = VK_F10; // optionally load from INI too
@@ -92,6 +122,64 @@ std::string ToUpper(const std::string& str)
     for (size_t i = 0; i < out.size(); ++i)
         out[i] = (char)toupper(out[i]);
     return out;
+}
+
+bool IsValidEffect(ID3DXEffect* fx, int slot)
+{
+    __try
+    {
+        void* vtable = *(void**)fx;
+        return vtable != nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        printf("[Patch] ⚠️ fx is invalid (slot %d), rejecting\n", slot);
+        return false;
+    }
+}
+
+bool IsValidShaderPointer(ID3DXEffect* fx)
+{
+    if (!fx)
+        return false;
+
+    __try
+    {
+        // Try reading the first DWORD — should be the vtable
+        void* vtable = *(void**)fx;
+
+        // Minimal sanity check: vtable pointer must also be non-null
+        if (!vtable)
+            return false;
+
+        // Optional: check that vtable address is within a reasonable range
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(vtable, &mbi, sizeof(mbi)) == 0)
+            return false;
+
+        if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+            return false;
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+void SanityCheckShaderTable()
+{
+    auto table = GetShaderTable();
+    for (int i = 0; i < kShaderSlotCount; ++i)
+    {
+        ID3DXEffect* fx = table[i];
+        if (fx && !IsValidShaderPointer(fx))
+        {
+            printf("[Sanity] Slot %d contains invalid fx pointer (value: %p), clearing\n", i, fx);
+            table[i] = nullptr;
+        }
+    }
 }
 
 // -------------------- INCLUDE HANDLER --------------------
@@ -271,6 +359,84 @@ void LoadShaderOverrides()
 }
 
 // -------------------- HOOK HANDLER --------------------
+void (__cdecl* GetApplyGraphicsSettings())()
+{
+    auto base = (uintptr_t)GetModuleHandle(nullptr);
+    return reinterpret_cast<void(__cdecl*)()>(base + kApplyGraphicsSettingsRVA);
+}
+
+bool SafePatchShaderTable(int slot, ID3DXEffect* fx)
+{
+    auto table = GetShaderTable();
+    if (!table || slot < 0 || slot >= kShaderSlotCount)
+        return false;
+
+    DWORD oldProtect;
+    if (!VirtualProtect(&table[slot], sizeof(ID3DXEffect*), PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+
+    ID3DXEffect* existing = table[slot];
+
+    if (fx)
+    {
+        __try
+        {
+            fx->AddRef();
+            printf("[Patch] AddRef() successful — fx = %p\n", fx);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            printf("[Patch] ⚠️ AddRef() failed — invalid fx for slot %d\n", slot);
+            VirtualProtect(&table[slot], sizeof(ID3DXEffect*), oldProtect, &oldProtect);
+            return false;
+        }
+
+        if (!IsValidShaderPointer(fx))
+        {
+            printf("[Patch] ❌ fx is invalid (slot %d), skipping patch\n", slot);
+            fx->Release();
+            VirtualProtect(&table[slot], sizeof(ID3DXEffect*), oldProtect, &oldProtect);
+            return false;
+        }
+    }
+
+    if (existing && IsValidShaderPointer(existing))
+    {
+        __try
+        {
+            existing->Release();
+            printf("[Patch] Released old fx = %p from slot %d\n", existing, slot);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            printf("[Patch] ⚠️ Release() failed — old fx may be invalid in slot %d\n", slot);
+        }
+    }
+
+    printf("[Patch] Writing shader to slot %d (%p)\n", slot, fx);
+
+    table[slot] = fx;
+
+    VirtualProtect(&table[slot], sizeof(ID3DXEffect*), oldProtect, &oldProtect);
+    return fx != nullptr;
+}
+
+void PatchAllInvalidMatchingFx(ID3DXEffect* replacementFx)
+{
+    auto table = GetShaderTable();
+    if (!table || !replacementFx)
+        return;
+
+    for (int i = 0; i < kShaderSlotCount; ++i)
+    {
+        ID3DXEffect* fx = table[i];
+        if (fx && !IsValidShaderPointer(fx))
+        {
+            printf("[Reload] ⚠️ Slot %d contains invalid fx (%p), patching with %p\n", i, fx, replacementFx);
+            SafePatchShaderTable(i, replacementFx);
+        }
+    }
+}
 
 typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
     LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*, LPD3DXINCLUDE,
@@ -289,170 +455,104 @@ HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors)
 {
+    if (!outEffect)
+    {
+        printf("[Hook] ERROR: outEffect is null\n");
+        return E_POINTER;
+    }
+
+    *outEffect = nullptr;
+
     if (!g_Device)
     {
         g_Device = device;
-        LoadShaderOverrides(); // compile everything once
+        LoadShaderOverrides(); // one-time fill of g_ShaderBuffers
     }
 
-    static int g_HookCallCount = 0;
-    printf("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n",
-           g_HookCallCount++, pResource ? pResource : "(null)");
-
-    if (g_PendingApplyGraphicsSettings)
+    // Hot-reload path
     {
-        g_PendingApplyGraphicsSettings = false;
-        g_DeferredApplyRequested = true;
-        g_ApplyDelayCountdown = 10; // Delay ~100ms (depends on your polling rate)
-        printf("[Hook] Deferred ApplyGraphicsSettings requested\n");
-    }
-
-    int slotToClear = LookupShaderSlotFromResource(pResource);
-    {
-        std::lock_guard<std::mutex> lock(g_PendingShaderClearMutex);
-        if (g_PendingShaderClearSlots.find(slotToClear) != g_PendingShaderClearSlots.end())
+        std::lock_guard<std::mutex> lock(g_TriggerShaderReloadMutex);
+        if (!g_TriggerShaderReloadFor.empty() &&
+            strcmp(pResource, g_TriggerShaderReloadFor.c_str()) == 0)
         {
-            if (slotToClear >= 0 && slotToClear < 64 && SHADER_TABLE_PTR[slotToClear])
+            auto& src = g_ShaderBuffers[g_TriggerShaderReloadFor];
+            if (src.empty())
             {
-                SHADER_TABLE_PTR[slotToClear]->Release();
-                SHADER_TABLE_PTR[slotToClear] = nullptr;
-                printf("[Hook] Deferred shader release of slot %d\n", slotToClear);
+                printf("[Hotkey] ❌ Shader buffer for %s is empty!\n", g_TriggerShaderReloadFor.c_str());
+                return E_FAIL;
             }
-            g_PendingShaderClearSlots.erase(slotToClear);
+
+            FXIncludeHandler incl;
+            LPD3DXEFFECT fx = nullptr;
+
+            HRESULT hr = D3DXCreateEffect(device,
+                                          src.data(), (UINT)src.size(),
+                                          nullptr, &incl,
+                                          D3DXSHADER_DEBUG,
+                                          nullptr,
+                                          &fx,
+                                          outErrors);
+            if (SUCCEEDED(hr) && fx)
+            {
+                auto slots = LookupShaderSlotsFromResource(pResource);
+                for (int slot : slots)
+                {
+                    if (SafePatchShaderTable(slot, fx))
+                        printf("[Hotkey] ✅ Hot-reloaded %s into slot %d\n", g_TriggerShaderReloadFor.c_str(), slot);
+                    else
+                        printf("[Hotkey] ❌ Failed to patch slot %d for %s\n", slot, g_TriggerShaderReloadFor.c_str());
+                }
+                g_TriggerShaderReloadFor.clear();
+                *outEffect = fx;
+                return S_OK;
+            }
+            else
+            {
+                printf("[Hotkey] ❌ Hot-reload failed for %s (hr=0x%08X)\n",
+                       g_TriggerShaderReloadFor.c_str(), hr);
+                g_TriggerShaderReloadFor.clear(); // avoid infinite loop
+            }
         }
     }
 
+    // One-time override path
     if (g_FxOverrides.count(pResource))
     {
-        std::string path = std::string(pResource); // assume key starts with IDI_
-        FILE* f = fopen(path.c_str(), "rb");
-        if (f)
+        auto& src = g_ShaderBuffers[pResource];
+        FXIncludeHandler incl;
+        LPD3DXEFFECT fx = nullptr;
+
+        HRESULT hr = D3DXCreateEffect(device,
+                                      src.data(), (UINT)src.size(),
+                                      defines, &incl,
+                                      flags, pool,
+                                      &fx, outErrors);
+
+        if (SUCCEEDED(hr) && fx)
         {
-            fseek(f, 0, SEEK_END);
-            size_t len = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            std::vector<char> buffer(len);
-            fread(buffer.data(), 1, len, f);
-            fclose(f);
-
-            FXIncludeHandler includeHandler;
-            HRESULT hr = D3DXCreateEffect(device, buffer.data(), (UINT)len, defines, &includeHandler, flags, pool,
-                                          outEffect, outErrors);
-            if (SUCCEEDED(hr) && *outEffect)
+            auto slots = LookupShaderSlotsFromResource(pResource);
+            for (int slot : slots)
             {
-                bool patched = false;
-
-                int index = LookupShaderSlotFromResource(pResource);
-                if (index >= 0 && index < 64)
-                {
-                    SHADER_TABLE_PTR[index] = *outEffect;
-                    printf("[Patch] ✅ Replaced live shader slot %d for %s\n", index, pResource);
-                    patched = true;
-                }
-
-                if (!patched)
-                {
-                    g_ActiveEffects[pResource] = {pResource, *outEffect};
-                    printf("[Patch] ⚠️ Shader not found in table — stored in internal map instead: %s\n", pResource);
-                }
-
-                return S_OK;
+                if (SafePatchShaderTable(slot, fx))
+                    printf("[Patch] ✅ Replaced %s in slot %d\n", pResource, slot);
+                else
+                    printf("[Patch] ❌ Failed to patch slot %d for %s\n", slot, pResource);
             }
-
-            printf("[Hook] Failed to create effect from compiled override for %s\n", pResource);
+            *outEffect = fx;
+            return S_OK;
         }
         else
         {
-            printf("[Hook] Failed to open compiled file: %s\n", path.c_str());
+            printf("[Hook] ❌ Override failed for %s (hr=0x%08X)\n", pResource, hr);
         }
     }
 
-    // Fallback: load compiled shader from game root if it exists and wasn't compiled from .fx
-    if (!g_FxOverrides.count(pResource) && strncmp(pResource, "IDI_", 4) == 0)
-    {
-        FILE* f = fopen(pResource, "rb");
-        if (f)
-        {
-            fseek(f, 0, SEEK_END);
-            size_t len = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            std::vector<char> buffer(len);
-            fread(buffer.data(), 1, len, f);
-            fclose(f);
-
-            FXIncludeHandler includeHandler;
-            HRESULT hr = D3DXCreateEffect(device, buffer.data(), (UINT)len,
-                                          defines, &includeHandler, flags, pool, outEffect, outErrors);
-            if (SUCCEEDED(hr) && *outEffect)
-            {
-                printf("[Hook] Loaded fallback compiled shader: %s\n", pResource);
-                return S_OK;
-            }
-
-            printf("[Hook] Failed to load fallback compiled shader: %s\n", pResource);
-        }
-    }
-
-    std::string pendingKey;
-    {
-        std::lock_guard<std::mutex> lock(g_TriggerShaderReloadMutex);
-        pendingKey = g_TriggerShaderReloadFor;
-        g_TriggerShaderReloadFor.clear();
-    }
-
-    // Force reload if game skipped it and slot is nullptr
-    if (!pendingKey.empty() && strcmp(pResource, pendingKey.c_str()) == 0)
-    {
-        auto& data = g_ShaderBuffers[pendingKey];
-        FXIncludeHandler includeHandler;
-        HRESULT hr = D3DXCreateEffect(
-            device, data.data(), (UINT)data.size(),
-            nullptr, &includeHandler,
-            D3DXSHADER_DEBUG, nullptr,
-            outEffect, outErrors
-        );
-        printf("[Hook] Injected shader override for %s\n", pendingKey.c_str());
-
-        // Patch slot manually
-        int index = LookupShaderSlotFromResource(pendingKey.c_str());
-        if (index >= 0 && index < 64)
-        {
-            if (*outEffect)
-            {
-                SHADER_TABLE_PTR[index] = *outEffect;
-                printf("[Hook] Patched slot %d with recompiled effect\n", index);
-            }
-        }
-
-        return hr;
-    }
-
-    if (g_DeferredApplyRequested && --g_ApplyDelayCountdown <= 0)
-    {
-        {
-            std::lock_guard<std::mutex> lock(g_PendingShaderClearMutex);
-            for (int slot : g_PendingShaderClearSlots)
-            {
-                if (slot >= 0 && slot < 64 && SHADER_TABLE_PTR[slot])
-                {
-                    SHADER_TABLE_PTR[slot]->Release();
-                    SHADER_TABLE_PTR[slot] = nullptr;
-                    printf("[Hook] Deferred shader release of slot %d\n", slot);
-                }
-            }
-            g_PendingShaderClearSlots.clear();
-        }
-
-        g_DeferredApplyRequested = false;
-
-        typedef void (__cdecl*ApplySettingsFn)();
-        ApplySettingsFn ApplyGraphicsSettings = (ApplySettingsFn)0x006D6000;
-
-        printf("[Hook] Delayed ApplyGraphicsSettings triggered\n");
-        ApplyGraphicsSettings();
-    }
-
-    return RealCreateFromResource(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
+    // Fallback to original game behavior
+    return RealCreateFromResource(
+        device, hModule, pResource,
+        defines, include, flags, pool,
+        outEffect, outErrors
+    );
 }
 
 void ReloadTrackedEffects()
@@ -488,11 +588,14 @@ void ReloadTrackedEffects()
         if (SUCCEEDED(hr))
         {
             shader.effect = fx;
-            int index = LookupShaderSlotFromResource(key);
-            if (index >= 0 && index < 64)
+            auto slots = LookupShaderSlotsFromResource(key);
+            for (int index : slots)
             {
-                SHADER_TABLE_PTR[index] = fx;
-                printf("[ReloadTrack] ✅ Updated live shader slot %d\n", index);
+                if (index >= 0 && index < 64)
+                {
+                    GetShaderTable()[index] = fx;
+                    printf("[ReloadTrack] ✅ Updated live shader slot %d\n", index);
+                }
             }
             printf("[ReloadTrack] Reloaded effect for: %s\n", key.c_str());
         }
@@ -510,55 +613,94 @@ void ReloadTrackedEffects()
 
 DWORD WINAPI TriggerApplyLater(LPVOID)
 {
-    Sleep(50); // Give game enough time to see cleared slot
-    typedef void(__cdecl* ApplySettingsFn)();
-    ApplySettingsFn ApplyGraphicsSettings = (ApplySettingsFn)0x006D6000;
+    {
+        std::lock_guard<std::mutex> lk(g_PendingShaderClearMutex);
+        const std::string& key = "IDI_VISUALTREATMENT_FX";
+        if (!g_ShaderBuffers.count(key) || g_ShaderBuffers[key].empty())
+        {
+            printf("[Reload] ❌ No shader buffer available for %s\n", key.c_str());
+            return 0;
+        }
 
-    printf("[Trigger] Delayed ApplyGraphicsSettings (0x006D6000)\n");
-    ApplyGraphicsSettings();
+        auto& src = g_ShaderBuffers[key];
+        FXIncludeHandler incl;
+        LPD3DXEFFECT fx = nullptr;
+        auto slots = LookupShaderSlotsFromResource(key);
+        for (int slot : slots)
+        {
+            LPD3DXEFFECT fx = nullptr;
+            HRESULT hr = D3DXCreateEffect(g_Device, src.data(), (UINT)src.size(),
+                                          nullptr, &incl, D3DXSHADER_DEBUG, nullptr, &fx, nullptr);
+
+            if (SUCCEEDED(hr) && fx)
+            {
+                if (IsValidEffect(fx, slot) && SafePatchShaderTable(slot, fx))
+                    printf("[Reload] ✅ Patched slot %d for %s\n", slot, key.c_str());
+                else
+                    printf("[Reload] ❌ Failed to patch slot %d for %s\n", slot, key.c_str());
+            }
+            else
+            {
+                printf("[Reload] ❌ Shader compilation failed for slot %d of %s (hr=0x%08X)\n", slot, key.c_str(), hr);
+            }
+        }
+
+        // 🛡️ Scan all slots for invalid fx and patch them with the new effect
+        PatchAllInvalidMatchingFx(fx);
+
+        g_PendingShaderClearSlots.clear();
+    }
+
+    Sleep(50); // give the engine time
+    SanityCheckShaderTable();
+    auto fn = GetApplyGraphicsSettings();
+    if (fn)
+        fn();
 
     return 0;
 }
 
 DWORD WINAPI HotkeyThread(LPVOID)
 {
-    printf("[HotkeyThread] Started and waiting for F10...\n");
+    printf("[HotkeyThread] Waiting for F10...\n");
 
     while (true)
     {
-        if (GetAsyncKeyState(hkReload) & 1)
+        if (GetAsyncKeyState(VK_F10) & 1)
         {
-            printf("[HotkeyThread] F10 pressed — recompiling shaders...\n");
-            LoadShaderOverrides();
+            printf("[HotkeyThread] F10 pressed — recompiling and queueing reload\n");
+            LoadShaderOverrides(); // refill g_ShaderBuffers
 
-            int index = LookupShaderSlotFromResource("IDI_VISUALTREATMENT_FX");
-            if (index >= 0 && index < 64)
+            // When F10 is pressed:
             {
-                std::lock_guard<std::mutex> lock(g_PendingShaderClearMutex);
+                std::lock_guard<std::mutex> lk(g_TriggerShaderReloadMutex);
                 g_TriggerShaderReloadFor = "IDI_VISUALTREATMENT_FX";
-                g_PendingShaderClearSlots.insert(index);
-                SHADER_TABLE_PTR[index] = nullptr; // 🔥 actually clear the slot *now*
-                printf("[Hotkey] Shader slot %d manually nullified\n", index);
             }
 
-            HANDLE hApplyThread = CreateThread(nullptr, 0, TriggerApplyLater, nullptr, 0, nullptr);
-            if (hApplyThread)
-                printf("[Hotkey] Triggered ApplySettings thread\n");
+            // Tell the hook we want to defer the clear
+            g_PendingApplyGraphicsSettings = true;
+            // Kick off the engine’s reload pass
+            // And spawn a tiny thread to do the deferred clear + reapply afterwards
+            CreateThread(nullptr, 0, TriggerApplyLater, nullptr, 0, nullptr);
+            Sleep(50); // Give time for deferred patch
+            SanityCheckShaderTable();
+            auto fn = GetApplyGraphicsSettings();
+            if (fn)
+            {
+                printf("[HotkeyThread] Calling ApplyGraphicsSettings()\n");
+                fn();
+            }
             else
-                printf("[Hotkey] Failed to launch ApplySettings thread\n");
-
-            while (GetAsyncKeyState(hkReload) & 0x8000)
-                Sleep(10);
+            {
+                printf("[HotkeyThread] ERROR: ApplyGraphicsSettings not found\n");
+            }
         }
-
-        Sleep(10);
+        Sleep(50);
     }
-
     return 0;
 }
 
 // -------------------- DllMain --------------------
-
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -573,15 +715,25 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         {
             void* addr = GetProcAddress(d3dx, "D3DXCreateEffectFromResourceA");
             RealCreateFromResource = (D3DXCreateEffectFromResourceAFn)addr;
-            injector::MakeCALL(0x006C60D2, HookedCreateFromResource, true);
-            printf("[Init] Hooked D3DXCreateEffectFromResourceA\n");
-            // ✅ Correct: Launch F1 hotkey thread *after* setup
-            HANDLE hThread = CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
-            if (hThread)
-                printf("[Init] Hotkey thread started successfully.\n");
-            else
-                printf("[Init] Failed to start hotkey thread! Error: %lu\n", GetLastError());
+
+            // Rebase the hook address under ASLR
+            uintptr_t moduleBase = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+            constexpr uintptr_t hookRVA = 0x006C60D2 - 0x00400000; // VA - image base
+            uintptr_t hookAddr = moduleBase + hookRVA;
+            injector::MakeCALL(hookAddr, HookedCreateFromResource, true);
+            printf("[Init] Hooked D3DXCreateEffectFromResourceA at 0x%p\n", (void*)hookAddr);
         }
+        else
+        {
+            printf("[Error] d3dx9_43.dll not loaded!\n");
+        }
+
+        // ✅ Launch hotkey thread
+        HANDLE hThread = CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
+        if (hThread)
+            printf("[Init] Hotkey thread started successfully.\n");
+        else
+            printf("[Init] Failed to start hotkey thread! Error: %lu\n", GetLastError());
     }
     return TRUE;
 }
