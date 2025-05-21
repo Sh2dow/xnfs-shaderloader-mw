@@ -10,7 +10,6 @@
 class ShaderManager
 {
 public:
-    static void Initialize(LPDIRECT3DDEVICE9 device);
     static void LoadOverrides();
     static bool SafePatchShaderTable(int slot, ID3DXEffect* fx);
     static void ForceReplaceShaderIntoSlots(const std::string& resourceKey, ID3DXEffect* fx);
@@ -31,21 +30,17 @@ public:
     static PresentFn RealPresent;
 
 private:
+    // struct QueuedPatch
+    // {
+    //     int slot;
+    //     ID3DXEffect* fx;
+    //     int framesRemaining;
+    // };
+
     static std::string ToUpper(const std::string& str);
     static bool CompileAndDumpShader(const std::string& key, const std::string& fxPath);
     static std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName);
     static bool IsValidShaderPointer(ID3DXEffect* fx);
-
-    struct QueuedPatch
-    {
-        int slot;
-        ID3DXEffect* fx;
-        int framesRemaining;
-    };
-
-    static std::vector<QueuedPatch> g_PendingPatches;
-    static std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
-    static std::mutex g_PatchMutex;
 
     class FXIncludeHandler : public ID3DXInclude
     {
@@ -57,6 +52,9 @@ private:
 
 extern void RecompileAndReloadAll();
 
+typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
+    LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*,
+    LPD3DXINCLUDE, DWORD, LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*);
 
 extern HRESULT WINAPI HookedCreateFromResource(
     LPDIRECT3DDEVICE9 device,
@@ -68,11 +66,6 @@ extern HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECTPOOL pool,
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors);
-
-
-typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
-    LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*, LPD3DXINCLUDE,
-    DWORD, LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*);
 
 extern D3DXCreateEffectFromResourceAFn RealCreateFromResource;
 

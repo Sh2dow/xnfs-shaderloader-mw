@@ -1,9 +1,12 @@
-﻿#include "dllmain.h"
+﻿#include "Hooks.h"
 #include "ShaderManager.h"
+#include "dllmain.h"
 #include <windows.h>
 #include <d3d9.h>
 #include <d3dx9effect.h>
 #include <cstdio>
+#include <MinHook.h>
+
 #include "includes/injector/injector.hpp"
 #include <mutex>
 
@@ -46,6 +49,7 @@ DWORD WINAPI DeferredHookThread(LPVOID)
     }
     return 0;
 }
+
 // -------------------- DllMain --------------------
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
@@ -63,6 +67,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             void* addr = GetProcAddress(d3dx, "D3DXCreateEffectFromResourceA");
             RealCreateFromResource = (D3DXCreateEffectFromResourceAFn)addr;
             injector::MakeCALL(0x006C60D2, HookedCreateFromResource, true);
+
+            // Setup the hook once the frontend is loaded
+            ApplyGraphicsSettingsOriginal = (decltype(ApplyGraphicsSettingsOriginal))0x004EA0D0;
+            injector::MakeCALL(0x004F186E, HookApplyGraphicsSettings, true);
+            // injector::MakeCALL(0x004F186E, HookApplyGraphicsSettings, true);    // hook the CALL to it
+            
             CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)HotkeyThread, nullptr, 0, nullptr);
             printf_s("[Init] Hooked D3DXCreateEffectFromResourceA\n");
 

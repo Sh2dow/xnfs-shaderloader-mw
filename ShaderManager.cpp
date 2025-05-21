@@ -1,3 +1,4 @@
+#include "Hooks.h"
 #include "ShaderManager.h"
 #include <algorithm>
 #include <atomic>
@@ -16,28 +17,35 @@
 #include <mutex>
 #include <unordered_set>
 
+#define SHADER_TABLE_ADDRESS 0x0093DE78;
+#define WORLDSHADER_TABLE_ADDRESS 0x008F9B60;
+const int ShaderTableSize = 64;
+
 LPDIRECT3DDEVICE9 g_Device = nullptr;
 ShaderManager::PresentFn ShaderManager::RealPresent = nullptr;
+bool g_EnableShaderTableDump = false;
 
-std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
-std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
-std::unordered_set<std::string> g_FxOverrides;
-static std::atomic<int> g_HookCallCount{0};
-std::atomic<bool> g_TriggerApplyGraphicsSettings = false;
+ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal = nullptr;  // ✅ definition
+void* g_ApplyGraphicsSettingsThis = nullptr;
 
-struct QueuedPatch {
+struct QueuedPatch
+{
     int slot;
     ID3DXEffect* fx;
     int framesRemaining = 2; // safe delay
 };
 
+std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
 std::vector<QueuedPatch> g_PendingPatches;
 std::mutex g_PatchMutex;
+std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
+std::unordered_set<std::string> g_FxOverrides;
+static std::atomic<int> g_HookCallCount{0};
+std::atomic<bool> g_TriggerApplyGraphicsSettings = false;
+
+
 std::atomic<bool> g_PausePresent{false};
 std::atomic<bool> g_PresentIsWaiting{false};
-    
-typedef void (__cdecl* ApplyGraphicsSettingsFn)();
-ApplyGraphicsSettingsFn ApplyGraphicsSettings = (ApplyGraphicsSettingsFn)0x004EA0B0;
 
 // -------------------- HELPERS --------------------
 
@@ -170,7 +178,7 @@ void LoadShaderOverrides()
     {
         std::string fileName = findData.cFileName;
         std::string name = fileName.substr(0, fileName.find_last_of('.'));
-        std::replace(name.begin(), name.end(), '-', '_');  // normalize dashes
+        std::replace(name.begin(), name.end(), '-', '_'); // normalize dashes
         std::string key = "IDI_" + ToUpper(name) + "_FX";
         std::string fullPath = "fx/" + fileName;
         g_FxOverrides.insert(key); // ✅ REQUIRED for HookedCreateFromResource
@@ -221,50 +229,49 @@ void LoadShaderOverrides()
 }
 
 // -------------------- HOOK HANDLER --------------------
+bool IsValidThis(void* ptr)
+{
+    if (!ptr)
+        return false;
+
+    __try {
+        void* vtable = *(void**)ptr;
+        if (!vtable)
+            return false;
+
+        void* fn = *((void**)vtable); // vtable[0]
+        return fn != nullptr && !IsBadCodePtr((FARPROC)fn);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool IsValidShaderPointer(ID3DXEffect* fx)
 {
     if (!fx) return false;
+
     void** vtable = *(void***)fx;
-    return vtable && !IsBadCodePtr((FARPROC)vtable[0]) && !IsBadCodePtr((FARPROC)vtable[1]);
-}
 
-__declspec(noinline)
-const char* GetShaderSlotPtr(int i)
-{
-    const char** shaderTable = (const char**)0x008F9B60;
-    __try {
-        return shaderTable[i];
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-int LookupShaderSlotIndex(const std::string& resourceName)
-{
-    for (int i = 0; i < 64; ++i)
-    {
-        const char* entry = GetShaderSlotPtr(i);
-        if (!entry || IsBadStringPtrA(entry, 128))
-            continue;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!vtable || VirtualQuery(vtable, &mbi, sizeof(mbi)) == 0)
+        return false;
 
-        std::string name(entry);
-        size_t dot = name.find_last_of('.');
-        if (dot != std::string::npos)
-            name = name.substr(0, dot);
+    // Must be readable and executable (code segment)
+    bool isReadable = (mbi.Protect & PAGE_EXECUTE_READ) ||
+        (mbi.Protect & PAGE_EXECUTE_READWRITE) ||
+        (mbi.Protect & PAGE_EXECUTE_WRITECOPY);
+    if (!isReadable)
+        return false;
 
-        std::string key = "IDI_" + ToUpper(name) + "_FX";
-        if (key == resourceName)
-            return i;
-    }
-
-    return -1;
+    return !IsBadCodePtr((FARPROC)vtable[0]);
 }
 
 void DumpShaderTable()
 {
-    static ID3DXEffect** table = (ID3DXEffect**)0x0093DE78; // NFS MW shader table
+    static ID3DXEffect** table = (ID3DXEffect**)SHADER_TABLE_ADDRESS; // NFS MW shader table
 
     printf_s("------ Shader Table Dump ------\n");
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < ShaderTableSize; ++i)
     {
         ID3DXEffect* fx = table[i];
         if (!fx || !IsValidShaderPointer(fx))
@@ -277,7 +284,7 @@ void DumpShaderTable()
 void ApplyQueuedShaderPatches()
 {
     std::lock_guard<std::mutex> lock(g_PatchMutex);
-    static ID3DXEffect** table = (ID3DXEffect**)0x0093DE78;
+    static ID3DXEffect** table = (ID3DXEffect**)SHADER_TABLE_ADDRESS;
 
     std::vector<QueuedPatch> stillPending;
 
@@ -291,40 +298,26 @@ void ApplyQueuedShaderPatches()
 
         if (!IsValidShaderPointer(patch.fx))
         {
-            printf_s("[Patch] ❌ fx invalid for slot %d, skipping\n", patch.slot);
+            printf_s("[Patch] ❌ fx invalid for slot %d, fx=%p — skipping\n", patch.slot, patch.fx);
+
+            if ((uintptr_t)patch.fx == 0xCCCCCCCC)
+                printf_s("[Patch] ❌ fx == 0xCCCCCCCC — uninitialized stack pointer\n");
+
             continue;
         }
 
         if (table[patch.slot] && IsValidShaderPointer(table[patch.slot]))
         {
-            printf_s("[Patch] 🔁 Released old fx in slot %d (%p)\n", patch.slot, table[patch.slot]);
+            printf_s("[Patch] 🔁 Releasing old fx in slot %d (%p)\n", patch.slot, table[patch.slot]);
             table[patch.slot]->Release();
         }
 
-        // patch.fx->AddRef(); // assign to table
         table[patch.slot] = patch.fx;
 
         printf_s("[Patch] ✅ Wrote shader to slot %d (fx=%p)\n", patch.slot, patch.fx);
     }
 
     g_PendingPatches = std::move(stillPending);
-}
-
-HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
-                              const RECT* src, const RECT* dest,
-                              HWND hwnd, const RGNDATA* dirty)
-{
-    ApplyQueuedShaderPatches();  // ✅ Apply deferred effects first
-    DumpShaderTable();           // ✅ Inspect current state BEFORE triggering graphics reload
-
-    if (g_TriggerApplyGraphicsSettings)
-    {
-        g_TriggerApplyGraphicsSettings = false;
-        printf_s("[Hook] Applying graphics settings (safe in Present)\n");
-        ApplyGraphicsSettings(); // 💥 Game reinitializes shaders — crash may happen AFTER this
-    }
-
-    return ShaderManager::RealPresent(device, src, dest, hwnd, dirty);
 }
 
 HRESULT WINAPI HookedCreateFromResource(
@@ -356,7 +349,8 @@ HRESULT WINAPI HookedCreateFromResource(
         }
     }
 
-    printf_s("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++, pResource ? pResource : "(null)");
+    printf_s("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++,
+             pResource ? pResource : "(null)");
 
     if (g_FxOverrides.count(pResource))
     {
@@ -387,7 +381,7 @@ HRESULT WINAPI HookedCreateFromResource(
             printf_s("[Hook] Failed to open compiled file: %s\n", path.c_str());
         }
     }
-    
+
     // Fallback: load compiled shader from game root if it exists and wasn't compiled from .fx
     if (!g_FxOverrides.count(pResource) && strncmp(pResource, "IDI_", 4) == 0)
     {
@@ -414,18 +408,28 @@ HRESULT WINAPI HookedCreateFromResource(
         }
     }
 
-    return RealCreateFromResource(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
+    return RealCreateFromResource(device, hModule, pResource,
+                                  defines, include, flags, pool, outEffect, outErrors);
 }
 
 bool SafePatchShaderTable(int slot, ID3DXEffect* fx)
 {
-    if (slot < 0 || slot >= 64 || !IsValidShaderPointer(fx))
+    if (slot < 0 || slot >= ShaderTableSize)
+    {
+        printf_s("[Patch] ❌ Invalid slot index: %d\n", slot);
         return false;
+    }
+
+    if (!fx || !IsValidShaderPointer(fx))
+    {
+        printf_s("[Patch] ❌ fx is null or invalid for slot %d\n", slot);
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_PatchMutex);
-        fx->AddRef(); // Defer patch safely
-        g_PendingPatches.push_back({ slot, fx, 2 });
+        fx->AddRef(); // Safe defer
+        g_PendingPatches.push_back({slot, fx, 2});
     }
 
     printf_s("[Patch] ⏳ Deferred shader patch queued: slot %d → fx=%p\n", slot, fx);
@@ -439,7 +443,7 @@ void PauseGameThread()
     // Wait up to 250ms for Present to acknowledge pause
     const auto start = std::chrono::steady_clock::now();
     while (!g_PresentIsWaiting &&
-           std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250))
+        std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250))
     {
         Sleep(1);
     }
@@ -459,11 +463,14 @@ void ResumeGameThread()
 // MUST NOT use STL types in this function!
 static const char* SafeGetShaderTableEntry(int index)
 {
-    const char** table = (const char**)0x008F9B60;
+    const char** table = (const char**)WORLDSHADER_TABLE_ADDRESS;
     const char* result = nullptr;
-    __try {
+    __try
+    {
         result = table[index];
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
         return nullptr;
     }
     return result;
@@ -478,7 +485,7 @@ std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName)
     else
         return results;
 
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < ShaderTableSize; ++i)
     {
         const char* entry = SafeGetShaderTableEntry(i);
         if (!entry || IsBadStringPtrA(entry, 128))
@@ -502,14 +509,26 @@ std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName)
 
 void ForceReplaceShaderIntoSlots(const std::string& resourceKey, ID3DXEffect* fx)
 {
+    if (!fx || !IsValidShaderPointer(fx))
+    {
+        printf_s("[HotReload] ❌ Invalid fx pointer passed to ForceReplaceShaderIntoSlots for %s\n",
+                 resourceKey.c_str());
+        return;
+    }
+
     PauseGameThread();
+
     auto slots = LookupShaderSlotsFromResource(resourceKey);
     if (!slots.empty())
     {
         for (int slot : slots)
         {
-            fx->AddRef();
-            SafePatchShaderTable(slot, fx);
+            if (!SafePatchShaderTable(slot, fx))
+            {
+                printf_s("[HotReload] ❌ Failed to patch slot %d for %s\n", slot, resourceKey.c_str());
+                continue;
+            }
+
             printf_s("[HotReload] ✅ Patched slot %d with new effect for %s\n", slot, resourceKey.c_str());
         }
     }
@@ -517,11 +536,20 @@ void ForceReplaceShaderIntoSlots(const std::string& resourceKey, ID3DXEffect* fx
     {
         printf_s("[HotReload] ⚠️ No slots found for %s\n", resourceKey.c_str());
     }
+
     ResumeGameThread();
 }
 
 void RecompileAndReloadAll()
 {
+    if (!g_Device)
+    {
+        printf_s("[HotReload] ❌ g_Device is null, cannot recompile shaders.\n");
+        return;
+    }
+
+    bool patchedAny = false;
+
     for (const auto& key : g_FxOverrides)
     {
         auto it = g_ShaderOverridePaths.find(key);
@@ -578,15 +606,66 @@ void RecompileAndReloadAll()
         if (!IsValidShaderPointer(fx))
         {
             printf_s("[HotReload] ❌ fx for %s is invalid, skipping patch\n", key.c_str());
-            fx->Release(); // Clean up
+            fx->Release();
             continue;
         }
 
         ForceReplaceShaderIntoSlots(key, fx);
         printf_s("[HotReload] ✅ Force-replaced effect in all slots for %s\n", key.c_str());
-        
+
+        patchedAny = true;
+    }
+
+    if (patchedAny)
+    {
         printf_s("[HotReload] Triggering ApplyGraphicsSettings()\n");
         g_TriggerApplyGraphicsSettings = true;
         printf_s("[HotReload] Will apply graphics settings at next Present\n");
     }
+    else
+    {
+        printf_s("[HotReload] ❌ No shader slots were patched — skipping ApplyGraphicsSettings()\n");
+    }
+}
+
+// Logging hook: store the 'this' pointer used in ApplyGraphicsSettings
+void __stdcall LogApplyGraphicsSettingsThis(void* thisptr)
+{
+    printf_s("[Hook] ApplyGraphicsSettings called with this = %p\n", thisptr);
+    if (thisptr)
+        g_ApplyGraphicsSettingsThis = thisptr;
+}
+
+void __fastcall HookApplyGraphicsSettings(void* manager, void* /*unused*/, void* vtObject)
+{
+    g_ApplyGraphicsSettingsThis = vtObject;
+    printf_s("[Hook] ApplyGraphicsSettings called, this = %p, manager = %p\n", vtObject, manager);
+
+    if (ApplyGraphicsSettingsOriginal)
+        ApplyGraphicsSettingsOriginal(manager, nullptr, vtObject);
+}
+
+void TryApplyGraphicsSettings()
+{
+    if (!g_ApplyGraphicsSettingsThis)
+    {
+        printf_s("[HotReload] ❌ this pointer is null — ApplyGraphicsSettings skipped\n");
+        return;
+    }
+
+    printf_s("[HotReload] ✅ Calling ApplyGraphicsSettings(this = %p)\n", g_ApplyGraphicsSettingsThis);
+    ApplyGraphicsSettingsOriginal(nullptr, nullptr, g_ApplyGraphicsSettingsThis);
+}
+
+HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
+                             const RECT* src, const RECT* dest,
+                             HWND hwnd, const RGNDATA* dirty)
+{
+    if (g_EnableShaderTableDump)
+        DumpShaderTable(); // before anything
+
+    TryApplyGraphicsSettings();
+
+    ApplyQueuedShaderPatches(); // Safe after ApplyGraphicsSettings
+    return ShaderManager::RealPresent(device, src, dest, hwnd, dirty);
 }
