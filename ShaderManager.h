@@ -50,6 +50,7 @@ private:
     };
 };
 
+extern void ReleaseAllRetainedShaders();
 extern void RecompileAndReloadAll();
 
 typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(

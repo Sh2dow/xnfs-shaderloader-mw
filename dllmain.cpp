@@ -19,6 +19,18 @@
 LPDIRECT3DDEVICE9 ShaderManager::g_Device = nullptr;
 D3DXCreateEffectFromResourceAFn RealCreateFromResource = nullptr;
 
+int g_ApplyDelayCounter = 0;
+bool g_ApplyScheduled = false;
+
+// This is the actual entry point the game uses.
+// Correct function type
+
+void __fastcall Hook_ApplyGraphicsManagerMain(void* This)
+{
+    g_ApplyGraphicsSettingsThis = This;
+    printf_s("[XNFS-ShaderLoader-MW] [Hook] sub_4F17F0 called, this = %p\n", This);
+}
+
 DWORD WINAPI HotkeyThread(LPVOID)
 {
     while (true)
@@ -26,9 +38,18 @@ DWORD WINAPI HotkeyThread(LPVOID)
         if (GetAsyncKeyState(VK_F2) & 1) // Press F2
         {
             printf_s("[HotkeyThread] F2 pressed → Recompiling FX overrides...\n");
+            ReleaseAllRetainedShaders();
             RecompileAndReloadAll();
+
+            // ✅ Trigger ApplyGraphicsManagerMain on next Present
+            g_ApplyDelayCounter = 4; // delay for 4 Present()s
+            g_ApplyScheduled = true;
         }
-        Sleep(100);
+
+        // while (g_ApplyGraphicsSettingsThis == nullptr)
+        {
+            Sleep(50);
+        }
     }
 }
 
@@ -68,17 +89,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             RealCreateFromResource = (D3DXCreateEffectFromResourceAFn)addr;
             injector::MakeCALL(0x006C60D2, HookedCreateFromResource, true);
 
-            // Setup the hook once the frontend is loaded
-            ApplyGraphicsSettingsOriginal = (decltype(ApplyGraphicsSettingsOriginal))0x004EA0D0;
+            ApplyGraphicsManagerMainOriginal = (decltype(ApplyGraphicsManagerMainOriginal))0x004F17F0;
+            printf_s("[Init] ApplyGraphicsManagerMainOriginal set to 0x004F17F0\n");
+
+            ApplyGraphicsSettingsOriginal = reinterpret_cast<ApplyGraphicsSettingsFn>(0x004EA0D0);
             injector::MakeCALL(0x004F186E, HookApplyGraphicsSettings, true);
-            // injector::MakeCALL(0x004F186E, HookApplyGraphicsSettings, true);    // hook the CALL to it
-            
-            CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)HotkeyThread, nullptr, 0, nullptr);
-            printf_s("[Init] Hooked D3DXCreateEffectFromResourceA\n");
 
             CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)HotkeyThread, nullptr, 0, nullptr);
             CreateThread(nullptr, 0, DeferredHookThread, nullptr, 0, nullptr);
+
+            printf_s("[Init] Hooked D3DXCreateEffectFromResourceA\n");
         }
     }
     return TRUE;
 }
+
