@@ -12,7 +12,6 @@ extern ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal;
 
 extern void* g_ApplyGraphicsSettingsThis;
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject);
-void __stdcall LogApplyGraphicsSettingsThis(void* thisptr);
 void TryApplyGraphicsManagerMain();
 extern std::atomic<bool> g_TriggerApplyGraphicsSettings;
 

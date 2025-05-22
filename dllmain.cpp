@@ -22,15 +22,6 @@ D3DXCreateEffectFromResourceAFn RealCreateFromResource = nullptr;
 int g_ApplyDelayCounter = 0;
 bool g_ApplyScheduled = false;
 
-// This is the actual entry point the game uses.
-// Correct function type
-
-void __fastcall Hook_ApplyGraphicsManagerMain(void* This)
-{
-    g_ApplyGraphicsSettingsThis = This;
-    printf_s("[XNFS-ShaderLoader-MW] [Hook] sub_4F17F0 called, this = %p\n", This);
-}
-
 DWORD WINAPI HotkeyThread(LPVOID)
 {
     while (true)

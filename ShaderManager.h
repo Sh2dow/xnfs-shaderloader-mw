@@ -52,6 +52,7 @@ private:
 
 extern void ReleaseAllRetainedShaders();
 extern void RecompileAndReloadAll();
+extern  void ScanIVisualTreatment();
 
 typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
     LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*,
