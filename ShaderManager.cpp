@@ -259,19 +259,8 @@ bool IsValidThis(void* ptr)
     }
 }
 
-bool IsValidShaderPointer(ID3DXEffect* fx)
+bool IsValidShaderPointer_SEH(ID3DXEffect* fx, void*** outVtable, DWORD* outProtect)
 {
-    if (!fx || (uintptr_t)fx < 0x10000)
-        return false;
-
-    // 🚫 Early filter for float constants
-    if (((uintptr_t)fx & 0xFFF00000) == 0x3F000000)
-    {
-        printf_s("⚠️ IsValidShaderPointer: fx=%p looks like float constant (0x%08X)\n", fx, (unsigned)(uintptr_t)fx);
-        return false;
-    }
-
-    MEMORY_BASIC_INFORMATION mbi = {};
     __try
     {
         if (IsBadReadPtr(fx, sizeof(void*)))
@@ -281,35 +270,51 @@ bool IsValidShaderPointer(ID3DXEffect* fx)
         if (!vtable || IsBadReadPtr(vtable, sizeof(void*)))
             return false;
 
+        MEMORY_BASIC_INFORMATION mbi = {};
         if (!VirtualQuery(vtable, &mbi, sizeof(mbi)))
-        {
-            printf_s("⚠️ VirtualQuery failed for fx=%p (vtable=%p)\n", fx, vtable);
             return false;
-        }
 
-        DWORD prot = mbi.Protect;
-        bool validVtable =
-            ((prot & PAGE_EXECUTE_READ) ||
-                (prot & PAGE_EXECUTE_READWRITE) ||
-                (prot & PAGE_EXECUTE_WRITECOPY)) &&
-            !IsBadCodePtr((FARPROC)vtable[0]);
-
-        if (!validVtable)
-        {
-            printf_s("⚠️ vtable invalid or not executable: fx=%p vtable=%p prot=0x%08X\n", fx, vtable, prot);
-        }
-        else
-        {
-            printf_s("🔍 VTable fx=%p vtbl=%p prot=0x%08X ✅\n", fx, vtable, prot);
-        }
-
-        return validVtable;
+        *outVtable = vtable;
+        *outProtect = mbi.Protect;
+        return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        printf_s("❌ Exception in IsValidShaderPointer for fx=%p\n", fx);
         return false;
     }
+}
+
+bool IsValidShaderPointer(ID3DXEffect* fx)
+{
+    if (!fx || (uintptr_t)fx < 0x10000)
+        return false;
+
+    if (((uintptr_t)fx & 0xFFF00000) == 0x3F000000)
+        return false;
+
+    void** vtable = nullptr;
+    DWORD prot = 0;
+    if (!IsValidShaderPointer_SEH(fx, &vtable, &prot))
+        return false;
+
+    bool validVtable =
+        (prot & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
+        !IsBadCodePtr((FARPROC)vtable[0]);
+
+    static std::unordered_map<uintptr_t, int> invalidVtableHits;
+    if (!validVtable)
+    {
+        uintptr_t vtblAddr = reinterpret_cast<uintptr_t>(vtable);
+        int& count = invalidVtableHits[vtblAddr];
+        if (count++ < 1)
+            printf_s("⚠️ Invalid vtable: fx=%p vtable=%p prot=0x%08X\n", fx, vtable, prot);
+
+        // if (++count == 1 || count % 10 == 0) {
+        //     printf_s("⚠️ Invalid vtable: fx=%p vtable=%p prot=0x%08X (seen %d times)\n", fx, vtable, prot, count);
+        // }
+    }
+
+    return validVtable;
 }
 
 void DumpShaderTable()
@@ -657,10 +662,13 @@ void VisualTreatment_Reset()
             *fxSlot = nullptr;
         }
 
-        __try {
+        __try
+        {
             IVisualTreatment_Reset(vt);
             printf_s("[HotReload] ✅ Reset() called on IVisualTreatment at %p\n", vt);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
             printf_s("[HotReload] ❌ Exception while calling IVisualTreatment::Reset()\n");
         }
     }
@@ -867,7 +875,7 @@ void ScanIVisualTreatment()
     if (IsValidShaderPointer((ID3DXEffect*)sub))
     {
         printf_s("✅ SubScan at +0x18C looks valid, storing as vtObject[0]\n");
-        g_ThisCandidates[0] = (void*)sub;  // ✅ use this in fallback
+        g_ThisCandidates[0] = (void*)sub; // ✅ use this in fallback
         g_ThisCount = 1;
     }
     else
@@ -924,87 +932,67 @@ bool IsLikelyApplyGraphicsSettingsObject(void* candidate)
     return true;
 }
 
-bool TryApplyGraphicsSettingsSafely()
+bool ReplaceShaderSlot(BYTE* object, int offset, ID3DXEffect* newFx)
 {
-    void* targetThis = nullptr;
+    ID3DXEffect** slot = (ID3DXEffect**)(object + offset);
 
-    // Primary candidate: tracked "this"
-    if (g_ApplyGraphicsSettingsThis && IsValidThis(g_ApplyGraphicsSettingsThis))
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(slot, &mbi, sizeof(mbi)) || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
     {
-        targetThis = g_ApplyGraphicsSettingsThis;
-        printf_s("✅ ApplyGraphicsSettingsThis validated: this=%p\n", targetThis);
+        printf_s("❌ Cannot access shader slot at +0x%02X (%p)\n", offset, slot);
+        return false;
+    }
+
+    ID3DXEffect* oldFx = nullptr;
+    __try
+    {
+        oldFx = *slot;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    if (!newFx || !IsValidShaderPointer(newFx))
+    {
+        printf_s("❌ Invalid newFx pointer passed to ReplaceShaderSlot\n");
+        return false;
+    }
+
+    if (oldFx != newFx)
+    {
+        if (oldFx && IsValidShaderPointer(oldFx))
+        {
+            printf_s("🔁 Releasing old fx at +0x%02X = %p\n", offset, oldFx);
+            oldFx->Release();
+        }
+
+        *slot = newFx;
+        newFx->AddRef();
+        printf_s("✅ Overwrote slot +0x%02X with fx = %p\n", offset, newFx);
     }
     else
     {
-        printf_s("⚠️ g_ApplyGraphicsSettingsThis is nullptr or invalid\n");
-
-        // Try captured candidates
-        for (int i = 0; i < g_ThisCount; ++i)
-        {
-            if (IsValidThis(g_ThisCandidates[i]))
-            {
-                targetThis = g_ThisCandidates[i];
-                printf_s("🔄 Fallback: Using candidate[%d] = %p\n", i, targetThis);
-                break;
-            }
-        }
-
-        // Try scanning live if nothing usable yet
-        if (!targetThis)
-        {
-            void* scanned = GetIVisualTreatmentObject();
-            if (scanned && IsValidThis(scanned) && IsLikelyApplyGraphicsSettingsObject(scanned)) {
-                targetThis = scanned;
-                printf_s("🧪 Fallback: Using verified scanned object = %p\n", targetThis);
-            } else {
-                printf_s("❌ Scanned object not valid for ApplyGraphicsSettings\n");
-            }
-        }
+        printf_s("⚠️ Slot +0x%02X already set to fx = %p — skipping\n", offset, newFx);
     }
 
-    // Final safety checks
-    if (!targetThis)
-    {
-        printf_s("❌ No valid ApplyGraphicsSettings this-pointer found\n");
-        return false;
-    }
-
-    if (!g_ApplyGraphicsManagerThis)
-    {
-        printf_s("❌ g_ApplyGraphicsManagerThis is nullptr\n");
-        return false;
-    }
-
-    // Optional deeper check on vtable field if needed
-    if (IsBadReadPtr(targetThis, 0x130))
-    {
-        printf_s("⚠️ targetThis = %p is not readable\n", targetThis);
-        return false;
-    }
-
-    void* vtablePtr = *(void**)((char*)targetThis + 0x12C);
-    if (!vtablePtr)
-    {
-        printf_s("⚠️ targetThis[0x12C] is null\n");
-        return false;
-    }
-
-    printf_s("🎯 Calling ApplyGraphicsSettingsOriginal(manager=%p, object=%p)\n",
-             g_ApplyGraphicsManagerThis, targetThis);
-
-    ApplyGraphicsSettingsOriginal(g_ApplyGraphicsManagerThis, nullptr, targetThis);
-
-    printf_s("✅ ApplyGraphicsSettingsOriginal finished\n");
     return true;
 }
 
-bool IsTargetGraphicsObject(void* ptr)
+void* ResolveApplyGraphicsThis()
 {
-    if (!IsValidThis(ptr))
-        return false;
+    if (IsValidThis(g_ApplyGraphicsSettingsThis))
+        return g_ApplyGraphicsSettingsThis;
 
-    void** vtable = *(void***)ptr;
-    return vtable[0] == (void*)0x007ABCDEF; // Replace with your known-good vtable[0]
+    for (int i = 0; i < g_ThisCount; ++i)
+        if (IsValidThis(g_ThisCandidates[i]))
+            return g_ThisCandidates[i];
+
+    void* scan = GetIVisualTreatmentObject();
+    if (IsValidThis(scan) && IsLikelyApplyGraphicsSettingsObject(scan))
+        return scan;
+
+    return nullptr;
 }
 
 bool AlreadyStored(void* ptr)
@@ -1017,34 +1005,214 @@ bool AlreadyStored(void* ptr)
     return false;
 }
 
-bool ShadersLikelyEqual(ID3DXEffect* a, ID3DXEffect* b)
+void LogLiveShaderMatch(void* targetThis)
 {
-    if (!a || !b) return false;
+    if (!targetThis || !IsValidThis(targetThis))
+        return;
 
-    D3DXEFFECT_DESC da = {}, db = {};
-    if (FAILED(a->GetDesc(&da)) || FAILED(b->GetDesc(&db)))
+    BYTE* sub = (BYTE*)targetThis;
+
+    for (int i = 0; i < 0x100; i += 4)
+    {
+        ID3DXEffect** fxSlot = (ID3DXEffect**)(sub + i);
+        ID3DXEffect* fx = nullptr;
+
+        __try
+        {
+            fx = *fxSlot;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            continue;
+        }
+
+        if (fx == g_LastReloadedFx)
+        {
+            printf_s("🎯 Exact match: g_LastReloadedFx found at +0x%02X (%p)\n", i, fx);
+        }
+        else if (IsValidShaderPointer(fx))
+        {
+            D3DXEFFECT_DESC d = {};
+            if (SUCCEEDED(fx->GetDesc(&d)))
+            {
+                printf_s("🔍 Shader at +0x%02X = %p: Creator=%s Params=%d Techs=%d\n",
+                         i, fx, d.Creator, d.Parameters, d.Techniques);
+            }
+        }
+    }
+}
+
+void LogApplyGraphicsSettingsCall(void* manager, void* object, int objectType)
+{
+    static std::unordered_map<std::pair<void*, int>, int> objectHits;
+    static std::pair<void*, int> lastKey = { nullptr, 0 };
+    // static int repeatCount = 0;
+
+    std::pair<void*, int> key = std::make_pair(object, objectType);
+    int& count = objectHits[key];
+
+    // if (key == lastKey) {
+    //     ++repeatCount;
+    // } else {
+    //     if (repeatCount > 1 && count % 10 == 0)
+    //     {
+    //         printf_s("  [Hook] (object %p type=%d repeated %d times)\n", key.first, key.second, repeatCount);
+    //     }
+    //
+    //     lastKey = key;
+    //     repeatCount = 1;
+    // }
+
+    if (count++ < 1)
+    {
+        switch (objectType)
+        {
+        case 1:
+            printf_s("[Hook] ApplyGraphicsSettings live-call: manager=%p object=%p\n", manager, object);
+            break;
+        case 2:
+            printf_s("[Hook] ➕ Captured live vtObject = %p\n", object);
+            break;
+        }
+    }
+}
+
+void PrintFxAtOffsets(void* target)
+{
+    BYTE* base = (BYTE*)target;
+    for (int i = 0; i < 0x100; i += 4)
+    {
+        ID3DXEffect** fxSlot = (ID3DXEffect**)(base + i);
+        ID3DXEffect* fx = nullptr;
+
+        __try
+        {
+            fx = *fxSlot;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            continue;
+        }
+
+        if (fx == g_LastReloadedFx)
+        {
+            printf_s("🎯 Match: g_LastReloadedFx is actively assigned at offset +0x%02X (%p)\n", i, fx);
+        }
+        else if (IsValidShaderPointer(fx))
+        {
+            D3DXEFFECT_DESC d = {};
+            if (SUCCEEDED(fx->GetDesc(&d)))
+            {
+                printf_s("🔍 Found other valid shader at +0x%02X: %p (%s)\n", i, fx, d.Creator);
+            }
+        }
+    }
+}
+
+bool TryApplyGraphicsSettingsSafely()
+{
+    void* targetThis = ResolveApplyGraphicsThis();
+    if (!targetThis)
+    {
+        printf_s("❌ Failed to resolve ApplyGraphicsSettings this-pointer\n");
         return false;
+    }
 
-    return da.Parameters == db.Parameters &&
-        da.Techniques == db.Techniques &&
-        strcmp(da.Creator, db.Creator) == 0;
+    if (!g_ApplyGraphicsManagerThis)
+    {
+        printf_s("❌ g_ApplyGraphicsManagerThis is null\n");
+        return false;
+    }
+
+    PrintFxAtOffsets(targetThis); // just do this once for diagnostics
+
+    // Replace +0x18C if reloaded
+    if (g_LastReloadedFx && IsValidShaderPointer(g_LastReloadedFx))
+    {
+        BYTE* obj = (BYTE*)targetThis;
+
+        D3DXEFFECT_DESC newDesc = {};
+        g_LastReloadedFx->GetDesc(&newDesc);
+
+        for (int offset = 0; offset < 0x100; offset += 4)
+        {
+            ID3DXEffect** fxSlot = (ID3DXEffect**)(obj + offset);
+            ID3DXEffect* fx = nullptr;
+
+            __try
+            {
+                fx = *fxSlot;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                continue;
+            }
+
+            if (!fx || !IsValidShaderPointer(fx))
+                continue;
+
+            if (fx == g_LastReloadedFx)
+            {
+                ReplaceShaderSlot(obj, offset, g_LastReloadedFx);
+            }
+            else
+            {
+                D3DXEFFECT_DESC desc = {};
+                if (SUCCEEDED(fx->GetDesc(&desc)) &&
+                    !strcmp(desc.Creator, newDesc.Creator) &&
+                    desc.Parameters == newDesc.Parameters &&
+                    desc.Techniques == newDesc.Techniques)
+                {
+                    printf_s("🔶 Fuzzy match at +0x%02X (%p) — replacing\n", offset, fx);
+                    ReplaceShaderSlot(obj, offset, g_LastReloadedFx);
+                }
+            }
+        }
+    }
+
+    // Call ApplyGraphicsSettings
+    printf_s("🎯 Calling ApplyGraphicsSettingsOriginal(manager=%p, object=%p)\n",
+             g_ApplyGraphicsManagerThis, targetThis);
+
+    __try
+    {
+        LogLiveShaderMatch(targetThis);
+        ApplyGraphicsSettingsOriginal(g_ApplyGraphicsManagerThis, nullptr, targetThis);
+        LogLiveShaderMatch(targetThis);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        printf_s("❌ Exception during ApplyGraphicsSettingsOriginal call\n");
+        return false;
+    }
+
+    PrintFxAtOffsets(targetThis); // again after call
+
+    return true;
 }
 
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
 {
-    printf_s("[Hook] ApplyGraphicsSettings live-call: manager=%p object=%p\n", manager, vtObject);
+    // printf_s("[Hook] ApplyGraphicsSettings live-call: manager=%p object=%p\n", manager, vtObject);
+    LogApplyGraphicsSettingsCall(manager, vtObject, 1);
+
     g_ApplyGraphicsManagerThis = manager;
 
     if (IsValidThis(vtObject))
     {
-        // Optionally store for retry
+        if (!g_ApplyGraphicsSettingsThis)
+        {
+            g_ApplyGraphicsSettingsThis = vtObject;
+            printf_s("[Hook] ✅ g_ApplyGraphicsSettingsThis captured for first time: %p\n", vtObject);
+        }
+
         if (g_ThisCount < 3 && !AlreadyStored(vtObject))
         {
             g_ThisCandidates[g_ThisCount++] = vtObject;
         }
 
-        // ⏺️ Log every live call that actually works
-        printf_s("[Hook] ➕ Captured live vtObject = %p\n", vtObject);
+        // printf_s("[Hook] ➕ Captured live vtObject = %p\n", vtObject);
+        LogApplyGraphicsSettingsCall(manager, vtObject, 2);
     }
 
     // ✅ Continue execution
@@ -1084,173 +1252,6 @@ bool SafeReleaseShaderSlot(ID3DXEffect** fxSlot, int offset)
     fx->Release();
     *fxSlot = nullptr;
     return true;
-}
-
-void TryApplyGraphicsManagerMain()
-{
-    if (!ApplyGraphicsManagerMainOriginal)
-        return;
-
-    void* target = nullptr;
-
-    // Use the best valid known "this" pointer
-    for (int i = 0; i < g_ThisCount; ++i)
-    {
-        if (IsValidThis(g_ThisCandidates[i]))
-        {
-            target = g_ThisCandidates[i];
-            break;
-        }
-    }
-
-    if (!target)
-    {
-        target = GetIVisualTreatmentObject();
-        if (!IsValidThis(target))
-        {
-            printf_s("❌ No valid vtObject found for TryApplyGraphicsManagerMain\n");
-            return;
-        }
-    }
-
-    DWORD* dirty = (DWORD*)((BYTE*)target + 0x10);
-    *dirty += 1;
-
-    ApplyGraphicsManagerMainOriginal(target);
-
-    if (g_LastReloadedFx && IsValidShaderPointer(g_LastReloadedFx))
-    {
-        ULONG tmpRef = g_LastReloadedFx->AddRef();
-        g_LastReloadedFx->Release(); // cancel out
-        printf_s("🔍 g_LastReloadedFx=%p has refcount ~%lu\n", g_LastReloadedFx, tmpRef);
-    }
-    else
-    {
-        printf_s("⚠️ g_LastReloadedFx is null or invalid: %p\n", g_LastReloadedFx);
-    }
-
-    if (!g_pVisualTreatment || !*g_pVisualTreatment)
-        return;
-
-    BYTE* vt = (BYTE*)*g_pVisualTreatment;
-    printf_s("[Scan] IVisualTreatment @ %p\n", vt);
-
-    BYTE* obj = *(BYTE**)(vt + 0x18C);
-    printf_s("[SubScan @ 0x18C] object = %p\n", obj);
-
-    // ✅ Add this new validation
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!obj || !VirtualQuery(obj, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT)
-    {
-        printf_s("❌ SubScan base pointer (obj) is invalid or not committed memory: %p\n", obj);
-        return;
-    }
-
-    BYTE* sub = obj; // Assumed base pointer
-    bool didReset = false;
-
-    constexpr int maxScanBytes = 0x60; // Try a wider range (0x60 = 24 slots)
-    for (int i = 0; i < maxScanBytes; i += 4)
-    {
-        ID3DXEffect** fxSlot = (ID3DXEffect**)(sub + i);
-
-        if (IsBadReadPtr(fxSlot, sizeof(void*)))
-        {
-            printf_s("⚠️ fxSlot +0x%02X not readable (fxSlot=%p)\n", i, fxSlot);
-            continue;
-        }
-
-        ID3DXEffect* fx = *fxSlot;
-
-        if ((uintptr_t)fx < 0x10000)
-        {
-            printf_s("⚠️ fx @ +0x%02X too low to be valid: %p\n", i, fx);
-            continue;
-        }
-
-        if (((uintptr_t)fx & 0xFFF00000) == 0x3F000000)
-        {
-            printf_s("⚠️ fx @ +0x%02X looks like float constant: 0x%08X\n", i, (unsigned)(uintptr_t)fx);
-            continue;
-        }
-
-        if (!IsValidShaderPointer(fx))
-        {
-            printf_s("⚠️ Invalid effect at +0x%02X (fx=%p)\n", i, fx);
-            continue;
-        }
-
-        // ✅ Print desc
-        D3DXEFFECT_DESC desc1 = {}, desc2 = {};
-        fx->GetDesc(&desc1);
-        g_LastReloadedFx->GetDesc(&desc2);
-        printf_s("🔍 fx[+0x%02X] = %p: Creator=%s Params=%d Techniques=%d\n",
-                 i, fx, desc1.Creator, desc1.Parameters, desc1.Techniques);
-
-        // ✅ Exact match
-        if (fx == g_LastReloadedFx)
-        {
-            printf_s("  [+%02X] = %p  ✅ Exact match\n", i, fx);
-            fx->Release();
-            *fxSlot = nullptr;
-            IVisualTreatment_Reset(*g_pVisualTreatment);
-            printf_s("[HotReload] 🔄 Resetting IVisualTreatment and cleared fx slot +0x%02X\n", i);
-            didReset = true;
-            break;
-        }
-
-        // ✅ Fuzzy match by desc
-        if (!strcmp(desc1.Creator, desc2.Creator) &&
-            desc1.Parameters == desc2.Parameters &&
-            desc1.Techniques == desc2.Techniques)
-        {
-            printf_s("  [+%02X] = %p  🔶 Fuzzy match by desc\n", i, fx);
-            fx->Release();
-            *fxSlot = nullptr;
-            IVisualTreatment_Reset(*g_pVisualTreatment);
-            printf_s("[HotReload] 🔄 Resetting IVisualTreatment and cleared fx slot +0x%02X (fuzzy)\n", i);
-            didReset = true;
-            break;
-        }
-    }
-
-    // Safe optional cleanup for known slot +0x30
-    if (!didReset)
-    {
-        ID3DXEffect** fxSlot30 = (ID3DXEffect**)(sub + 0x30);
-        if (SafeReleaseShaderSlot(fxSlot30, 0x30))
-        {
-            IVisualTreatment_Reset(*g_pVisualTreatment);
-            printf_s("[HotReload] 🔄 Fallback reset via fxSlot +0x30\n");
-        }
-
-        printf_s("[HotReload] ❌ No matching fx found — Reset() not triggered.\n");
-
-        for (int i = 0; i < 64; i++)
-        {
-            ID3DXEffect* fx = g_ShaderTable[i];
-            if (fx == g_LastReloadedFx)
-            {
-                printf_s(
-                    "[Fallback] 🔄 Found g_LastReloadedFx in shader g_ShaderTable slot %d — triggering IVisualTreatment reset\n",
-                    i);
-                IVisualTreatment_Reset(*g_pVisualTreatment);
-                didReset = true;
-                break;
-            }
-        }
-
-        if (g_LastReloadedFx)
-        {
-            D3DXHANDLE tech = g_LastReloadedFx->GetTechnique(0);
-            if (tech)
-            {
-                printf_s("[HotReload] 🧪 Forcing technique bind...\n");
-                g_LastReloadedFx->SetTechnique(tech);
-                g_LastReloadedFx->CommitChanges();
-            }
-        }
-    }
 }
 
 HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,

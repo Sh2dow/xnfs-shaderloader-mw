@@ -53,6 +53,10 @@ private:
 extern void ReleaseAllRetainedShaders();
 extern void RecompileAndReloadAll();
 extern  void ScanIVisualTreatment();
+extern void PrintFxAtOffsets(void* obj);
+
+extern std::pair<void*, int> lastKey;
+extern int repeatCount;
 
 typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
     LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*,
