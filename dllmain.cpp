@@ -35,11 +35,13 @@ DWORD WINAPI HotkeyThread(LPVOID)
             // ✅ Trigger ApplyGraphicsManagerMain on next Present
             g_ApplyDelayCounter = 4; // delay for 4 Present()s
             g_ApplyScheduled = true;
+            g_TriggerApplyGraphicsSettings = true;
+            g_ApplyGraphicsTriggerDelay = 2; // skip first 2 frames
         }
 
-        // while (g_ApplyGraphicsSettingsThis == nullptr)
+        while (g_ApplyGraphicsSettingsThis == nullptr)
         {
-            Sleep(50);
+            Sleep(100);
         }
     }
 }

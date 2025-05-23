@@ -25,7 +25,12 @@ static ID3DXEffect** g_ShaderTable = (ID3DXEffect**)SHADER_TABLE_ADDRESS; // NFS
 
 LPDIRECT3DDEVICE9 g_Device = nullptr;
 ShaderManager::PresentFn ShaderManager::RealPresent = nullptr;
+
+bool g_ApplyGraphicsSeenThisFrame = false;
+int g_ApplyGraphicsTriggerDelay = 0;
+
 bool g_EnableShaderTableDump = false;
+void* g_LiveVisualTreatmentObject = nullptr;
 
 ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal = nullptr; // ✅ definition
 ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal = nullptr; // ✅ definition
@@ -845,8 +850,6 @@ void RecompileAndReloadAll()
     }
 }
 
-void* g_LiveVisualTreatmentObject = nullptr;
-
 void ScanIVisualTreatment()
 {
     if (!g_pVisualTreatment || IsBadReadPtr(g_pVisualTreatment, sizeof(void*)))
@@ -1045,7 +1048,7 @@ void LogLiveShaderMatch(void* targetThis)
 void LogApplyGraphicsSettingsCall(void* manager, void* object, int objectType)
 {
     static std::unordered_map<std::pair<void*, int>, int> objectHits;
-    static std::pair<void*, int> lastKey = { nullptr, 0 };
+    static std::pair<void*, int> lastKey = {nullptr, 0};
     // static int repeatCount = 0;
 
     std::pair<void*, int> key = std::make_pair(object, objectType);
@@ -1188,6 +1191,8 @@ bool TryApplyGraphicsSettingsSafely()
 
     PrintFxAtOffsets(targetThis); // again after call
 
+    g_ThisCount = 0;
+    g_TriggerApplyGraphicsSettings = false; // ✅ Prevent further log spam
     return true;
 }
 
@@ -1218,6 +1223,13 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
     // ✅ Continue execution
     if (ApplyGraphicsSettingsOriginal)
         ApplyGraphicsSettingsOriginal(manager, nullptr, vtObject);
+
+    if (g_TriggerApplyGraphicsSettings)
+    {
+        printf_s("✅ ApplyGraphicsSettings hook confirmed — clearing trigger flag\n");
+        g_TriggerApplyGraphicsSettings = false;
+        g_ThisCount = 0;
+    }
 }
 
 bool SafeReleaseShaderSlot(ID3DXEffect** fxSlot, int offset)
@@ -1261,28 +1273,40 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
     if (g_EnableShaderTableDump)
         DumpShaderTable();
 
-    static int delayCounter = 0;
+    static int waitFrames = 0;
 
     if (g_TriggerApplyGraphicsSettings)
     {
-        if (g_ThisCount >= 3)
+        if (g_ApplyGraphicsTriggerDelay > 0)
         {
-            if (++delayCounter >= 3)
-            {
-                TryApplyGraphicsSettingsSafely();
-                g_TriggerApplyGraphicsSettings = false;
-                delayCounter = 0;
-                g_ThisCount = 0;
-            }
-            else
-            {
-                printf_s("[HotReload] ⏳ Delaying ApplyGraphicsSettings %d/3 frames...\n", delayCounter);
-            }
+            g_ApplyGraphicsTriggerDelay--;
+            g_ApplyGraphicsSeenThisFrame = false; // Ignore anything during delay
+        }
+        else if (g_ApplyGraphicsSeenThisFrame)
+        {
+            printf_s("✅ ApplyGraphicsSettings hook confirmed — clearing trigger flag\n");
+            g_TriggerApplyGraphicsSettings = false;
+            g_ApplyGraphicsSeenThisFrame = false;
+            g_ApplyGraphicsTriggerDelay = 0;
+            waitFrames = 0;
         }
         else
         {
-            printf_s("[HotReload] ⏳ Waiting for ApplyGraphicsSettings calls... (%d captured)\n", g_ThisCount);
+            if (++waitFrames >= 180)
+            {
+                printf_s("⚠️ Timeout waiting for ApplyGraphicsSettings — resetting\n");
+                g_TriggerApplyGraphicsSettings = false;
+                waitFrames = 0;
+            }
+            else if (waitFrames == 1 || waitFrames % 30 == 0)
+            {
+                printf_s("[HotReload] ⏳ Waiting for ApplyGraphicsSettings calls... (%d captured)\n", g_ThisCount);
+            }
         }
+    }
+    else
+    {
+        g_ApplyGraphicsSeenThisFrame = false;
     }
 
     ApplyQueuedShaderPatches();

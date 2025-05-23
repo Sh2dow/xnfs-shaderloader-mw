@@ -19,6 +19,7 @@ extern ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal;  // ✅ extern = D
 typedef int (__thiscall* ApplyGraphicsManagerMain_t)(void* thisptr);
 extern ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal;
 
+extern int g_ApplyGraphicsTriggerDelay;
 extern void* g_ApplyGraphicsSettingsThis;
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject);
 extern std::atomic<bool> g_TriggerApplyGraphicsSettings;
