@@ -22,29 +22,6 @@ D3DXCreateEffectFromResourceAFn RealCreateFromResource = nullptr;
 int g_ApplyDelayCounter = 0;
 bool g_ApplyScheduled = false;
 
-DWORD WINAPI HotkeyThread(LPVOID)
-{
-    while (true)
-    {
-        if (GetAsyncKeyState(VK_F2) & 1) // Press F2
-        {
-            printf_s("[HotkeyThread] F2 pressed → Recompiling FX overrides...\n");
-            ReleaseAllRetainedShaders();
-            RecompileAndReloadAll();
-
-            // ✅ Trigger ApplyGraphicsManagerMain on next Present
-            g_ApplyDelayCounter = 4; // delay for 4 Present()s
-            g_ApplyScheduled = true;
-            g_TriggerApplyGraphicsSettings = true;
-            g_ApplyGraphicsTriggerDelay = 2; // skip first 2 frames
-        }
-
-        while (g_ApplyGraphicsSettingsThis == nullptr)
-        {
-            Sleep(100);
-        }
-    }
-}
 
 DWORD WINAPI DeferredHookThread(LPVOID)
 {
@@ -62,6 +39,27 @@ DWORD WINAPI DeferredHookThread(LPVOID)
         printf_s("[Init] Hooked IDirect3DDevice9::Present (deferred)\n");
     }
     return 0;
+}
+
+DWORD WINAPI HotkeyThread(LPVOID)
+{
+    while (true)
+    {
+        if (GetAsyncKeyState(VK_F2) & 1) // Press F2
+        {
+            printf_s("[HotkeyThread] F2 pressed → Recompiling FX overrides...\n");
+            ReleaseAllRetainedShaders();
+            RecompileAndReloadAll(); // triggers ApplyGraphicsSettings fallback
+
+            // Will trigger ApplyGraphicsSettings path in Present
+            g_ApplyDelayCounter = 4;
+            g_ApplyScheduled = true;
+            g_TriggerApplyGraphicsSettings = true;
+            g_ApplyGraphicsTriggerDelay = 2;
+        }
+
+        Sleep(100);
+    }
 }
 
 // -------------------- DllMain --------------------
@@ -96,4 +94,3 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     }
     return TRUE;
 }
-

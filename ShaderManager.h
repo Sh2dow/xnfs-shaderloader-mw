@@ -12,7 +12,6 @@ class ShaderManager
 public:
     static void LoadOverrides();
     static bool SafePatchShaderTable(int slot, ID3DXEffect* fx);
-    static void ForceReplaceShaderIntoSlots(const std::string& resourceKey, ID3DXEffect* fx);
     static void ApplyQueuedShaderPatches();
     static void PauseGameThread();
     static void ResumeGameThread();
@@ -40,7 +39,6 @@ private:
     static std::string ToUpper(const std::string& str);
     static bool CompileAndDumpShader(const std::string& key, const std::string& fxPath);
     static std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName);
-    static bool IsValidShaderPointer(ID3DXEffect* fx);
 
     class FXIncludeHandler : public ID3DXInclude
     {
@@ -50,13 +48,26 @@ private:
     };
 };
 
+extern bool IsValidShaderPointer(ID3DXEffect* fx);
+extern void ForceReplaceShaderIntoSlots(const std::string& resourceKey, ID3DXEffect* fx); 
 extern void ReleaseAllRetainedShaders();
 extern void RecompileAndReloadAll();
-extern  void ScanIVisualTreatment();
+extern void ScanIVisualTreatment();
 extern void PrintFxAtOffsets(void* obj);
+extern bool ReplaceShaderSlot(BYTE* object, int offset, ID3DXEffect* newFx);
+extern void ClearMatchingShaders(BYTE* object, ID3DXEffect* newFx);
+extern bool IsValidThis(void* ptr);
 
+extern void* g_ThisCandidates[3];
+
+extern void* g_LatestEView;
+extern unsigned g_FrameId;
+extern unsigned g_LastApplySeenFrame;
+extern void** g_pVisualTreatment;
+extern void* g_ApplyGraphicsManagerThis;
 extern std::pair<void*, int> lastKey;
 extern int repeatCount;
+extern int g_ThisCount;
 
 typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
     LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*,

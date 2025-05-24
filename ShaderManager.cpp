@@ -21,6 +21,8 @@
 #define WORLDSHADER_TABLE_ADDRESS 0x008F9B60;
 const int ShaderTableSize = 64;
 void** g_pVisualTreatment = (void**)0x00982AF0;
+#define EViewsBase 0x009195E0  // Replace old guess 0x008FAF30
+
 static ID3DXEffect** g_ShaderTable = (ID3DXEffect**)SHADER_TABLE_ADDRESS; // NFS MW shader g_ShaderTable
 
 LPDIRECT3DDEVICE9 g_Device = nullptr;
@@ -1201,6 +1203,8 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
     // printf_s("[Hook] ApplyGraphicsSettings live-call: manager=%p object=%p\n", manager, vtObject);
     LogApplyGraphicsSettingsCall(manager, vtObject, 1);
 
+    bool triggerActive = g_TriggerApplyGraphicsSettings;
+
     g_ApplyGraphicsManagerThis = manager;
 
     if (IsValidThis(vtObject))
@@ -1216,54 +1220,106 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
             g_ThisCandidates[g_ThisCount++] = vtObject;
         }
 
-        // printf_s("[Hook] ➕ Captured live vtObject = %p\n", vtObject);
         LogApplyGraphicsSettingsCall(manager, vtObject, 2);
     }
 
-    // ✅ Continue execution
     if (ApplyGraphicsSettingsOriginal)
         ApplyGraphicsSettingsOriginal(manager, nullptr, vtObject);
 
-    if (g_TriggerApplyGraphicsSettings)
+    // ✅ If trigger was active, actually reload now
+    if (triggerActive)
     {
-        printf_s("✅ ApplyGraphicsSettings hook confirmed — clearing trigger flag\n");
+        printf_s("✅ ApplyGraphicsSettings hook confirmed — applying shader changes\n");
         g_TriggerApplyGraphicsSettings = false;
         g_ThisCount = 0;
+
+        if (g_LastReloadedFx)
+        {
+            ReplaceShaderSlot((BYTE*)vtObject, 0x18C, g_LastReloadedFx);
+            if (g_pVisualTreatment && *g_pVisualTreatment)
+            {
+                IVisualTreatment_Reset(*g_pVisualTreatment);
+                printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+            }
+        }
     }
 }
 
-bool SafeReleaseShaderSlot(ID3DXEffect** fxSlot, int offset)
+void* g_LastEView = nullptr;
+
+typedef void (__thiscall* UpdateFunc)(void* thisptr, void* eView);
+typedef void (__cdecl* FrameRenderFn)();
+FrameRenderFn ForceFrameRender = (FrameRenderFn)0x006DE300;
+UpdateFunc OriginalUpdate = nullptr;
+
+// Hook to capture eView*
+void __fastcall HookedUpdate(void* thisptr, void*, void* eView)
 {
-    if (IsBadReadPtr(fxSlot, sizeof(void*)))
+    if (!g_LastEView && eView)
     {
-        printf_s("⚠️ fxSlot @ +0x%02X not readable\n", offset);
-        return false;
+        g_LastEView = eView;
+        printf_s("[Capture] g_LastEView = %p\n", eView);
     }
 
-    ID3DXEffect* fx = *fxSlot;
+    if (OriginalUpdate)
+        OriginalUpdate(thisptr, eView);
+    else
+        ((UpdateFunc)0x0074C000)(thisptr, eView); // Fallback to original address
+}
 
-    if ((uintptr_t)fx < 0x10000)
+void TryFullGraphicsReset()
+{
+    static bool hookInstalled = false;
+    if (!hookInstalled)
     {
-        printf_s("⚠️ fx @ +0x%02X too low to be valid: %p\n", offset, fx);
-        return false;
+        // Hook call to IVisualTreatment::Update to capture eView
+        injector::MakeCALL(0x006DE299, HookedUpdate, true);
+        hookInstalled = true;
     }
 
-    if (((uintptr_t)fx & 0xFFF00000) == 0x3F000000)
+    if (!g_LastEView)
     {
-        printf_s("⚠️ fx @ +0x%02X looks like float constant: 0x%08X\n", offset, (unsigned)(uintptr_t)fx);
-        return false;
+        // Try fallback from known static array
+        g_LastEView = *(void**)0x009195E0;
+        printf_s("[Fallback] Using eViews[0] from 0x009195E0 → %p\n", g_LastEView);
     }
 
-    if (!IsValidShaderPointer(fx))
+    if (!g_LastEView && g_pVisualTreatment && *g_pVisualTreatment)
     {
-        printf_s("⚠️ fx @ +0x%02X is not a valid ID3DXEffect*: %p\n", offset, fx);
-        return false;
+        // Also patch vtable[3] to HookedUpdate if not already done
+        BYTE** vtable = *(BYTE***)g_pVisualTreatment;
+        if (vtable)
+        {
+            DWORD oldProtect;
+            VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+            OriginalUpdate = (UpdateFunc)vtable[3];
+            vtable[3] = (BYTE*)&HookedUpdate;
+            VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
+            printf_s("[Init] ✅ Hooked IVisualTreatment::Update(eView*) at vtable[3]\n");
+        }
     }
 
-    printf_s("[HotReload] 🔻 Releasing shader at +0x%02X (%p)\n", offset, fx);
-    fx->Release();
-    *fxSlot = nullptr;
-    return true;
+    if (g_LastEView && g_pVisualTreatment && *g_pVisualTreatment)
+    {
+        ReplaceShaderSlot((BYTE*)g_ApplyGraphicsSettingsThis, 0x18C, g_LastReloadedFx);
+
+        IVisualTreatment_Reset(*g_pVisualTreatment);
+        printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+
+        // 🔧 Force game to consider settings changed
+        *(BYTE*)0x00982C39 = 1;
+        printf_s("[HotReload] ✅ Set LoadedFlagMaybe = 1 (0x00982C39)\n");
+
+        // 🔁 Try full visual reset
+        ForceFrameRender();
+        printf_s("[HotReload] ✅ ForceFrameRender (sub_6DE300) called\n");
+
+        ApplyGraphicsManagerMainOriginal(g_ApplyGraphicsManagerThis);
+    }
+    else
+    {
+        printf_s("⚠️ Cannot reset visuals: g_LastEView or g_pVisualTreatment is null\n");
+    }
 }
 
 HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
@@ -1277,18 +1333,36 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
 
     if (g_TriggerApplyGraphicsSettings)
     {
+        g_ApplyGraphicsSeenThisFrame = true;
         if (g_ApplyGraphicsTriggerDelay > 0)
         {
             g_ApplyGraphicsTriggerDelay--;
-            g_ApplyGraphicsSeenThisFrame = false; // Ignore anything during delay
         }
-        else if (g_ApplyGraphicsSeenThisFrame)
+        else
         {
-            printf_s("✅ ApplyGraphicsSettings hook confirmed — clearing trigger flag\n");
+            g_ApplyGraphicsSeenThisFrame = true;
+        }
+
+        if (g_ApplyGraphicsSeenThisFrame)
+        {
+            printf_s("✅ ApplyGraphicsSettings hook confirmed — applying shader changes\n");
             g_TriggerApplyGraphicsSettings = false;
             g_ApplyGraphicsSeenThisFrame = false;
-            g_ApplyGraphicsTriggerDelay = 0;
             waitFrames = 0;
+
+            if (g_ApplyGraphicsSettingsThis && g_ApplyGraphicsManagerThis)
+            {
+                ReplaceShaderSlot((BYTE*)g_ApplyGraphicsSettingsThis, 0x18C, g_LastReloadedFx);
+
+                if (g_pVisualTreatment && *g_pVisualTreatment)
+                {
+                    IVisualTreatment_Reset(*g_pVisualTreatment);
+                    printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+                }
+
+                TryFullGraphicsReset();
+                printf_s("[HotReload] ✅ Full graphics reapplication triggered\n");
+            }
         }
         else
         {
