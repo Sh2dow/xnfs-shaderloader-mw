@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdio>
 #include <cctype>
+#include <MinHook.h>
 #include <unordered_set>
 #include "includes/injector/injector.hpp"
 #include "d3d9.h"
@@ -19,6 +20,7 @@ LPDIRECT3DDEVICE9 g_Device = nullptr;
 std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
 std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
 std::unordered_set<std::string> g_FxOverrides;
+std::unordered_set<int> g_OwnedShaderSlots;
 
 struct ShaderInfo
 {
@@ -29,39 +31,42 @@ struct ShaderInfo
 std::unordered_map<std::string, ShaderInfo> g_ActiveEffects;
 
 std::unordered_map<std::string, int> g_ShaderSlotMap = {
-    { "IDI_WORLD_FX", 0 },
-    { "IDI_WORLDREFLECT_FX", 1 },
-    { "IDI_WORLDBONE_FX", 2 },
-    { "IDI_WORLDNORMALMAP_FX", 3 },
-    { "IDI_CAR_FX", 4 },
-    { "IDI_GLOSSYWINDOW_FX", 5 },
-    { "IDI_TREE_FX", 6 },
-    { "IDI_WORLDMIN_FX", 7 },
-    { "IDI_WORLDNOFOG_FX", 8 },
-    { "IDI_FE_FX", 9 },
-    { "IDI_FE_MASK_FX", 10 },
-    { "IDI_FILTER_FX", 11 },
-    { "IDI_OVERBRIGHT_FX", 12 },
-    { "IDI_SCREENFILTER_FX", 13 },
-    { "IDI_RAIN_DROP_FX", 14 },
-    { "IDI_RUNWAYLIGHT_FX", 15 },
-    { "IDI_VISUALTREATMENT_FX", 16 },
-    { "IDI_WORLDPRELIT_FX", 17 },
-    { "IDI_PARTICLES_FX", 18 },
-    { "IDI_SKYBOX_FX", 19 },
-    { "IDI_SHADOW_MAP_MESH_FX", 20 },
-    { "IDI_SKYBOX_CG_FX", 21 },
-    { "IDI_SHADOW_CG_FX", 22 },
-    { "IDI_CAR_SHADOW_MAP_FX", 23 },
-    { "IDI_WORLDDEPTH_FX", 24 },
-    { "IDI_WORLDNORMALMAPDEPTH_FX", 25 },
-    { "IDI_CARDEPTH_FX", 26 },
-    { "IDI_GLOSSYWINDOWDEPTH_FX", 27 },
-    { "IDI_TREEDEPTH_FX", 28 },
-    { "IDI_SHADOW_MAP_MESH_DEPTH_FX", 29 },
-    { "IDI_WORLDNORMALMAPNOFOG_FX", 30 },
-    { "IDI_GLASSREFLECTSHADER_FX", 31 }
+    {"IDI_WORLD_FX", 0},
+    {"IDI_WORLDREFLECT_FX", 1},
+    {"IDI_WORLDBONE_FX", 2},
+    {"IDI_WORLDNORMALMAP_FX", 3},
+    {"IDI_CAR_FX", 4},
+    {"IDI_GLOSSYWINDOW_FX", 5},
+    {"IDI_TREE_FX", 6},
+    {"IDI_WORLDMIN_FX", 7},
+    {"IDI_WORLDNOFOG_FX", 8},
+    {"IDI_FE_FX", 9},
+    {"IDI_FE_MASK_FX", 10},
+    {"IDI_FILTER_FX", 11},
+    {"IDI_OVERBRIGHT_FX", 12},
+    {"IDI_SCREENFILTER_FX", 13},
+    {"IDI_RAIN_DROP_FX", 14},
+    {"IDI_RUNWAYLIGHT_FX", 15},
+    {"IDI_VISUALTREATMENT_FX", 16},
+    {"IDI_WORLDPRELIT_FX", 17},
+    {"IDI_PARTICLES_FX", 18},
+    {"IDI_SKYBOX_FX", 19},
+    {"IDI_SHADOW_MAP_MESH_FX", 20},
+    {"IDI_SKYBOX_CG_FX", 21},
+    {"IDI_SHADOW_CG_FX", 22},
+    {"IDI_CAR_SHADOW_MAP_FX", 23},
+    {"IDI_WORLDDEPTH_FX", 24},
+    {"IDI_WORLDNORMALMAPDEPTH_FX", 25},
+    {"IDI_CARDEPTH_FX", 26},
+    {"IDI_GLOSSYWINDOWDEPTH_FX", 27},
+    {"IDI_TREEDEPTH_FX", 28},
+    {"IDI_SHADOW_MAP_MESH_DEPTH_FX", 29},
+    {"IDI_WORLDNORMALMAPNOFOG_FX", 30},
+    {"IDI_GLASSREFLECTSHADER_FX", 31}
 };
+
+typedef ULONG (STDMETHODCALLTYPE* ReleaseFn)(IDirect3DDevice9*);
+ReleaseFn RealRelease = nullptr;
 
 int LookupShaderSlotFromResource(const std::string& key)
 {
@@ -176,6 +181,24 @@ bool CompileAndDumpShader(const std::string& key, const std::string& fxPath)
     return true;
 }
 
+ULONG STDMETHODCALLTYPE HookedRelease(IDirect3DDevice9* device)
+{
+    static bool cleaned = false;
+    if (!cleaned)
+    {
+        printf("[Hook] Cleaning up shader table (no Release calls)...\n");
+
+        for (int i = 0; i < 62; ++i)
+        {
+            SHADER_TABLE_PTR[i] = nullptr; // prevent use-after-free
+        }
+
+        cleaned = true;
+    }
+
+    return RealRelease(device); // call the original Release()
+}
+
 // -------------------- SHADER OVERRIDE LOADER --------------------
 
 void LoadShaderOverrides()
@@ -276,10 +299,11 @@ HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors)
 {
+    // First-time setup
     if (!g_Device)
     {
         g_Device = device;
-        LoadShaderOverrides(); // compile everything once
+        LoadShaderOverrides();
     }
 
     static int g_HookCallCount = 0;
@@ -298,33 +322,35 @@ HRESULT WINAPI HookedCreateFromResource(
             std::vector<char> buffer(len);
             fread(buffer.data(), 1, len, f);
             fclose(f);
-
+    
             FXIncludeHandler includeHandler;
             HRESULT hr = D3DXCreateEffect(device, buffer.data(), (UINT)len, defines, &includeHandler, flags, pool,
                                           outEffect, outErrors);
             if (SUCCEEDED(hr) && *outEffect)
             {
                 bool patched = false;
-
+    
                 int index = LookupShaderSlotFromResource(pResource);
                 if (index >= 0 && index < 62)
                 {
                     (*outEffect)->AddRef();
-                    SHADER_TABLE_PTR[index] = *outEffect;
+                    // Avoid injecting effect directly into game memory
+                    g_ActiveEffects[pResource] = {pResource, *outEffect};
+                    printf("[Patch] ⚠️ Skipped SHADER_TABLE_PTR[%d] assignment to prevent dangling use\n", index);
                     printf("[Patch] ✅ Replaced live shader slot %d for %s\n", index, pResource);
                     patched = true;
                 }
-
+    
                 if (!patched)
                 {
-                    g_ActiveEffects[pResource] = { pResource, *outEffect };
+                    g_ActiveEffects[pResource] = {pResource, *outEffect};
                     printf("[Patch] ⚠️ Shader not found in table — stored in internal map instead: %s\n", pResource);
                 }
-
+    
                 return S_OK;
             }
-
-
+    
+    
             printf("[Hook] Failed to create effect from compiled override for %s\n", pResource);
         }
         else
@@ -372,11 +398,8 @@ void ReloadTrackedEffects()
 
         printf("[ReloadTrack] Recompiling and reloading: %s\n", key.c_str());
 
-        if (shader.effect)
-        {
-            shader.effect->Release();
-            shader.effect = nullptr;
-        }
+        // Do NOT release; we assume the game owns it now
+        shader.effect = nullptr;
 
         LPD3DXEFFECT fx = nullptr;
         LPD3DXBUFFER err = nullptr;
@@ -449,6 +472,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
+        if (MH_Initialize() != MH_OK)
+        {
+            printf("[MinHook] Failed to initialize!\n");
+            return FALSE;
+        }
+
         AllocConsole();
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);
@@ -461,7 +490,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             RealCreateFromResource = (D3DXCreateEffectFromResourceAFn)addr;
             injector::MakeCALL(0x006C60D2, HookedCreateFromResource, true);
             printf("[Init] Hooked D3DXCreateEffectFromResourceA\n");
-            // ✅ Correct: Launch F1 hotkey thread *after* setup
+            // ✅ Correct: Launch F2 hotkey thread *after* setup
             HANDLE hThread = CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
             if (hThread)
                 printf("[Init] Hotkey thread started successfully.\n");
@@ -469,5 +498,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
                 printf("[Init] Failed to start hotkey thread! Error: %lu\n", GetLastError());
         }
     }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        printf("[Shutdown] Nulling shader table...\n");
+
+        for (int i = 0; i < 62; ++i)
+            SHADER_TABLE_PTR[i] = nullptr;
+
+        g_ActiveEffects.clear();
+        g_ShaderOverridePaths.clear();
+        g_ShaderBuffers.clear();
+        g_FxOverrides.clear();
+        g_Device = nullptr;
+    }
+
     return TRUE;
 }
