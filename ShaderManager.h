@@ -19,7 +19,6 @@ public:
     static void DumpShaderTable();
     static void LoadShaderOverrides();
 
-
     static std::unordered_set<std::string> g_FxOverrides;
     static std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
 
@@ -28,6 +27,8 @@ public:
     static PresentFn RealPresent;
 
 private:
+    static FxWrapper* g_LastReloadedFx;
+    
     static std::string ToUpper(const std::string& str);
     static bool CompileAndDumpShader(const std::string& key, const std::string& fxPath);
     static std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName);
@@ -43,7 +44,7 @@ private:
 extern void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx);
 extern void ReleaseAllRetainedShaders();
 extern void ReleaseAllActiveEffects();
-extern void RecompileAndReloadAll();
+extern bool RecompileAndReloadAll();
 extern void ScanIVisualTreatment();
 extern void PrintFxAtOffsets(void* obj);
 extern bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx);

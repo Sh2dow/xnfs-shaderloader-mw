@@ -124,3 +124,12 @@ bool IsValidShaderPointer(FxWrapper* m_fx)
 
     return valid;
 }
+
+bool IsD3D9ExAvailable()
+{
+    OSVERSIONINFOEX osvi = {};
+    osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
+    GetVersionEx((OSVERSIONINFO*)&osvi);
+
+    return (osvi.dwMajorVersion > 6) || (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion >= 0); // Vista+
+}

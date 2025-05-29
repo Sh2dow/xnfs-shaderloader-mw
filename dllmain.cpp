@@ -34,7 +34,6 @@ DWORD WINAPI DeferredHookThread(LPVOID)
         vtable[16] = (void*)&hkReset;
         VirtualProtect(&vtable[16], sizeof(void*), oldProtect, &oldProtect);
         printf_s("[Init] Hooked IDirect3DDevice9::Reset (deferred)\n");
-
     }
     return 0;
 }
@@ -51,13 +50,20 @@ DWORD WINAPI HotkeyThread(LPVOID)
             // ReleaseAllRetainedShaders();
             // ReleaseAllActiveEffects();
 
-            RecompileAndReloadAll();
+            if (!RecompileAndReloadAll())
+            {
+                printf_s("[HotkeyThread] ❌ RecompileAndReloadAll failed\n");
+            }
+            else
+            {
+                printf_s("[HotkeyThread] ✅ RecompileAndReloadAll succeeded\n");
 
-            // Schedule ApplyGraphicsSettings
-            g_ApplyDelayCounter = 4;
-            g_ApplyScheduled = true;
-            g_TriggerApplyGraphicsSettings = true;
-            g_ApplyGraphicsTriggerDelay = 2;
+                // Schedule ApplyGraphicsSettings
+                g_ApplyDelayCounter = 4;
+                g_ApplyScheduled = true;
+                g_TriggerApplyGraphicsSettings = true;
+                g_ApplyGraphicsTriggerDelay = 2;
+            }
         }
 
         Sleep(100);

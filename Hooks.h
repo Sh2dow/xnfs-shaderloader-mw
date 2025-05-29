@@ -37,4 +37,3 @@ extern std::atomic<bool> g_TriggerApplyGraphicsSettings;
 using IVisualTreatment_ResetFn = void(__thiscall*)(void* thisPtr);
 // ✅ Header declaration only:
 extern IVisualTreatment_ResetFn IVisualTreatment_Reset;
-extern FxWrapper* g_LastReloadedFx;

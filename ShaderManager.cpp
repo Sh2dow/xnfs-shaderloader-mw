@@ -17,7 +17,7 @@
 #include "Validators.h"
 
 // Define a cast macro that allows old FxWrapper* to be used with minimal refactoring
-#define FX(x) ((FxWrapper*)(x))
+// #define FX(x) ((FxWrapper*)(x))
 
 #define SHADER_TABLE_ADDRESS 0x0093DE78;
 #define WORLDSHADER_TABLE_ADDRESS 0x008F9B60;
@@ -28,6 +28,7 @@ void** g_pVisualTreatment = (void**)0x00982AF0;
 static FxWrapper** g_ShaderTable = (FxWrapper**)SHADER_TABLE_ADDRESS; // NFS MW shader g_ShaderTable
 std::mutex g_ShaderTableLock = std::mutex();
 std::unordered_map<std::string, FxWrapper*> g_DebugLiveEffects;
+std::unordered_set<FxWrapper*> g_AlreadyInjectedFxThisFrame;
 
 ShaderManager::PresentFn ShaderManager::RealPresent = nullptr;
 
@@ -591,7 +592,8 @@ HRESULT WINAPI HookedCreateFromResource(
         }
     }
 
-    printf_s("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++,
+    if (pResource == "IDI_WORLD_FX" || pResource == "IDI_VISUALTREATMENT_FX")
+        printf_s("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++,
              pResource ? pResource : "(null)");
 
     if (g_FxOverrides.count(pResource))
@@ -887,12 +889,12 @@ void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx)
     ResumeGameThread();
 }
 
-void RecompileAndReloadAll()
+bool RecompileAndReloadAll()
 {
     if (!g_Device)
     {
         printf_s("[HotReload] ❌ g_Device is null, cannot recompile shaders.\n");
-        return;
+        return false;
     }
 
     bool patchedAny = false;
@@ -969,6 +971,11 @@ void RecompileAndReloadAll()
         fx->AddRef(); // prevent premature destruction
         g_LastReloadedFx = fx;
 
+        g_ActiveEffects["IDI_VISUALTREATMENT_FX"] = g_LastReloadedFx;
+
+        // Track for motion blur injection
+        TrackLiveEffect(key, fx);
+
         ForceReplaceShaderIntoSlots(key, fx);
         printf_s("[HotReload] ✅ Force-replaced effect in all slots for %s\n", key.c_str());
 
@@ -985,6 +992,8 @@ void RecompileAndReloadAll()
     {
         printf_s("[HotReload] ❌ No shader slots were patched — skipping ApplyGraphicsSettings()\n");
     }
+
+    return true;
 }
 
 void ScanIVisualTreatment()
@@ -1079,7 +1088,7 @@ bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx)
         printf_s("❌ g_LastReloadedFx is invalid\n");
         return false;
     }
-    
+
     FxWrapper** slot = (FxWrapper**)(object + offset);
 
     MEMORY_BASIC_INFORMATION mbi = {};
@@ -1256,6 +1265,7 @@ void PrintFxAtOffsets(void* target)
 bool TryApplyGraphicsSettingsSafely()
 {
     void* targetThis = ResolveApplyGraphicsThis();
+    
     if (!targetThis)
     {
         printf_s("❌ Failed to resolve ApplyGraphicsSettings this-pointer\n");
@@ -1273,6 +1283,8 @@ bool TryApplyGraphicsSettingsSafely()
     // Replace +0x18C if reloaded
     if (g_LastReloadedFx && IsValidShaderPointer(g_LastReloadedFx))
     {
+        printf_s("🧪 Entering TryApplyGraphicsSettingsSafely() — g_LastReloadedFx=%p\n", g_LastReloadedFx);
+
         BYTE* obj = (BYTE*)targetThis;
 
         D3DXEFFECT_DESC newDesc = {};
@@ -1341,7 +1353,7 @@ bool TryApplyGraphicsSettingsSafely()
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
 {
     LogApplyGraphicsSettingsCall(manager, vtObject, 1);
-    
+
     if (g_WaitingForReset)
     {
         // skip scanning or patching — game is in reset
@@ -1363,13 +1375,16 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
     {
         // Validate the [vtObject + 0x140] chain with try/except
         void* ptr140 = nullptr;
-        __try {
+        __try
+        {
             ptr140 = *(void**)((char*)vtObject + 0x140);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
             ptr140 = nullptr;
         }
 
-        printf_s("[Debug] vtObject=%p  ptr140=%p\n", vtObject, ptr140);
+        // printf_s("[Debug] vtObject=%p  ptr140=%p\n", vtObject, ptr140);
 
         if (!IsValidThis(ptr140))
         {
@@ -1377,7 +1392,7 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
             auto now = std::chrono::steady_clock::now();
             if (now - lastLogTime > std::chrono::seconds(1))
             {
-                printf_s("[XNFS-ShaderLoader-MW] ❌ Still invalid: vtObject+0x140 = %p (from %p)\n", ptr140, vtObject);
+                // printf_s("[XNFS-ShaderLoader-MW] ❌ Still invalid: vtObject+0x140 = %p (from %p)\n", ptr140, vtObject);
                 lastLogTime = now;
             }
             return;
@@ -1470,21 +1485,67 @@ HRESULT TryFullGraphicsReset()
         printf_s("❌ Refusing to patch slot — g_LastReloadedFx or effect is null\n");
         return E_POINTER;
     }
-    
-    ReplaceShaderSlot((BYTE*)g_ApplyGraphicsSettingsThis, 0x18C, g_LastReloadedFx);
 
-    IDirect3DDevice9Ex* deviceEx = nullptr;
-    if (SUCCEEDED(g_Device->QueryInterface(IID_PPV_ARGS(&deviceEx))) && deviceEx)
+    if (IsValidThis(g_ApplyGraphicsSettingsThis))
     {
-        UINT count = 0;
+        void* applyThis = ResolveApplyGraphicsThis();
+        if (!applyThis)
+        {
+            printf_s("[HotReload] ❌ Cannot replace shader slot — ApplyGraphicsSettingsThis unresolved\n");
+            return E_POINTER;
+        }
+        ReplaceShaderSlot((BYTE*)applyThis, 0x18C, g_LastReloadedFx);
+    }
+    else if (g_pVisualTreatment && *g_pVisualTreatment)
+    {
+        BYTE* vtObj = (BYTE*)(*g_pVisualTreatment);
+        printf_s("[Fallback] Patching g_pVisualTreatment at +0x18C (vtObj = %p)\n", vtObj);
+        ReplaceShaderSlot(vtObj, 0x18C, g_LastReloadedFx);
+    }
+    else
+    {
+        printf_s("[HotReload] ❌ Cannot patch shader slot — no valid this-pointer\n");
+    }
+
+    // Optional debug output — only if QueryInterface succeeds
+    IDirect3DDevice9Ex* deviceEx = nullptr;
+    if (SUCCEEDED(g_Device->QueryInterface(__uuidof(IDirect3DDevice9Ex), (void**)&deviceEx)) && deviceEx)
+    {
         HRESULT hr = deviceEx->CheckDeviceState(nullptr);
-        printf_s("[Debug] CheckDeviceState: 0x%08X, remaining losable resources: ~%u?\n", hr, count);
+        printf_s("[Debug] CheckDeviceState: 0x%08X\n", hr);
         deviceEx->Release();
+    }
+    else
+    {
+        printf_s("[Debug] IDirect3DDevice9Ex not available — skipping CheckDeviceState\n");
     }
 
     IVisualTreatment_Reset(*g_pVisualTreatment);
     printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
 
+    // (Optional but recommended)
+    g_Device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    g_Device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    g_Device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    g_Device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
+    g_Device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    g_Device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
+    g_Device->SetRenderState(D3DRS_CLIPPING, TRUE);
+    g_Device->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+    printf_s("[HotReload] ✅ Z-buffer re-enabled\n");
+
+    // Dummy draw to force internal state update
+    IDirect3DSurface9* backbuffer = nullptr;
+    if (SUCCEEDED(g_Device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer)
+    {
+        g_Device->SetRenderTarget(0, backbuffer);
+        g_Device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_ARGB(0, 0, 0, 0), 1.0f, 0);
+        g_Device->BeginScene();
+        g_Device->EndScene();
+        backbuffer->Release();
+        printf_s("[HotReload] 🧪 Performed dummy draw to rebind device state\n");
+    }
+    
     *(BYTE*)0x00982C39 = 1;
     printf_s("[HotReload] ✅ Set LoadedFlagMaybe = 1 (0x00982C39)\n");
 
@@ -1503,34 +1564,79 @@ HRESULT TryFullGraphicsReset()
 
 bool InjectSharedTextures(IDirect3DDevice9* device)
 {
+    g_AlreadyInjectedFxThisFrame.clear();
+
     if (!device)
         return false;
 
     if (!g_MotionBlurTex && !CreateMotionBlurResources(device))
         return false;
-    
-    // Inject into all effects
+
+    if (!g_LastReloadedFx || !g_LastReloadedFx->GetEffect())
+    {
+        return false;
+    }
+
     for (auto& [name, fx] : g_ActiveEffects)
     {
         if (!fx || !fx->GetEffect())
+        {
+            printf_s("[ShaderManager] ⚠️ Skipped: null or missing effect for %s\n", name.c_str());
+            continue;
+        }
+
+        if (g_AlreadyInjectedFxThisFrame.count(fx))
             continue;
 
         fx->ReloadHandles();
 
-        HRESULT hr1 = fx->GetEffect()->SetTexture("MISCMAP3_TEXTURE", g_MotionBlurTex);
-        HRESULT hr2 = fx->GetEffect()->SetVector("BlurParams", &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f));
+        ID3DXEffect* e = fx->GetEffect();
+
+        D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
+        D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
+
+        HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
+        HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_FAIL;
 
         if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
+        {
             printf_s("[ShaderManager] ✅ Set motion blur texture in: %s\n", name.c_str());
+            g_AlreadyInjectedFxThisFrame.insert(fx);
+        }
         else
-            printf_s("[ShaderManager] ❌ Failed to inject into: %s (hr1=0x%08X, hr2=0x%08X)\n", name.c_str(), hr1, hr2);
+        {
+            printf_s("[ShaderManager] ❌ Failed to inject into: %s (hr1=0x%08X, hr2=0x%08X)\n",
+                     name.c_str(), hr1, hr2);
+        }
+    }
+
+    // Ensure hot-reloaded fx is handled
+    if (g_LastReloadedFx && !g_AlreadyInjectedFxThisFrame.count(g_LastReloadedFx))
+    {
+        g_LastReloadedFx->ReloadHandles();
+        ID3DXEffect* e = g_LastReloadedFx->GetEffect();
+
+        D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
+        D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
+
+        HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
+        HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_FAIL;
+
+        if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
+        {
+            printf_s("[ShaderManager] ✅ Set motion blur texture in: g_LastReloadedFx\n");
+            g_AlreadyInjectedFxThisFrame.insert(g_LastReloadedFx);
+        }
+        else
+        {
+            printf_s("[ShaderManager] ❌ Failed to inject into g_LastReloadedFx (hr1=0x%08X, hr2=0x%08X)\n", hr1, hr2);
+        }
     }
 
     return true;
 }
 
-
-bool _InjectSharedTextures(IDirect3DDevice9* device)
+bool InjectSharedTextures2(IDirect3DDevice9* device)
 {
     if (!device)
         return false;
@@ -1552,7 +1658,9 @@ bool _InjectSharedTextures(IDirect3DDevice9* device)
         D3DXHANDLE blurHandle = effect->GetEffect()->GetParameterByName(nullptr, "BlurParams");
 
         HRESULT hr1 = texHandle ? effect->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-        HRESULT hr2 = blurHandle ? effect->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_POINTER;
+        HRESULT hr2 = blurHandle
+                          ? effect->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
+                          : E_POINTER;
 
         if (FAILED(hr1) || FAILED(hr2))
         {
@@ -1564,9 +1672,11 @@ bool _InjectSharedTextures(IDirect3DDevice9* device)
 
             if (!g_MotionBlurTex || !fx->GetEffect())
                 continue;
-            
+
             hr1 = texHandle ? effect->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-            hr2 = blurHandle ? effect->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_POINTER;
+            hr2 = blurHandle
+                      ? effect->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
+                      : E_POINTER;
         }
     }
 
@@ -1578,9 +1688,11 @@ bool _InjectSharedTextures(IDirect3DDevice9* device)
         {
             D3DXHANDLE texHandle = fx->GetEffect()->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
             D3DXHANDLE blurHandle = fx->GetEffect()->GetParameterByName(nullptr, "BlurParams");
-            
+
             HRESULT hr1 = texHandle ? fx->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-            HRESULT hr2 = blurHandle ? fx->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_POINTER;
+            HRESULT hr2 = blurHandle
+                              ? fx->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
+                              : E_POINTER;
 
             if (FAILED(hr1) || FAILED(hr2))
             {
@@ -1592,7 +1704,9 @@ bool _InjectSharedTextures(IDirect3DDevice9* device)
                 if (fx && g_MotionBlurTex)
                 {
                     hr1 = texHandle ? fx->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-                    hr2 = blurHandle ? fx->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_POINTER;
+                    hr2 = blurHandle
+                              ? fx->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
+                              : E_POINTER;
                 }
             }
         }
@@ -1645,7 +1759,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                 ReleaseAllActiveEffects();
             }
 
-            DumpLiveEffects();
+            // DumpLiveEffects();
 
             IDirect3DDevice9Ex* deviceEx = nullptr;
             if (SUCCEEDED(g_Device->QueryInterface(IID_PPV_ARGS(&deviceEx))) && deviceEx)
@@ -1656,10 +1770,10 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                 deviceEx->Release();
             }
 
-            // 🌀 Trigger the full reset
-            TryFullGraphicsReset();
+            // 🌀 Trigger the full reset first
+            TryFullGraphicsReset(); // includes IVisualTreatment::Reset
 
-            // 🧪 Inject shared textures only after reset
+            // 🧪 Inject shared textures after full reset
             InjectSharedTextures(g_Device);
 
             // 🔁 Trigger ApplyGraphicsManager to finalize settings
@@ -1667,7 +1781,19 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
             {
                 ApplyGraphicsManagerMainOriginal(g_ApplyGraphicsManagerThis);
                 printf_s("[HotReload] ✅ ApplyGraphicsManagerMain called (post-reset)\n");
-                
+
+                if (IsValidThis(g_ApplyGraphicsSettingsThis))
+                {
+                    printf_s("[HotReload] 🔁 Manually calling ApplyGraphicsSettingsOriginal...\n");
+                    ApplyGraphicsSettingsOriginal(g_ApplyGraphicsManagerThis, nullptr, g_ApplyGraphicsSettingsThis);
+                }
+
+                // ⬅️ Move this UP — before ResumeGameThread
+                if (!TryApplyGraphicsSettingsSafely())
+                {
+                    printf_s("[HotReload] ❌ TryApplyGraphicsSettingsSafely failed — final fallback attempt\n");
+                }
+
                 ReleaseMotionBlurTexture();
                 printf_s("[ShaderManager] 🔻 Released g_MotionBlurTex (pre-reset)\n");
             }
@@ -1675,16 +1801,44 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
             {
                 printf_s("[HotReload] ⚠️ Invalid ApplyGraphicsManagerThis — skipping call\n");
             }
-
-            if (g_LastReloadedFx)
+            
+            if (IsValidThis(g_ApplyGraphicsSettingsThis))
             {
-                g_LastReloadedFx->Release();
-                g_LastReloadedFx = nullptr;
+                void* applyThis = ResolveApplyGraphicsThis();
+                if (!applyThis)
+                {
+                    printf_s("[HotReload] ❌ Cannot replace shader slot — ApplyGraphicsSettingsThis unresolved\n");
+                    return E_POINTER;
+                }
+                g_LastReloadedFx->GetEffect()->OnLostDevice();
+
+                ReplaceShaderSlot((BYTE*)applyThis, 0x18C, g_LastReloadedFx);
+            }
+            else if (g_pVisualTreatment && *g_pVisualTreatment)
+            {
+                BYTE* vtObj = (BYTE*)(*g_pVisualTreatment);
+                printf_s("[Fallback] Patching g_pVisualTreatment at +0x18C (vtObj = %p)\n", vtObj);
+                g_LastReloadedFx->GetEffect()->OnLostDevice();
+
+                ReplaceShaderSlot(vtObj, 0x18C, g_LastReloadedFx);
+            }
+            else
+            {
+                printf_s("[HotReload] ❌ Cannot patch shader slot — no valid this-pointer\n");
             }
 
+            // if (g_LastReloadedFx->IsValid())
+            // {
+            //     g_LastReloadedFx->Release();
+            //     g_LastReloadedFx = nullptr;
+            // }
+
+            g_TriggerApplyGraphicsSettings = false;
             lastPatchedThis = nullptr; // 🔁 ready for next reload
 
-            g_ResumeGameThreadNextPresent = true; // <-- new flag
+            ResumeGameThread();
+            g_ResumeGameThreadNextPresent = false;
+            printf_s("[HotReload] ✅ Game Present thread resumed (immediate)\n");
             g_WaitingForReset = false;
 
             g_CallApplyGraphicsManagerNextFrame = false;
@@ -1694,7 +1848,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
         }
 
         // Waiting loop for ApplyGraphicsSettings
-        if (++waitFrames >= 150)
+        if (++waitFrames >= 360)
         {
             printf_s("⚠️ Timeout waiting for ApplyGraphicsSettings — resetting\n");
             g_TriggerApplyGraphicsSettings = false;
@@ -1709,10 +1863,12 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
     // Safety: if reset hangs, auto-resume game thread after timeout
     if (g_WaitingForReset)
     {
-        if (++resetTimeout > 150)
+        if (++resetTimeout > 180)
         {
             printf_s("[HotReload] ❌ Reset timeout — forcing resume\n");
             ResumeGameThread();
+            printf_s("[HotReload] ✅ Game Present thread resumed (forced)\n");
+            g_ResumeGameThreadNextPresent = true;
             g_WaitingForReset = false;
             resetTimeout = 0;
         }
@@ -1735,6 +1891,18 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
         ResumeGameThread();
         g_ResumeGameThreadNextPresent = false;
         printf_s("[HotReload] ✅ Game Present thread resumed (delayed)\n");
+
+        // 🛠️ Fallback: force patch using known IVisualTreatment if ApplyGraphicsSettingsThis was never seen
+        if (!IsValidThis(g_ApplyGraphicsSettingsThis) && g_pVisualTreatment && *g_pVisualTreatment)
+        {
+            BYTE* obj = (BYTE*)(*g_pVisualTreatment);
+            if (obj && IsValidShaderPointer(g_LastReloadedFx))
+            {
+                printf_s("[HotReload] 🛠️ Forcing fallback shader patch via g_pVisualTreatment\n");
+                ReplaceShaderSlot(obj, 0x18C, g_LastReloadedFx);
+                g_LastReloadedFx->ReloadHandles();
+            }
+        }
     }
 
     return ShaderManager::RealPresent(device, src, dest, hwnd, dirty);

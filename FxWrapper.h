@@ -12,7 +12,16 @@ public:
 
     ~FxWrapper()
     {
-        if (m_fx) m_fx->Release();
+        if (m_fx)
+        {
+            printf_s("[FxWrapper] ~FxWrapper() releasing m_fx = %p\n", m_fx);
+            m_fx->Release();
+            m_fx = nullptr;
+        }
+        else
+        {
+            printf_s("[FxWrapper] ~FxWrapper() called with null m_fx!\n");
+        }
     }
 
     // Implement AddRef and Release
