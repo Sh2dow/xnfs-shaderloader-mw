@@ -27,7 +27,6 @@ inline bool IsValidCodePtr(void* ptr)
     return false;
 }
 
-
 bool IsValidThis(void* ptr)
 {
     if (!ptr)
@@ -47,6 +46,26 @@ bool IsValidThis(void* ptr)
         return false;
     }
 }
+
+// bool IsValidThis(void* ptr)
+// {
+//     if (!ptr || (uintptr_t)ptr < 0x10000)
+//         return false;
+//
+//     MEMORY_BASIC_INFORMATION mbi = {};
+//     if (!VirtualQuery(ptr, &mbi, sizeof(mbi)))
+//         return false;
+//
+//     // Accept readable and writable (RW or RWX)
+//     if (!(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+//         return false;
+//
+//     // Ensure it's committed and not a guard or reserved region
+//     if (!(mbi.State & MEM_COMMIT) || (mbi.Protect & PAGE_GUARD))
+//         return false;
+//
+//     return true;
+// }
 
 // inline bool IsValidThis(void* ptr)
 // {

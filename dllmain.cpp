@@ -6,22 +6,18 @@
 #include <cstdio>
 #include "includes/injector/injector.hpp"
 #include <mutex>
-#include "FxWrapper.h"
 
 // -------------------- GLOBALS --------------------
-LPDIRECT3DDEVICE9 ShaderManager::g_Device = nullptr;
-D3DXCreateEffectFromResourceAFn RealCreateFromResource = nullptr;
-
 int g_ApplyDelayCounter = 0;
 bool g_ApplyScheduled = false;
 
 
 DWORD WINAPI DeferredHookThread(LPVOID)
 {
-    while (!ShaderManager::g_Device)
+    while (!g_Device)
         Sleep(10);
 
-    void** vtable = *(void***)ShaderManager::g_Device;
+    void** vtable = *(void***)g_Device;
     if (vtable)
     {
         // Hook Present
@@ -52,6 +48,9 @@ DWORD WINAPI HotkeyThread(LPVOID)
             printf_s("[HotkeyThread] F2 pressed → Recompiling FX overrides...\n");
 
             // Now trigger recompilation
+            // ReleaseAllRetainedShaders();
+            // ReleaseAllActiveEffects();
+
             RecompileAndReloadAll();
 
             // Schedule ApplyGraphicsSettings

@@ -29,7 +29,6 @@ static FxWrapper** g_ShaderTable = (FxWrapper**)SHADER_TABLE_ADDRESS; // NFS MW 
 std::mutex g_ShaderTableLock = std::mutex();
 std::unordered_map<std::string, FxWrapper*> g_DebugLiveEffects;
 
-LPDIRECT3DDEVICE9 g_Device = nullptr;
 ShaderManager::PresentFn ShaderManager::RealPresent = nullptr;
 
 bool g_WaitingForReset = false;
@@ -41,6 +40,10 @@ static void* lastPatchedThis = nullptr;
 
 bool g_EnableShaderTableDump = false;
 void* g_LiveVisualTreatmentObject = nullptr;
+
+// At top of HookApplyGraphicsSettings (outside function if needed)
+static auto lastInvalidLogTime = std::chrono::steady_clock::now();
+static void* lastInvalidVtObject = nullptr;
 
 ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal = nullptr; // ✅ definition
 ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal = nullptr; // ✅ definition
@@ -177,9 +180,6 @@ HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
     }
     return hr;
 }
-
-// -------------------- NFSMW-RenderTarget block End --------------------
-
 
 // -------------------- HELPERS --------------------
 
@@ -1074,6 +1074,12 @@ bool IsLikelyApplyGraphicsSettingsObject(void* candidate)
 
 bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx)
 {
+    if (!g_LastReloadedFx || !g_LastReloadedFx->GetEffect())
+    {
+        printf_s("❌ g_LastReloadedFx is invalid\n");
+        return false;
+    }
+    
     FxWrapper** slot = (FxWrapper**)(object + offset);
 
     MEMORY_BASIC_INFORMATION mbi = {};
@@ -1122,7 +1128,11 @@ bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx)
 void* ResolveApplyGraphicsThis()
 {
     if (IsValidThis(g_ApplyGraphicsSettingsThis))
+    {
         return g_ApplyGraphicsSettingsThis;
+    }
+
+    printf_s("❌ g_ApplyGraphicsSettingsThis is invalid — skipping ApplyGraphicsSettingsOriginal\n");
 
     for (int i = 0; i < g_ThisCount; ++i)
         if (IsValidThis(g_ThisCandidates[i]))
@@ -1200,17 +1210,45 @@ void PrintFxAtOffsets(void* target)
             continue;
         }
 
-        if (fx && fx == g_LastReloadedFx)
+        if (!fx || !IsValidShaderPointer(fx))
+            continue;
+
+        ID3DXEffect* effect = nullptr;
+        __try
         {
-            printf_s("🎯 Match: g_LastReloadedFx is actively assigned at offset +0x%02X (%p)\n", i, fx);
+            effect = fx->GetEffect();
         }
-        else if (IsValidShaderPointer(fx))
+        __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            D3DXEFFECT_DESC d = {};
-            if (SUCCEEDED(fx->GetEffect()->GetDesc(&d)))
-            {
+            continue;
+        }
+
+        if (!effect || (uintptr_t)effect < 0x10000)
+            continue;
+
+        D3DXEFFECT_DESC d = {};
+        HRESULT hr = E_FAIL;
+
+        __try
+        {
+            hr = effect->GetDesc(&d);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            printf_s("⚠️ Exception calling GetDesc at offset +0x%02X (fx=%p, effect=%p)\n", i, fx, effect);
+            continue;
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            if (fx == g_LastReloadedFx)
+                printf_s("🎯 Match: g_LastReloadedFx is actively assigned at offset +0x%02X (%p)\n", i, fx);
+            else
                 printf_s("🔍 Found other valid shader at +0x%02X: %p (%s)\n", i, fx, d.Creator);
-            }
+        }
+        else
+        {
+            printf_s("⚠️ GetDesc failed at offset +0x%02X (fx=%p)\n", i, fx);
         }
     }
 }
@@ -1303,6 +1341,13 @@ bool TryApplyGraphicsSettingsSafely()
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
 {
     LogApplyGraphicsSettingsCall(manager, vtObject, 1);
+    
+    if (g_WaitingForReset)
+    {
+        // skip scanning or patching — game is in reset
+        return;
+    }
+
     if (IsValidThis(manager))
     {
         g_ApplyGraphicsManagerThis = manager;
@@ -1316,6 +1361,29 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
 
     if (IsValidThis(vtObject))
     {
+        // Validate the [vtObject + 0x140] chain with try/except
+        void* ptr140 = nullptr;
+        __try {
+            ptr140 = *(void**)((char*)vtObject + 0x140);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ptr140 = nullptr;
+        }
+
+        printf_s("[Debug] vtObject=%p  ptr140=%p\n", vtObject, ptr140);
+
+        if (!IsValidThis(ptr140))
+        {
+            static auto lastLogTime = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastLogTime > std::chrono::seconds(1))
+            {
+                printf_s("[XNFS-ShaderLoader-MW] ❌ Still invalid: vtObject+0x140 = %p (from %p)\n", ptr140, vtObject);
+                lastLogTime = now;
+            }
+            return;
+        }
+
+        // Only update if new
         if (!g_ApplyGraphicsSettingsThis)
         {
             g_ApplyGraphicsSettingsThis = vtObject;
@@ -1327,14 +1395,12 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
             g_ThisCandidates[g_ThisCount++] = vtObject;
         }
 
-        // 🔁 Only replace shader and reset once per reload session
         if (triggerActive && g_LastReloadedFx && vtObject != lastPatchedThis)
         {
             printf_s("[HotReload] 🔁 Applying shader and reset for vtObject = %p\n", vtObject);
             ReplaceShaderSlot((BYTE*)vtObject, 0x18C, g_LastReloadedFx);
             g_LastReloadedFx->ReloadHandles();
 
-            // ✅ Only reset ONCE
             if (g_pVisualTreatment && *g_pVisualTreatment)
             {
                 IVisualTreatment_Reset(*g_pVisualTreatment);
@@ -1347,7 +1413,6 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
         LogApplyGraphicsSettingsCall(manager, vtObject, 2);
     }
 
-    // ✅ Run game logic after patch
     if (ApplyGraphicsSettingsOriginal)
         ApplyGraphicsSettingsOriginal(manager, nullptr, vtObject);
 }
@@ -1400,6 +1465,12 @@ HRESULT TryFullGraphicsReset()
         printf_s("[Init] ✅ Hooked IVisualTreatment::Update(eView*) at vtable[3]\n");
     }
 
+    if (!g_LastReloadedFx || !g_LastReloadedFx->GetEffect())
+    {
+        printf_s("❌ Refusing to patch slot — g_LastReloadedFx or effect is null\n");
+        return E_POINTER;
+    }
+    
     ReplaceShaderSlot((BYTE*)g_ApplyGraphicsSettingsThis, 0x18C, g_LastReloadedFx);
 
     IDirect3DDevice9Ex* deviceEx = nullptr;
@@ -1623,7 +1694,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
         }
 
         // Waiting loop for ApplyGraphicsSettings
-        if (++waitFrames >= 360)
+        if (++waitFrames >= 150)
         {
             printf_s("⚠️ Timeout waiting for ApplyGraphicsSettings — resetting\n");
             g_TriggerApplyGraphicsSettings = false;
@@ -1638,7 +1709,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
     // Safety: if reset hangs, auto-resume game thread after timeout
     if (g_WaitingForReset)
     {
-        if (++resetTimeout > 180)
+        if (++resetTimeout > 150)
         {
             printf_s("[HotReload] ❌ Reset timeout — forcing resume\n");
             ResumeGameThread();

@@ -19,7 +19,6 @@ public:
     static void DumpShaderTable();
     static void LoadShaderOverrides();
 
-    static LPDIRECT3DDEVICE9 g_Device;
 
     static std::unordered_set<std::string> g_FxOverrides;
     static std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
@@ -40,7 +39,6 @@ private:
         STDMETHOD(Close)(LPCVOID pData) override;
     };
 };
-
 
 extern void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx);
 extern void ReleaseAllRetainedShaders();
@@ -78,7 +76,7 @@ extern HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors);
 
-extern D3DXCreateEffectFromResourceAFn RealCreateFromResource;
+inline D3DXCreateEffectFromResourceAFn RealCreateFromResource = nullptr;
 
 typedef HRESULT (WINAPI*PresentFn)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, HWND, const RGNDATA*);
 

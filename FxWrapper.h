@@ -39,7 +39,27 @@ public:
         return S_OK;
     }
 
-    ID3DXEffect* GetEffect() const { return m_fx; }
+    // ID3DXEffect* GetEffect() const { return m_fx; }
+
+    ID3DXEffect* GetEffect() { return SafeGetEffect(this); }
+    
+    ID3DXEffect* SafeGetEffect (FxWrapper* fx)
+    {
+        if (!fx)
+            return nullptr;
+
+        __try {
+            if (!IsBadReadPtr(fx, sizeof(FxWrapper)))
+            {
+                return m_fx;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+
+        return nullptr;
+    }
 
     void OnLostDevice() const
     {

@@ -19,6 +19,8 @@ namespace std {
     };
 }
 
+inline static LPDIRECT3DDEVICE9 g_Device = nullptr;
+
 // typedef void(__thiscall* ApplyGraphicsSettingsFn)(void* thisptr);
 typedef void(__fastcall* ApplyGraphicsSettingsFn)(void* ecx, void* edx, void* arg1);
 extern ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal;  // ✅ extern = DECLARATION ONLY
