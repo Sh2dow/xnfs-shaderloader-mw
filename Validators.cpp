@@ -53,7 +53,7 @@ bool IsValidThis(void* ptr)
 //     return ptr != nullptr && IsBadReadPtr(ptr, 4) == FALSE;
 // }
 
-bool IsValidShaderPointer_SEH(FxWrapper* fx, void*** outVtable, DWORD* outProtect)
+bool IsValidShaderPointer_SEH(ID3DXEffect* fx, void*** outVtable, DWORD* outProtect)
 {
     __try
     {
@@ -78,8 +78,9 @@ bool IsValidShaderPointer_SEH(FxWrapper* fx, void*** outVtable, DWORD* outProtec
     }
 }
 
-bool IsValidShaderPointer(FxWrapper* fx)
+bool IsValidShaderPointer(FxWrapper* m_fx)
 {
+    ID3DXEffect* fx = m_fx->GetEffect();
     if (!fx || (uintptr_t)fx < 0x10000)
         return false;
 
