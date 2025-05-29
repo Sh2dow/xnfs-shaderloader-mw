@@ -1,17 +1,17 @@
 #pragma once
 #include <d3d9.h>
-#include <d3dx9effect.h>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <mutex>
+#include "FxWrapper.h"
+// Define a cast macro that allows old FxWrapper* to be used with minimal refactoring
 
 class ShaderManager
 {
 public:
     static void LoadOverrides();
-    static bool SafePatchShaderTable(int slot, ID3DXEffect* fx);
+    static bool SafePatchShaderTable(int slot, FxWrapper* fx);
     static void ApplyQueuedShaderPatches();
     static void PauseGameThread();
     static void ResumeGameThread();
@@ -29,13 +29,6 @@ public:
     static PresentFn RealPresent;
 
 private:
-    // struct QueuedPatch
-    // {
-    //     int slot;
-    //     ID3DXEffect* fx;
-    //     int framesRemaining;
-    // };
-
     static std::string ToUpper(const std::string& str);
     static bool CompileAndDumpShader(const std::string& key, const std::string& fxPath);
     static std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName);
@@ -48,15 +41,16 @@ private:
     };
 };
 
-extern bool IsValidShaderPointer(ID3DXEffect* fx);
-extern void ForceReplaceShaderIntoSlots(const std::string& resourceKey, ID3DXEffect* fx); 
+
+extern void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx);
 extern void ReleaseAllRetainedShaders();
+extern void ReleaseAllActiveEffects();
 extern void RecompileAndReloadAll();
 extern void ScanIVisualTreatment();
 extern void PrintFxAtOffsets(void* obj);
-extern bool ReplaceShaderSlot(BYTE* object, int offset, ID3DXEffect* newFx);
-extern void ClearMatchingShaders(BYTE* object, ID3DXEffect* newFx);
-extern bool IsValidThis(void* ptr);
+extern bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx);
+extern void ClearMatchingShaders(BYTE* object, FxWrapper* newFx);
+extern void ReleaseMotionBlurTexture();
 
 extern void* g_ThisCandidates[3];
 
@@ -91,3 +85,12 @@ typedef HRESULT (WINAPI*PresentFn)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, 
 extern HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                                     const RECT* src, const RECT* dest,
                                     HWND hwnd, const RGNDATA* dirty);
+
+// -------------------- NFSMW-RenderTarget block --------------------
+
+typedef HRESULT (WINAPI*Reset_t)(LPDIRECT3DDEVICE9, D3DPRESENT_PARAMETERS*);
+extern Reset_t oReset;
+extern HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params);
+
+
+// -------------------- NFSMW-RenderTarget block End --------------------

@@ -1,7 +1,14 @@
 #pragma once
 #include <atomic>
-#include <d3dx9effect.h>
 #include <vector>
+#include "FxWrapper.h"
+
+#define FX(x) ((FxWrapper*)(x))
+
+#if _DEBUG
+#include "Log.h"
+#define printf_s(...) asi_log::Log(__VA_ARGS__)
+#endif
 
 namespace std {
     template <>
@@ -19,6 +26,7 @@ extern ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal;  // ✅ extern = D
 typedef int (__thiscall* ApplyGraphicsManagerMain_t)(void* thisptr);
 extern ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal;
 
+extern bool g_WaitingForReset;
 extern int g_ApplyGraphicsTriggerDelay;
 extern void* g_ApplyGraphicsSettingsThis;
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject);
@@ -27,4 +35,4 @@ extern std::atomic<bool> g_TriggerApplyGraphicsSettings;
 using IVisualTreatment_ResetFn = void(__thiscall*)(void* thisPtr);
 // ✅ Header declaration only:
 extern IVisualTreatment_ResetFn IVisualTreatment_Reset;
-extern ID3DXEffect* g_LastReloadedFx;
+extern FxWrapper* g_LastReloadedFx;
