@@ -1,5 +1,4 @@
 #include "FxWrapper.h"
-#include <stdio.h>
 #include "Log.h"
 #include "Validators.h"
 #define printf_s(...) asi_log::Log(__VA_ARGS__)
@@ -31,7 +30,7 @@ void FxWrapper::ReloadHandles()
     hMiscMap3 = m_fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
     hBlurParams = m_fx->GetParameterByName(nullptr, "BlurParams");
 
-    printf_s("[FxWrapper] 🔁 Refreshed handles for %s (%p)\n", name.c_str(), m_fx);
+    // printf_s("[FxWrapper] 🔁 Refreshed handles for %s (%p)\n", name.c_str(), m_fx);
     if (!hMiscMap3) printf_s("[FxWrapper] ⚠️ hMiscMap3 not found!\n");
     if (!hBlurParams) printf_s("[FxWrapper] ⚠️ hBlurParams not found!\n");
 }

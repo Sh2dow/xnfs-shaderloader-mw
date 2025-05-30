@@ -6,6 +6,7 @@
 #include <cstdio>
 #include "includes/injector/injector.hpp"
 #include <mutex>
+#define printf_s(...) asi_log::Log(__VA_ARGS__)
 
 // -------------------- GLOBALS --------------------
 int g_ApplyDelayCounter = 0;
@@ -14,10 +15,10 @@ bool g_ApplyScheduled = false;
 
 DWORD WINAPI DeferredHookThread(LPVOID)
 {
-    while (!g_Device)
+    while (!GetGameDevice())
         Sleep(10);
 
-    void** vtable = *(void***)g_Device;
+    void** vtable = *(void***)GetGameDevice();
     if (vtable)
     {
         // Hook Present

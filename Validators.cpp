@@ -1,11 +1,9 @@
 #include "Validators.h"
-
-#include <stdio.h>
+#include "Hooks.h"
+#include "FxWrapper.h"
 #include <unordered_map>
 #include <windows.h>
-
-#include "FxWrapper.h"
-
+#define printf_s(...) asi_log::Log(__VA_ARGS__)
 
 inline bool IsValidCodePtr(void* ptr)
 {
@@ -46,31 +44,6 @@ bool IsValidThis(void* ptr)
         return false;
     }
 }
-
-// bool IsValidThis(void* ptr)
-// {
-//     if (!ptr || (uintptr_t)ptr < 0x10000)
-//         return false;
-//
-//     MEMORY_BASIC_INFORMATION mbi = {};
-//     if (!VirtualQuery(ptr, &mbi, sizeof(mbi)))
-//         return false;
-//
-//     // Accept readable and writable (RW or RWX)
-//     if (!(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
-//         return false;
-//
-//     // Ensure it's committed and not a guard or reserved region
-//     if (!(mbi.State & MEM_COMMIT) || (mbi.Protect & PAGE_GUARD))
-//         return false;
-//
-//     return true;
-// }
-
-// inline bool IsValidThis(void* ptr)
-// {
-//     return ptr != nullptr && IsBadReadPtr(ptr, 4) == FALSE;
-// }
 
 bool IsValidShaderPointer_SEH(ID3DXEffect* fx, void*** outVtable, DWORD* outProtect)
 {
@@ -132,4 +105,20 @@ bool IsD3D9ExAvailable()
     GetVersionEx((OSVERSIONINFO*)&osvi);
 
     return (osvi.dwMajorVersion > 6) || (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion >= 0); // Vista+
+}
+
+// NFSMW_XenonEffects imports
+
+bool IsSafeToReload()
+{
+    int gameflow = *(int*)GAMEFLOWSTATUS_ADDR;
+    void* nis = *(void**)NISINSTANCE_ADDR;
+    return gameflow >= 3 && nis == nullptr;
+}
+
+inline bool IsInCutsceneOrFrontend()
+{
+    int flow = *(int*)GAMEFLOWSTATUS_ADDR;
+    void* nis = *(void**)NISINSTANCE_ADDR;
+    return (flow < 3 || nis != nullptr);
 }

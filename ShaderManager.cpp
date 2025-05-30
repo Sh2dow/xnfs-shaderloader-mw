@@ -15,23 +15,26 @@
 #include <unordered_set>
 #include "FxWrapper.h"
 #include "Validators.h"
+#include <DbgHelp.h>
+#include <set>
+#pragma comment(lib, "Dbghelp.lib")
+
+#define printf_s(...) asi_log::Log(__VA_ARGS__)
 
 // Define a cast macro that allows old FxWrapper* to be used with minimal refactoring
 // #define FX(x) ((FxWrapper*)(x))
 
-#define SHADER_TABLE_ADDRESS 0x0093DE78;
-#define WORLDSHADER_TABLE_ADDRESS 0x008F9B60;
 const int ShaderTableSize = 62;
 void** g_pVisualTreatment = (void**)0x00982AF0;
-#define EViewsBase 0x009195E0  // Replace old guess 0x008FAF30
 
 static FxWrapper** g_ShaderTable = (FxWrapper**)SHADER_TABLE_ADDRESS; // NFS MW shader g_ShaderTable
 std::mutex g_ShaderTableLock = std::mutex();
 std::unordered_map<std::string, FxWrapper*> g_DebugLiveEffects;
-std::unordered_set<FxWrapper*> g_AlreadyInjectedFxThisFrame;
+std::unordered_set<ID3DXEffect*> g_AlreadyInjectedFxThisFrame;
 
 ShaderManager::PresentFn ShaderManager::RealPresent = nullptr;
 
+static bool compiled = false;
 bool g_WaitingForReset = false;
 bool g_ApplyGraphicsSeenThisFrame = false;
 bool g_CallApplyGraphicsManagerNextFrame = false;
@@ -80,7 +83,6 @@ std::atomic<bool> g_PresentIsWaiting{false};
 
 LPDIRECT3DTEXTURE9 g_MotionBlurTex = nullptr;
 LPDIRECT3DSURFACE9 g_MotionBlurSurface = nullptr;
-bool g_TriggerInjectSharedTextures = false;
 
 std::unordered_map<std::string, FxWrapper*> g_ActiveEffects;
 
@@ -289,7 +291,7 @@ bool CompileAndDumpShader(const std::string& key, const std::string& fxPath)
 }
 
 // -------------------- SHADER OVERRIDE LOADER --------------------
-void LoadShaderOverrides()
+void CompileShaderOverride()
 {
     DWORD attrs = GetFileAttributesA("fx");
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
@@ -339,7 +341,7 @@ void LoadShaderOverrides()
         FXIncludeHandler includeHandler;
 
         HRESULT hr = D3DXCreateEffect(
-            g_Device, data.data(), (UINT)len,
+            GetGameDevice(), data.data(), (UINT)len,
             nullptr, &includeHandler,
             D3DXSHADER_DEBUG, nullptr, &rawFx, &errors);
 
@@ -362,6 +364,13 @@ void LoadShaderOverrides()
 
         g_ShaderOverridePaths[key] = fullPath;
         g_ShaderBuffers[key] = data; // stores raw HLSL code
+
+        // ✅ Set g_LastReloadedFx if this is the visual treatment shader
+        if (key == "IDI_VISUALTREATMENT_FX" && fx)
+        {
+            g_LastReloadedFx = fx;
+            printf_s("[Init] ✅ Set g_LastReloadedFx = %p (IDI_VISUALTREATMENT_FX)\n", fx);
+        }
     }
     while (FindNextFileA(hFind, &findData));
 
@@ -414,7 +423,7 @@ void ApplyQueuedShaderPatches()
         }
 
         FxWrapper* clone = nullptr;
-        HRESULT hr = patch.fx->CloneEffect(g_Device, &clone);
+        HRESULT hr = patch.fx->CloneEffect(GetGameDevice(), &clone);
 
         if (FAILED(hr) || !clone || !IsValidShaderPointer(clone))
         {
@@ -574,31 +583,44 @@ HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors)
 {
-    if (!g_Device)
+    if (!compiled)
     {
-        g_Device = device;
-        LoadShaderOverrides();
+        SetGameDevice(device); // Set global pointer to known-good device
 
-        // Hook Present now that g_Device is valid
-        void** vtable = *(void***)g_Device;
-        if (vtable)
+        CompileShaderOverride(); // Compile FX/*.fx → g_FxOverrides
+        compiled = true;
+
+        // 🛡️ Hook Present using *unhooked* vtable from freshly passed-in device
+        void** vtable = *(void***)device;
+        if (vtable && ShaderManager::RealPresent == nullptr)
         {
-            ShaderManager::RealPresent = (PresentFn)vtable[17];
-            DWORD oldProtect;
-            VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-            vtable[17] = (void*)&HookedPresent;
-            VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
-            printf_s("[Init] Hooked IDirect3DDevice9::Present\n");
+            ShaderManager::RealPresent = (ShaderManager::PresentFn)vtable[17];
+
+            if (ShaderManager::RealPresent == &HookedPresent)
+            {
+                printf_s("❌ RealPresent already points to HookedPresent — skipping hook to avoid recursion.\n");
+            }
+            else
+            {
+                DWORD oldProtect;
+                VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+                vtable[17] = (void*)&HookedPresent;
+                VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
+
+                printf_s("[Init] ✅ Hooked IDirect3DDevice9::Present — RealPresent = %p\n", ShaderManager::RealPresent);
+            }
         }
     }
 
-    if (pResource == "IDI_WORLD_FX" || pResource == "IDI_VISUALTREATMENT_FX")
-        printf_s("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++,
-             pResource ? pResource : "(null)");
+    if (pResource && (strcmp(pResource, "IDI_WORLD_FX") == 0 || strcmp(pResource, "IDI_VISUALTREATMENT_FX") == 0))
+    {
+        printf_s("[Hook] D3DXCreateEffectFromResourceA called #%d — pResource = %s\n", g_HookCallCount++, pResource);
+    }
 
+    // 🔄 Try FX override from compiled shader folder
     if (g_FxOverrides.count(pResource))
     {
-        std::string path = std::string(pResource); // assume key starts with IDI_
+        std::string path = std::string(pResource);
         FILE* f = fopen(path.c_str(), "rb");
         if (f)
         {
@@ -614,19 +636,19 @@ HRESULT WINAPI HookedCreateFromResource(
                                           outEffect, outErrors);
             if (SUCCEEDED(hr) && *outEffect)
             {
-                printf_s("[Hook] Loaded compiled FX override for %s\n", pResource);
+                printf_s("[Hook] ✅ Loaded compiled FX override for %s\n", pResource);
                 return S_OK;
             }
 
-            printf_s("[Hook] Failed to create effect from compiled override for %s\n", pResource);
+            printf_s("[Hook] ❌ Failed to create effect from compiled override: %s\n", pResource);
         }
         else
         {
-            printf_s("[Hook] Failed to open compiled file: %s\n", path.c_str());
+            printf_s("[Hook] ❌ Failed to open compiled file: %s\n", path.c_str());
         }
     }
 
-    // Fallback: load compiled shader from game root if it exists and wasn't compiled from .fx
+    // 📦 Fallback: Load shader directly from game folder
     if (!g_FxOverrides.count(pResource) && strncmp(pResource, "IDI_", 4) == 0)
     {
         FILE* f = fopen(pResource, "rb");
@@ -644,14 +666,15 @@ HRESULT WINAPI HookedCreateFromResource(
                                           defines, &includeHandler, flags, pool, outEffect, outErrors);
             if (SUCCEEDED(hr) && *outEffect)
             {
-                printf_s("[Hook] Loaded fallback compiled shader: %s\n", pResource);
+                printf_s("[Hook] ✅ Loaded fallback compiled shader: %s\n", pResource);
                 return S_OK;
             }
 
-            printf_s("[Hook] Failed to load fallback compiled shader: %s\n", pResource);
+            printf_s("[Hook] ❌ Failed to load fallback compiled shader: %s\n", pResource);
         }
     }
 
+    // 🧪 Fall back to original unhooked CreateEffect
     return RealCreateFromResource(device, hModule, pResource,
                                   defines, include, flags, pool, outEffect, outErrors);
 }
@@ -689,7 +712,7 @@ void PauseGameThread()
     while (!g_PresentIsWaiting &&
         std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250))
     {
-        Sleep(1);
+        Sleep(50);
     }
 
     if (g_PresentIsWaiting)
@@ -891,9 +914,9 @@ void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx)
 
 bool RecompileAndReloadAll()
 {
-    if (!g_Device)
+    if (!GetGameDevice())
     {
-        printf_s("[HotReload] ❌ g_Device is null, cannot recompile shaders.\n");
+        printf_s("[HotReload] ❌ GetGameDevice() is null, cannot recompile shaders.\n");
         return false;
     }
 
@@ -936,7 +959,7 @@ bool RecompileAndReloadAll()
         LPD3DXBUFFER errors = nullptr;
 
         HRESULT hr = D3DXCreateEffect(
-            g_Device, buffer.data(), (UINT)len,
+            GetGameDevice(), buffer.data(), (UINT)len,
             nullptr, &includeHandler,
             D3DXSHADER_DEBUG, nullptr, &rawFx, &errors);
 
@@ -1205,32 +1228,28 @@ void PrintFxAtOffsets(void* target)
         return;
 
     BYTE* base = (BYTE*)target;
-    for (int i = 0; i < 0x100; i += 4)
+
+    FxWrapper* currentFx = nullptr;
+    FxWrapper** currentFxPtr = (FxWrapper**)CURRENTSHADER_OBJ_ADDR;
+    if (IsValidShaderPointer(*currentFxPtr))
+        currentFx = *currentFxPtr;
+
+    printf_s("🧪 Scanning shader pointer slots (base = %p)...\n", base);
+
+    for (int offset = 0; offset < 0x100; offset += 4)
     {
-        FxWrapper** fxSlot = (FxWrapper**)(base + i);
+        FxWrapper** fxSlot = (FxWrapper**)(base + offset);
         FxWrapper* fx = nullptr;
 
-        __try
-        {
-            fx = *fxSlot;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            continue;
-        }
+        __try { fx = *fxSlot; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
 
         if (!fx || !IsValidShaderPointer(fx))
             continue;
 
         ID3DXEffect* effect = nullptr;
-        __try
-        {
-            effect = fx->GetEffect();
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            continue;
-        }
+        __try { effect = fx->GetEffect(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
 
         if (!effect || (uintptr_t)effect < 0x10000)
             continue;
@@ -1238,34 +1257,35 @@ void PrintFxAtOffsets(void* target)
         D3DXEFFECT_DESC d = {};
         HRESULT hr = E_FAIL;
 
-        __try
-        {
-            hr = effect->GetDesc(&d);
-        }
+        __try { hr = effect->GetDesc(&d); }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            printf_s("⚠️ Exception calling GetDesc at offset +0x%02X (fx=%p, effect=%p)\n", i, fx, effect);
+            printf_s("⚠️ Exception calling GetDesc at offset +0x%02X (fx=%p, effect=%p)\n", offset, fx, effect);
             continue;
         }
 
-        if (SUCCEEDED(hr))
+        if (!SUCCEEDED(hr))
         {
-            if (fx == g_LastReloadedFx)
-                printf_s("🎯 Match: g_LastReloadedFx is actively assigned at offset +0x%02X (%p)\n", i, fx);
-            else
-                printf_s("🔍 Found other valid shader at +0x%02X: %p (%s)\n", i, fx, d.Creator);
+            printf_s("⚠️ GetDesc failed at offset +0x%02X (fx=%p)\n", offset, fx);
+            continue;
         }
+
+        // 🎯 Classification output
+        if (fx == g_LastReloadedFx)
+            printf_s("🎯 g_LastReloadedFx is at +0x%02X → %p (%s)\n", offset, fx, d.Creator);
+        else if (fx == currentFx)
+            printf_s("🌀 Current shader (CURRENTSHADER_OBJ_ADDR) at +0x%02X → %p (%s)\n", offset, fx, d.Creator);
+        else if (offset == 0x18C)
+            printf_s("🔷 g_pVisualTreatment +0x18C slot → %p (%s)\n", fx, d.Creator);
         else
-        {
-            printf_s("⚠️ GetDesc failed at offset +0x%02X (fx=%p)\n", i, fx);
-        }
+            printf_s("🔍 Found valid shader at +0x%02X → %p (%s)\n", offset, fx, d.Creator);
     }
 }
 
 bool TryApplyGraphicsSettingsSafely()
 {
     void* targetThis = ResolveApplyGraphicsThis();
-    
+
     if (!targetThis)
     {
         printf_s("❌ Failed to resolve ApplyGraphicsSettings this-pointer\n");
@@ -1280,15 +1300,41 @@ bool TryApplyGraphicsSettingsSafely()
 
     PrintFxAtOffsets(targetThis); // just do this once for diagnostics
 
-    // Replace +0x18C if reloaded
+    // Replace any slots with g_LastReloadedFx or fuzzy match
     if (g_LastReloadedFx && IsValidShaderPointer(g_LastReloadedFx))
     {
         printf_s("🧪 Entering TryApplyGraphicsSettingsSafely() — g_LastReloadedFx=%p\n", g_LastReloadedFx);
 
+        // 📌 Patch known current shader slot first (CURRENTSHADER_OBJ_ADDR)
+        FxWrapper** currentShader = (FxWrapper**)CURRENTSHADER_OBJ_ADDR;
+        if (IsValidShaderPointer(*currentShader))
+        {
+            if (*currentShader != g_LastReloadedFx)
+            {
+                printf_s("🎯 Overwriting CURRENTSHADER_OBJ_ADDR (%p → %p)\n", *currentShader, g_LastReloadedFx);
+                *currentShader = g_LastReloadedFx;
+            }
+            else
+            {
+                printf_s("✅ g_LastReloadedFx already set in CURRENTSHADER_OBJ_ADDR\n");
+            }
+        }
+
+        // 📌 Patch known visual treatment slot at +0x18C if applicable
+        if (targetThis)
+        {
+            ReplaceShaderSlot((BYTE*)targetThis, 0x18C, g_LastReloadedFx);
+        }
+
+        // 📦 Fallback: scan memory for other matching FxWrapper* instances
         BYTE* obj = (BYTE*)targetThis;
 
         D3DXEFFECT_DESC newDesc = {};
-        g_LastReloadedFx->GetEffect()->GetDesc(&newDesc);
+        if (FAILED(g_LastReloadedFx->GetEffect()->GetDesc(&newDesc)))
+        {
+            printf_s("❌ Failed to get desc for g_LastReloadedFx\n");
+            return false;
+        }
 
         for (int offset = 0; offset < 0x100; offset += 4)
         {
@@ -1307,22 +1353,35 @@ bool TryApplyGraphicsSettingsSafely()
             if (!fx || !IsValidShaderPointer(fx))
                 continue;
 
-            if (fx && fx == g_LastReloadedFx)
+            if (fx == g_LastReloadedFx)
             {
                 ReplaceShaderSlot(obj, offset, g_LastReloadedFx);
                 g_LastReloadedFx->ReloadHandles();
+                continue;
             }
-            else
+
+            // ⚠️ Fuzzy match against previous shader based on D3DXEFFECT_DESC
+            ID3DXEffect* fxEffect = nullptr;
+            __try
             {
-                D3DXEFFECT_DESC desc = {};
-                if (SUCCEEDED(fx->GetEffect()->GetDesc(&desc)) &&
-                    !strcmp(desc.Creator, newDesc.Creator) &&
-                    desc.Parameters == newDesc.Parameters &&
-                    desc.Techniques == newDesc.Techniques)
-                {
-                    printf_s("🔶 Fuzzy match at +0x%02X (%p) — replacing\n", offset, fx);
-                    ReplaceShaderSlot(obj, offset, g_LastReloadedFx);
-                }
+                fxEffect = fx->GetEffect();
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                continue;
+            }
+
+            if (!fxEffect)
+                continue;
+
+            D3DXEFFECT_DESC desc = {};
+            if (SUCCEEDED(fxEffect->GetDesc(&desc)) &&
+                !strcmp(desc.Creator, newDesc.Creator) &&
+                desc.Parameters == newDesc.Parameters &&
+                desc.Techniques == newDesc.Techniques)
+            {
+                printf_s("🔶 Fuzzy match at +0x%02X (%p) — replacing\n", offset, fx);
+                ReplaceShaderSlot(obj, offset, g_LastReloadedFx);
             }
         }
     }
@@ -1333,9 +1392,9 @@ bool TryApplyGraphicsSettingsSafely()
 
     __try
     {
-        PrintFxAtOffsets(targetThis);
+        // PrintFxAtOffsets(targetThis);
         ApplyGraphicsSettingsOriginal(g_ApplyGraphicsManagerThis, nullptr, targetThis);
-        PrintFxAtOffsets(targetThis);
+        // PrintFxAtOffsets(targetThis);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -1343,7 +1402,7 @@ bool TryApplyGraphicsSettingsSafely()
         return false;
     }
 
-    PrintFxAtOffsets(targetThis); // again after call
+    // PrintFxAtOffsets(targetThis); // again after call
 
     g_ThisCount = 0;
     g_TriggerApplyGraphicsSettings = false; // ✅ Prevent further log spam
@@ -1374,29 +1433,29 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
     if (IsValidThis(vtObject))
     {
         // Validate the [vtObject + 0x140] chain with try/except
-        void* ptr140 = nullptr;
-        __try
-        {
-            ptr140 = *(void**)((char*)vtObject + 0x140);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            ptr140 = nullptr;
-        }
+        // void* ptr140 = nullptr;
+        // __try
+        // {
+        //     ptr140 = *(void**)((char*)vtObject + 0x140);
+        // }
+        // __except (EXCEPTION_EXECUTE_HANDLER)
+        // {
+        //     ptr140 = nullptr;
+        // }
 
         // printf_s("[Debug] vtObject=%p  ptr140=%p\n", vtObject, ptr140);
 
-        if (!IsValidThis(ptr140))
-        {
-            static auto lastLogTime = std::chrono::steady_clock::now();
-            auto now = std::chrono::steady_clock::now();
-            if (now - lastLogTime > std::chrono::seconds(1))
-            {
-                // printf_s("[XNFS-ShaderLoader-MW] ❌ Still invalid: vtObject+0x140 = %p (from %p)\n", ptr140, vtObject);
-                lastLogTime = now;
-            }
-            return;
-        }
+        // if (!IsValidThis(ptr140))
+        // {
+        //     static auto lastLogTime = std::chrono::steady_clock::now();
+        //     auto now = std::chrono::steady_clock::now();
+        //     if (now - lastLogTime > std::chrono::seconds(1))
+        //     {
+        //         printf_s("[XNFS-ShaderLoader-MW] ❌ Still invalid: vtObject+0x140 = %p (from %p)\n", ptr140, vtObject);
+        //         lastLogTime = now;
+        //     }
+        //     return;
+        // }
 
         // Only update if new
         if (!g_ApplyGraphicsSettingsThis)
@@ -1458,7 +1517,7 @@ HRESULT TryFullGraphicsReset()
 
     if (!g_LastEView)
     {
-        g_LastEView = *(void**)0x009195E0;
+        g_LastEView = *(void**)EViewsBase;
         printf_s("[Fallback] Using eViews[0] from 0x009195E0 → %p\n", g_LastEView);
     }
 
@@ -1509,7 +1568,7 @@ HRESULT TryFullGraphicsReset()
 
     // Optional debug output — only if QueryInterface succeeds
     IDirect3DDevice9Ex* deviceEx = nullptr;
-    if (SUCCEEDED(g_Device->QueryInterface(__uuidof(IDirect3DDevice9Ex), (void**)&deviceEx)) && deviceEx)
+    if (SUCCEEDED(GetGameDevice()->QueryInterface(__uuidof(IDirect3DDevice9Ex), (void**)&deviceEx)) && deviceEx)
     {
         HRESULT hr = deviceEx->CheckDeviceState(nullptr);
         printf_s("[Debug] CheckDeviceState: 0x%08X\n", hr);
@@ -1524,28 +1583,28 @@ HRESULT TryFullGraphicsReset()
     printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
 
     // (Optional but recommended)
-    g_Device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
-    g_Device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-    g_Device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-    g_Device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
-    g_Device->SetRenderState(D3DRS_LIGHTING, FALSE);
-    g_Device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
-    g_Device->SetRenderState(D3DRS_CLIPPING, TRUE);
-    g_Device->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+    GetGameDevice()->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    GetGameDevice()->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    GetGameDevice()->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    GetGameDevice()->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
+    GetGameDevice()->SetRenderState(D3DRS_LIGHTING, FALSE);
+    GetGameDevice()->SetRenderState(D3DRS_COLORVERTEX, TRUE);
+    GetGameDevice()->SetRenderState(D3DRS_CLIPPING, TRUE);
+    GetGameDevice()->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
     printf_s("[HotReload] ✅ Z-buffer re-enabled\n");
 
     // Dummy draw to force internal state update
     IDirect3DSurface9* backbuffer = nullptr;
-    if (SUCCEEDED(g_Device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer)
+    if (SUCCEEDED(GetGameDevice()->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer)
     {
-        g_Device->SetRenderTarget(0, backbuffer);
-        g_Device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_ARGB(0, 0, 0, 0), 1.0f, 0);
-        g_Device->BeginScene();
-        g_Device->EndScene();
+        GetGameDevice()->SetRenderTarget(0, backbuffer);
+        GetGameDevice()->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_ARGB(0, 0, 0, 0), 1.0f, 0);
+        GetGameDevice()->BeginScene();
+        GetGameDevice()->EndScene();
         backbuffer->Release();
         printf_s("[HotReload] 🧪 Performed dummy draw to rebind device state\n");
     }
-    
+
     *(BYTE*)0x00982C39 = 1;
     printf_s("[HotReload] ✅ Set LoadedFlagMaybe = 1 (0x00982C39)\n");
 
@@ -1559,81 +1618,141 @@ HRESULT TryFullGraphicsReset()
         printf_s("[HotReload] ❌ Cannot call ForceFrameRender — missing thisptr\n");
     }
 
+    // Force a manual call to IVisualTreatment::Update(eView*)
+    if (g_pVisualTreatment && *g_pVisualTreatment)
+    {
+        BYTE** vtable = *(BYTE***)g_pVisualTreatment;
+        if (vtable)
+        {
+            DWORD oldProtect;
+            VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+            OriginalUpdate = (UpdateFunc)vtable[3];
+            vtable[3] = (BYTE*)&HookedUpdate;
+            VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
+            printf_s("[Init] ✅ Hooked IVisualTreatment::Update(eView*) at vtable[3]\n");
+        }
+    }
+    else
+    {
+        printf_s("❌ g_pVisualTreatment is null — cannot install vtable hook!\n");
+    }
+
     return S_OK;
 }
 
-bool InjectSharedTextures(IDirect3DDevice9* device)
+static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
 {
+    static thread_local int callDepth = 0;
+    static thread_local bool inProgress = false;
+
+    // Prevent re-entry or stack explosion
+    if (inProgress || callDepth > 10)
+    {
+        if (callDepth > 10)
+            printf_s("⚠️ InjectSharedTextures: callDepth=%d — skipping to prevent overflow\n", callDepth);
+        return false;
+    }
+
+    inProgress = true;
+    ++callDepth;
+
+    static int frameCounter = 0;
+    ++frameCounter;
+
     g_AlreadyInjectedFxThisFrame.clear();
+    bool result = false;
 
-    if (!device)
-        return false;
-
-    if (!g_MotionBlurTex && !CreateMotionBlurResources(device))
-        return false;
-
-    if (!g_LastReloadedFx || !g_LastReloadedFx->GetEffect())
+    do
     {
-        return false;
-    }
+        IDirect3DDevice9* device = GetGameDevice();
+        if (!device) break;
 
-    for (auto& [name, fx] : g_ActiveEffects)
-    {
-        if (!fx || !fx->GetEffect())
+        if (!g_MotionBlurTex && !CreateMotionBlurResources(device))
+            break;
+
+        if (!g_LastReloadedFx || !g_LastReloadedFx->GetEffect())
+            break;
+
+        // 🧷 Shallow copy to prevent iterator invalidation
+        std::vector<std::string> keys;
+        try {
+            for (const auto& [name, fx] : g_ActiveEffects)
+                keys.push_back(name);
+        }
+        catch (...)
         {
-            printf_s("[ShaderManager] ⚠️ Skipped: null or missing effect for %s\n", name.c_str());
-            continue;
+            printf_s("❌ Exception copying g_ActiveEffects keys\n");
+            break;
         }
 
-        if (g_AlreadyInjectedFxThisFrame.count(fx))
-            continue;
-
-        fx->ReloadHandles();
-
-        ID3DXEffect* e = fx->GetEffect();
-
-        D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-        D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
-
-        HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
-        HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_FAIL;
-
-        if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
+        for (const auto& name : keys)
         {
-            printf_s("[ShaderManager] ✅ Set motion blur texture in: %s\n", name.c_str());
-            g_AlreadyInjectedFxThisFrame.insert(fx);
-        }
-        else
-        {
-            printf_s("[ShaderManager] ❌ Failed to inject into: %s (hr1=0x%08X, hr2=0x%08X)\n",
-                     name.c_str(), hr1, hr2);
-        }
-    }
+            auto it = g_ActiveEffects.find(name);
+            if (it == g_ActiveEffects.end()) continue;
 
-    // Ensure hot-reloaded fx is handled
-    if (g_LastReloadedFx && !g_AlreadyInjectedFxThisFrame.count(g_LastReloadedFx))
-    {
-        g_LastReloadedFx->ReloadHandles();
+            FxWrapper* fx = it->second;
+            if (!fx || !fx->GetEffect()) {
+                printf_s("[ShaderManager] ⚠️ Skipped: null effect for %s\n", name.c_str());
+                continue;
+            }
+
+            ID3DXEffect* e = fx->GetEffect();
+            if (!e || g_AlreadyInjectedFxThisFrame.count(e)) continue;
+
+            fx->ReloadHandles();
+
+            D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
+            D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
+
+            HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
+            D3DXVECTOR4 blurParams(0.5f, 0.3f, 1.0f, 0.0f);
+            HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &blurParams) : E_FAIL;
+
+            if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
+            {
+                if (frameCounter % 60 == 0)
+                    printf_s("[ShaderManager] ✅ Set motion blur texture in: %s\n", name.c_str());
+                g_AlreadyInjectedFxThisFrame.insert(e);
+            }
+            else
+            {
+                printf_s("[ShaderManager] ❌ Failed to inject into: %s (hr1=0x%08X, hr2=0x%08X)\n",
+                         name.c_str(), hr1, hr2);
+            }
+        }
+
+        // Handle g_LastReloadedFx separately
         ID3DXEffect* e = g_LastReloadedFx->GetEffect();
-
-        D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-        D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
-
-        HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
-        HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f)) : E_FAIL;
-
-        if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
+        if (e && !g_AlreadyInjectedFxThisFrame.count(e))
         {
-            printf_s("[ShaderManager] ✅ Set motion blur texture in: g_LastReloadedFx\n");
-            g_AlreadyInjectedFxThisFrame.insert(g_LastReloadedFx);
-        }
-        else
-        {
-            printf_s("[ShaderManager] ❌ Failed to inject into g_LastReloadedFx (hr1=0x%08X, hr2=0x%08X)\n", hr1, hr2);
-        }
-    }
+            g_LastReloadedFx->ReloadHandles();
 
-    return true;
+            D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
+            D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
+
+            HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
+            D3DXVECTOR4 blurParams(0.5f, 0.3f, 1.0f, 0.0f);
+            HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &blurParams) : E_FAIL;
+
+            if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
+            {
+                if (frameCounter % 60 == 0)
+                    printf_s("[ShaderManager] ✅ Set motion blur texture in: g_LastReloadedFx\n");
+                g_AlreadyInjectedFxThisFrame.insert(e);
+            }
+            else
+            {
+                printf_s("[ShaderManager] ❌ Failed to inject into g_LastReloadedFx (hr1=0x%08X, hr2=0x%08X)\n", hr1, hr2);
+            }
+        }
+
+        result = true;
+
+    } while (false);
+
+    inProgress = false;
+    --callDepth;
+    return result;
 }
 
 bool InjectSharedTextures2(IDirect3DDevice9* device)
@@ -1719,6 +1838,10 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                              const RECT* src, const RECT* dest,
                              HWND hwnd, const RGNDATA* dirty)
 {
+    static bool ranThisFrame = false;
+    if (ranThisFrame) return ShaderManager::RealPresent(device, src, dest, hwnd, dirty);
+    ranThisFrame = true;
+    
     if (g_EnableShaderTableDump)
         DumpShaderTable();
 
@@ -1759,22 +1882,34 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                 ReleaseAllActiveEffects();
             }
 
-            // DumpLiveEffects();
+            DumpLiveEffects();
+
+            // IDirect3DDevice9Ex* deviceEx = nullptr;
+            // if (SUCCEEDED(GetGameDevice()->QueryInterface(IID_PPV_ARGS(&deviceEx))) && deviceEx)
+            // {
+            //     UINT count = 0;
+            //     HRESULT hr = deviceEx->CheckDeviceState(nullptr);
+            //     printf_s("[Debug] CheckDeviceState: 0x%08X\n", hr);
+            //     deviceEx->Release();
+            // }
 
             IDirect3DDevice9Ex* deviceEx = nullptr;
-            if (SUCCEEDED(g_Device->QueryInterface(IID_PPV_ARGS(&deviceEx))) && deviceEx)
+            if (SUCCEEDED(GetGameDevice()->QueryInterface(__uuidof(IDirect3DDevice9Ex), (void**)&deviceEx)) && deviceEx)
             {
-                UINT count = 0;
                 HRESULT hr = deviceEx->CheckDeviceState(nullptr);
                 printf_s("[Debug] CheckDeviceState: 0x%08X\n", hr);
                 deviceEx->Release();
+            }
+            else
+            {
+                printf_s("[Debug] IDirect3DDevice9Ex not available — skipping CheckDeviceState\n");
             }
 
             // 🌀 Trigger the full reset first
             TryFullGraphicsReset(); // includes IVisualTreatment::Reset
 
             // 🧪 Inject shared textures after full reset
-            InjectSharedTextures(g_Device);
+            InjectSharedTextures(GetGameDevice());
 
             // 🔁 Trigger ApplyGraphicsManager to finalize settings
             if (IsValidThis(g_ApplyGraphicsManagerThis))
@@ -1782,10 +1917,15 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                 ApplyGraphicsManagerMainOriginal(g_ApplyGraphicsManagerThis);
                 printf_s("[HotReload] ✅ ApplyGraphicsManagerMain called (post-reset)\n");
 
-                if (IsValidThis(g_ApplyGraphicsSettingsThis))
+                void* resolved = ResolveApplyGraphicsThis();
+                if (resolved && IsValidThis(resolved))
                 {
-                    printf_s("[HotReload] 🔁 Manually calling ApplyGraphicsSettingsOriginal...\n");
-                    ApplyGraphicsSettingsOriginal(g_ApplyGraphicsManagerThis, nullptr, g_ApplyGraphicsSettingsThis);
+                    ApplyGraphicsSettingsOriginal(g_ApplyGraphicsManagerThis, nullptr, resolved);
+                }
+                else
+                {
+                    printf_s(
+                        "[HotReload] ⚠️ Skipping ApplyGraphicsSettingsOriginal — 'this' is stale or unresolved.\n");
                 }
 
                 // ⬅️ Move this UP — before ResumeGameThread
@@ -1801,7 +1941,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
             {
                 printf_s("[HotReload] ⚠️ Invalid ApplyGraphicsManagerThis — skipping call\n");
             }
-            
+
             if (IsValidThis(g_ApplyGraphicsSettingsThis))
             {
                 void* applyThis = ResolveApplyGraphicsThis();
@@ -1833,12 +1973,18 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
             //     g_LastReloadedFx = nullptr;
             // }
 
+            if (ApplyGraphicsManagerMainOriginal && g_ApplyGraphicsManagerThis)
+            {
+                ApplyGraphicsManagerMainOriginal(g_ApplyGraphicsManagerThis);
+                printf_s("[HotReload] ✅ ApplyGraphicsManagerMain reapplied\n");
+            }
+
             g_TriggerApplyGraphicsSettings = false;
             lastPatchedThis = nullptr; // 🔁 ready for next reload
 
             ResumeGameThread();
-            g_ResumeGameThreadNextPresent = false;
             printf_s("[HotReload] ✅ Game Present thread resumed (immediate)\n");
+            g_ResumeGameThreadNextPresent = false;
             g_WaitingForReset = false;
 
             g_CallApplyGraphicsManagerNextFrame = false;
@@ -1848,7 +1994,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
         }
 
         // Waiting loop for ApplyGraphicsSettings
-        if (++waitFrames >= 360)
+        if (++waitFrames >= 180)
         {
             printf_s("⚠️ Timeout waiting for ApplyGraphicsSettings — resetting\n");
             g_TriggerApplyGraphicsSettings = false;
@@ -1863,7 +2009,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
     // Safety: if reset hangs, auto-resume game thread after timeout
     if (g_WaitingForReset)
     {
-        if (++resetTimeout > 180)
+        if (++resetTimeout > 360)
         {
             printf_s("[HotReload] ❌ Reset timeout — forcing resume\n");
             ResumeGameThread();

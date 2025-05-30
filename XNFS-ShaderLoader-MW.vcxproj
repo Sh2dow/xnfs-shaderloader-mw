@@ -97,6 +97,7 @@
   <ItemGroup>
     <ClInclude Include="dllmain.h" />
     <ClInclude Include="FxWrapper.h" />
+    <ClInclude Include="Hooks.cpp" />
     <ClInclude Include="Hooks.h" />
     <ClInclude Include="Log.h" />
     <ClInclude Include="ShaderManager.h" />

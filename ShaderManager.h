@@ -17,7 +17,7 @@ public:
     static void ResumeGameThread();
 
     static void DumpShaderTable();
-    static void LoadShaderOverrides();
+    static void CompileShaderOverride();
 
     static std::unordered_set<std::string> g_FxOverrides;
     static std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
