@@ -17,7 +17,6 @@ public:
     static void ResumeGameThread();
 
     static void DumpShaderTable();
-    static void CompileShaderOverride();
 
     static std::unordered_set<std::string> g_FxOverrides;
     static std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
@@ -28,7 +27,7 @@ public:
 
 private:
     static FxWrapper* g_LastReloadedFx;
-    
+
     static std::string ToUpper(const std::string& str);
     static bool CompileAndDumpShader(const std::string& key, const std::string& fxPath);
     static std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName);
@@ -41,6 +40,8 @@ private:
     };
 };
 
+extern bool TryApplyGraphicsSettingsSafely();
+extern void CompileShaderOverride();
 extern void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx);
 extern void ReleaseAllRetainedShaders();
 extern void ReleaseAllActiveEffects();
@@ -51,8 +52,8 @@ extern bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx);
 extern void ClearMatchingShaders(BYTE* object, FxWrapper* newFx);
 extern void ReleaseMotionBlurTexture();
 
+extern bool compiled;
 extern void* g_ThisCandidates[3];
-
 extern void* g_LatestEView;
 extern unsigned g_FrameId;
 extern unsigned g_LastApplySeenFrame;

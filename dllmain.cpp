@@ -6,12 +6,13 @@
 #include <cstdio>
 #include "includes/injector/injector.hpp"
 #include <mutex>
+
+#include "Validators.h"
 #define printf_s(...) asi_log::Log(__VA_ARGS__)
 
 // -------------------- GLOBALS --------------------
 int g_ApplyDelayCounter = 0;
 bool g_ApplyScheduled = false;
-
 
 DWORD WINAPI DeferredHookThread(LPVOID)
 {
@@ -69,7 +70,9 @@ DWORD WINAPI HotkeyThread(LPVOID)
 
         Sleep(100);
     }
+    return 0; // ✅ Fixes C4716
 }
+
 
 // -------------------- DllMain --------------------
 
