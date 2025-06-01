@@ -5,17 +5,17 @@
 #include <unordered_set>
 #include <vector>
 #include "FxWrapper.h"
-// Define a cast macro that allows old FxWrapper* to be used with minimal refactoring
+// Define a cast macro that allows old std::shared_ptr<FxWrapper> to be used with minimal refactoring
 
 class ShaderManager
 {
 public:
+    static bool SafePatchShaderTable(int slot, std::shared_ptr<FxWrapper> fx);
+
     static void LoadOverrides();
-    static bool SafePatchShaderTable(int slot, FxWrapper* fx);
     static void ApplyQueuedShaderPatches();
     static void PauseGameThread();
     static void ResumeGameThread();
-
     static void DumpShaderTable();
 
     static std::unordered_set<std::string> g_FxOverrides;
@@ -26,8 +26,6 @@ public:
     static PresentFn RealPresent;
 
 private:
-    static FxWrapper* g_LastReloadedFx;
-
     static std::string ToUpper(const std::string& str);
     static bool CompileAndDumpShader(const std::string& key, const std::string& fxPath);
     static std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName);
@@ -40,28 +38,38 @@ private:
     };
 };
 
-extern bool TryApplyGraphicsSettingsSafely();
-extern void CompileShaderOverride();
-extern void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx);
-extern void ReleaseAllRetainedShaders();
-extern void ReleaseAllActiveEffects();
-extern bool RecompileAndReloadAll();
-extern void ScanIVisualTreatment();
-extern void PrintFxAtOffsets(void* obj);
-extern bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx);
-extern void ClearMatchingShaders(BYTE* object, FxWrapper* newFx);
-extern void ReleaseMotionBlurTexture();
+inline bool TryApplyGraphicsSettingsSafely();
+inline bool CompileShaderOverrides();
+inline void ForceReplaceShaderIntoSlots(const std::string& resourceName, std::shared_ptr<FxWrapper> fxWrapper);
+inline void ReleaseAllRetainedShaders();
+inline void ReleaseAllActiveEffects();
+inline bool RecompileAndReloadAll();
+inline void ScanIVisualTreatment();
+inline void PrintFxAtOffsets(void* obj);
+inline bool ReplaceShaderSlot(BYTE* object, int offset, const std::shared_ptr<FxWrapper>& newFx);
+inline bool ReplaceShaderSlot_RawEffect(
+    BYTE* baseObject,
+    int offset,
+    ID3DXEffect* newRawFx,
+    int slotIndex);
+inline void ClearMatchingShaders(BYTE* object, std::shared_ptr<FxWrapper> newFx);
+inline void ReleaseMotionBlurTexture();
 
-extern bool compiled;
-extern void* g_ThisCandidates[3];
-extern void* g_LatestEView;
-extern unsigned g_FrameId;
-extern unsigned g_LastApplySeenFrame;
-extern void** g_pVisualTreatment;
-extern void* g_ApplyGraphicsManagerThis;
-extern std::pair<void*, int> lastKey;
-extern int repeatCount;
-extern int g_ThisCount;
+inline void* GetFirstIVisualTreatmentObject();
+inline bool IsLikelyApplyGraphicsSettingsObject(void* candidate);
+
+inline static void* lastPatchedThis = nullptr;
+inline std::shared_ptr<FxWrapper> g_LastReloadedFx = nullptr;
+
+static bool compiled = false;
+inline void* g_ThisCandidates[3] = {};
+inline int g_ThisCount = 0;
+inline void* g_LatestEView;
+inline unsigned g_FrameId;
+inline unsigned g_LastApplySeenFrame;
+inline void** g_pVisualTreatment = (void**)0x00982AF0;
+inline std::pair<void*, int> lastKey;
+inline int repeatCount;
 
 typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
     LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*,
@@ -78,7 +86,7 @@ extern HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors);
 
-inline D3DXCreateEffectFromResourceAFn RealCreateFromResource = nullptr;
+inline D3DXCreateEffectFromResourceAFn RealCreateFromResource;
 
 typedef HRESULT (WINAPI*PresentFn)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, HWND, const RGNDATA*);
 

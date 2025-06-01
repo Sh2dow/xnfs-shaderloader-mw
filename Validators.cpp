@@ -70,7 +70,7 @@ bool IsValidShaderPointer_SEH(ID3DXEffect* fx, void*** outVtable, DWORD* outProt
     }
 }
 
-bool IsValidShaderPointer(FxWrapper* m_fx)
+bool IsValidShaderPointer(std::shared_ptr<FxWrapper> m_fx)
 {
     ID3DXEffect* fx = m_fx->GetEffect();
     if (!fx || (uintptr_t)fx < 0x10000)

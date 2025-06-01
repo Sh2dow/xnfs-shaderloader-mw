@@ -38,9 +38,21 @@ void FxWrapper::ReloadHandles()
 bool FxWrapper::IsValid() const
 {
     if (!m_fx)
+    {
+        printf_s("[FxWrapper] ❌ m_fx is null in IsValid()\n");
         return false;
+    }
 
     // Optional: Validate underlying pointer
     void* vtable = *(void**)m_fx;
-    return IsValidCodePtr(vtable); // ensures m_fx is a valid ID3DXEffect*
+
+    printf_s("[FxWrapper] ⚠️ m_fx = %p, vtable = %p\n", m_fx, vtable);
+
+    if (!IsValidCodePtr(vtable))
+    {
+        printf_s("[FxWrapper] ❌ m_fx vtable is invalid (bad code ptr)\n");
+        return false;
+    }
+
+    return true;
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include <d3dx9effect.h>
+#include <memory>
 #include <string>
 
 class FxWrapper
@@ -35,7 +36,7 @@ public:
         return m_fx ? m_fx->Release() : 0;
     }
 
-    HRESULT CloneEffect(IDirect3DDevice9* pDevice, FxWrapper** ppWrapper)
+    HRESULT CloneEffect(IDirect3DDevice9* pDevice, std::shared_ptr<FxWrapper>* ppWrapper)
     {
         if (!m_fx || !ppWrapper) return E_FAIL;
 
@@ -44,30 +45,13 @@ public:
         if (FAILED(hr) || !cloned)
             return hr;
 
-        *ppWrapper = new FxWrapper(cloned);
+        *ppWrapper = std::make_shared<FxWrapper>(cloned);
         return S_OK;
     }
 
-    // ID3DXEffect* GetEffect() const { return m_fx; }
-
-    ID3DXEffect* GetEffect() { return SafeGetEffect(this); }
-    
-    ID3DXEffect* SafeGetEffect (FxWrapper* fx)
+    ID3DXEffect* GetEffect() const
     {
-        if (!fx)
-            return nullptr;
-
-        __try {
-            if (!IsBadReadPtr(fx, sizeof(FxWrapper)))
-            {
-                return m_fx;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return nullptr;
-        }
-
-        return nullptr;
+        return m_fx; // No need to go through SafeGetEffect
     }
 
     void OnLostDevice() const
@@ -99,7 +83,7 @@ private:
     ID3DXEffect* m_fx = nullptr;
 };
 
-inline FxWrapper* FromRaw(ID3DXEffect* fx)
+inline std::shared_ptr<FxWrapper> FromRaw(ID3DXEffect* fx)
 {
-    return fx ? new FxWrapper(fx) : nullptr;
+    return fx ? std::make_shared<FxWrapper>(fx) : nullptr;
 }

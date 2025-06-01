@@ -16,27 +16,28 @@ bool g_ApplyScheduled = false;
 
 DWORD WINAPI DeferredHookThread(LPVOID)
 {
-    while (!GetGameDevice())
+    while (!g_Device)
         Sleep(10);
 
-    void** vtable = *(void***)GetGameDevice();
-    if (vtable)
-    {
-        // Hook Present
-        ShaderManager::RealPresent = (PresentFn)vtable[17];
-        DWORD oldProtect;
-        VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[17] = (void*)&HookedPresent;
-        VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
-        printf_s("[Init] Hooked IDirect3DDevice9::Present (deferred)\n");
+    if (!g_Device) return E_FAIL;
+    void** vtable = *(void***)g_Device;
+    if (!vtable)
+        return E_FAIL;
 
-        // Hook Reset
-        oReset = (Reset_t)vtable[16];
-        VirtualProtect(&vtable[16], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[16] = (void*)&hkReset;
-        VirtualProtect(&vtable[16], sizeof(void*), oldProtect, &oldProtect);
-        printf_s("[Init] Hooked IDirect3DDevice9::Reset (deferred)\n");
-    }
+    // Hook Present
+    ShaderManager::RealPresent = (PresentFn)vtable[17];
+    DWORD oldProtect;
+    VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+    vtable[17] = (void*)&HookedPresent;
+    VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
+    printf_s("[Init] Hooked IDirect3DDevice9::Present (deferred)\n");
+
+    // Hook Reset
+    oReset = (Reset_t)vtable[16];
+    VirtualProtect(&vtable[16], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+    vtable[16] = (void*)&hkReset;
+    VirtualProtect(&vtable[16], sizeof(void*), oldProtect, &oldProtect);
+    printf_s("[Init] Hooked IDirect3DDevice9::Reset (deferred)\n");
     return 0;
 }
 
@@ -48,19 +49,20 @@ DWORD WINAPI HotkeyThread(LPVOID)
         {
             printf_s("[HotkeyThread] F2 pressed → Recompiling FX overrides...\n");
 
-            // Now trigger recompilation
-            // ReleaseAllRetainedShaders();
-            // ReleaseAllActiveEffects();
-
-            if (!RecompileAndReloadAll())
+            CompileShaderOverrides();
+            bool recompiled_result = RecompileAndReloadAll();
+            if (!recompiled_result || !g_LastReloadedFx || !g_LastReloadedFx->IsValid())
             {
-                printf_s("[HotkeyThread] ❌ RecompileAndReloadAll failed\n");
+                printf_s("[HotkeyThread] ❌ RecompileAndReloadAll failed or shader invalid\n");
             }
             else
             {
                 printf_s("[HotkeyThread] ✅ RecompileAndReloadAll succeeded\n");
 
-                // Schedule ApplyGraphicsSettings
+                g_ThisCount = 0;
+                memset(g_ThisCandidates, 0, sizeof(g_ThisCandidates));
+                lastPatchedThis = nullptr;
+
                 g_ApplyDelayCounter = 4;
                 g_ApplyScheduled = true;
                 g_TriggerApplyGraphicsSettings = true;
@@ -72,7 +74,6 @@ DWORD WINAPI HotkeyThread(LPVOID)
     }
     return 0; // ✅ Fixes C4716
 }
-
 
 // -------------------- DllMain --------------------
 

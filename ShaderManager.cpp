@@ -15,66 +15,59 @@
 #include <unordered_set>
 #include "FxWrapper.h"
 #include "Validators.h"
-#include <DbgHelp.h>
 #include <set>
-#pragma comment(lib, "Dbghelp.lib")
 
-#define printf_s(...) asi_log::Log(__VA_ARGS__)
-
-// Define a cast macro that allows old FxWrapper* to be used with minimal refactoring
-// #define FX(x) ((FxWrapper*)(x))
-
+// Define a cast macro that allows old std::shared_ptr<FxWrapper> to be used with minimal refactoring
+// #define FX(x) ((std::shared_ptr<FxWrapper>)(x))
 const int ShaderTableSize = 62;
-void** g_pVisualTreatment = (void**)0x00982AF0;
 
-static FxWrapper** g_ShaderTable = (FxWrapper**)SHADER_TABLE_ADDRESS; // NFS MW shader g_ShaderTable
+static std::shared_ptr<FxWrapper>* g_ShaderTable = (std::shared_ptr<FxWrapper>*)SHADER_TABLE_ADDRESS;
+// NFS MW shader g_ShaderTable
 std::mutex g_ShaderTableLock = std::mutex();
-std::unordered_map<std::string, FxWrapper*> g_DebugLiveEffects;
+std::unordered_map<std::string, std::shared_ptr<FxWrapper>> g_DebugLiveEffects;
 std::unordered_set<ID3DXEffect*> g_AlreadyInjectedFxThisFrame;
 
 ShaderManager::PresentFn ShaderManager::RealPresent = nullptr;
 
-static bool compiled = false;
+
 bool g_WaitingForReset = false;
 bool g_ApplyGraphicsSeenThisFrame = false;
 bool g_CallApplyGraphicsManagerNextFrame = false;
 int g_ApplyGraphicsTriggerDelay = 0;
 bool g_ResumeGameThreadNextPresent = false;
-static void* lastPatchedThis = nullptr;
 
 bool g_EnableShaderTableDump = false;
 void* g_LiveVisualTreatmentObject = nullptr;
+// Map from shader resource name to fallback slot
+std::unordered_map<std::string, int> g_DynamicFallbackSlots;
 
-// At top of HookApplyGraphicsSettings (outside function if needed)
-static auto lastInvalidLogTime = std::chrono::steady_clock::now();
-static void* lastInvalidVtObject = nullptr;
+bool g_PendingVisualReset = false;
 
 ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal = nullptr; // ✅ definition
 ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal = nullptr; // ✅ definition
 IVisualTreatment_ResetFn IVisualTreatment_Reset = (IVisualTreatment_ResetFn)0x0073DE50;
 void* g_ApplyGraphicsManagerThis = nullptr;
 void* g_ApplyGraphicsSettingsThis = nullptr;
-FxWrapper* g_LastReloadedFx = nullptr;
 
 struct QueuedPatch
 {
-    int slot;
-    FxWrapper* fx;
+    int slot = -1;
+    std::shared_ptr<FxWrapper> fx;
     int framesRemaining = 2; // safe delay
+    std::string resourceName;
+    
 };
 
 std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
 std::vector<QueuedPatch> g_PendingPatches;
-FxWrapper* g_SlotRetainedFx[62] = {};
+std::shared_ptr<FxWrapper> g_SlotRetainedFx[64] = {};
 
 std::mutex g_PatchMutex;
 std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
 std::unordered_set<std::string> g_FxOverrides;
+
 static std::atomic<int> g_HookCallCount{0};
 std::atomic<bool> g_TriggerApplyGraphicsSettings = false;
-
-void* g_ThisCandidates[3] = {};
-int g_ThisCount = 0;
 
 std::atomic<bool> g_PausePresent{false};
 std::atomic<bool> g_PresentIsWaiting{false};
@@ -84,7 +77,7 @@ std::atomic<bool> g_PresentIsWaiting{false};
 LPDIRECT3DTEXTURE9 g_MotionBlurTex = nullptr;
 LPDIRECT3DSURFACE9 g_MotionBlurSurface = nullptr;
 
-std::unordered_map<std::string, FxWrapper*> g_ActiveEffects;
+std::unordered_map<std::string, std::shared_ptr<FxWrapper>> g_ActiveEffects;
 
 void* g_LastEView = nullptr;
 
@@ -291,23 +284,23 @@ bool CompileAndDumpShader(const std::string& key, const std::string& fxPath)
 }
 
 // -------------------- SHADER OVERRIDE LOADER --------------------
-void CompileShaderOverride()
+void LoadShaderOverrides()
 {
     DWORD attrs = GetFileAttributesA("fx");
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
     {
-        printf_s("[Error] fx/ folder does not exist or is inaccessible.\n");
+        printf("[Error] fx/ folder does not exist or is inaccessible.\n");
         return;
     }
 
-    printf_s("[Init] fx/ folder found, scanning for shaders...\n");
+    printf("[Init] fx/ folder found, scanning for shaders...\n");
 
     WIN32_FIND_DATAA findData;
     HANDLE hFind = FindFirstFileA("fx\\*.fx", &findData);
 
     if (hFind == INVALID_HANDLE_VALUE)
     {
-        printf_s("[Init] No .fx files found in fx/ folder.\n");
+        printf("[Init] No .fx files found in fx/ folder.\n");
         return;
     }
 
@@ -315,70 +308,212 @@ void CompileShaderOverride()
     {
         std::string fileName = findData.cFileName;
         std::string name = fileName.substr(0, fileName.find_last_of('.'));
-        std::replace(name.begin(), name.end(), '-', '_'); // normalize dashes
+        std::replace(name.begin(), name.end(), '-', '_');
         std::string key = "IDI_" + ToUpper(name) + "_FX";
         std::string fullPath = "fx/" + fileName;
-        g_FxOverrides.insert(key); // ✅ REQUIRED for HookedCreateFromResource
 
-        CompileAndDumpShader(key, fullPath);
+        // ✅ COMPILE IT!
+        if (!CompileAndDumpShader(key, fullPath))
+        {
+            printf("[Init] ❌ Failed to compile %s\n", fileName.c_str());
+            continue;
+        }
 
-        printf_s("[Init] Compiling and caching %s as %s\n", fileName.c_str(), key.c_str());
+        g_FxOverrides.insert(key);
 
-        FILE* f = fopen(fullPath.c_str(), "rb");
-        if (!f) continue;
+        printf("[Init] ✅ Compiled and registered %s as %s\n", fileName.c_str(), key.c_str());
+    }
+    while (FindNextFileA(hFind, &findData));
+
+    FindClose(hFind);
+}
+
+static void TrackLiveEffect(const std::string& name, std::shared_ptr<FxWrapper> fx)
+{
+    if (fx && fx->GetEffect())
+    {
+        g_DebugLiveEffects[name] = fx;
+    }
+}
+
+void DumpLiveEffects()
+{
+    printf_s("[Debug] 📊 g_DebugLiveEffects has %zu entries\n", g_DebugLiveEffects.size());
+    for (auto& [name, fx] : g_DebugLiveEffects)
+    {
+        printf_s("  - FX: %s @ %p\n", name.c_str(), fx);
+    }
+}
+
+void ReleaseTrackedEffects()
+{
+    for (auto& [name, fx] : g_DebugLiveEffects)
+    {
+        if (fx && fx->GetEffect())
+        {
+            fx->Release();
+        }
+    }
+    g_DebugLiveEffects.clear();
+}
+
+std::shared_ptr<FxWrapper> CompileFxFromFile(const std::string& key, const std::string& fxPath)
+{
+    FILE* f = fopen(fxPath.c_str(), "rb");
+    if (!f)
+    {
+        printf_s("[HotReload] ❌ Failed to open %s\n", fxPath.c_str());
+        return nullptr;
+    }
+
+    fseek(f, 0, SEEK_END);
+    size_t len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    std::vector<char> buffer(len);
+    fread(buffer.data(), 1, len, f);
+    fclose(f);
+
+    FXIncludeHandler includeHandler;
+    ID3DXEffect* rawFx = nullptr;
+    LPD3DXBUFFER errors = nullptr;
+
+    HRESULT hr = D3DXCreateEffect(
+        GetGameDevice(), buffer.data(), (UINT)len,
+        nullptr, &includeHandler,
+        D3DXSHADER_DEBUG, nullptr, &rawFx, &errors);
+
+    if (FAILED(hr) || !rawFx)
+    {
+        printf_s("[HotReload] ❌ Failed to compile effect for %s (hr=0x%08X)\n", key.c_str(), hr);
+        if (errors)
+        {
+            printf_s("[HotReload] Error: %s\n", (char*)errors->GetBufferPointer());
+            errors->Release();
+        }
+        return nullptr;
+    }
+
+    std::shared_ptr<FxWrapper> wrapper = std::make_shared<FxWrapper>(rawFx);
+    rawFx->Release(); // balance refcount
+
+    if (!IsValidShaderPointer(wrapper))
+    {
+        printf_s("[HotReload] ❌ Invalid FxWrapper for %s\n", key.c_str());
+        return nullptr;
+    }
+
+    return wrapper;
+}
+
+bool CompileShaderOverrides()
+{
+    bool anyCompiled = false;
+
+    for (const auto& [key, path] : g_ShaderOverridePaths)
+    {
+        if (CompileAndDumpShader(key, path))
+        {
+            g_FxOverrides.insert(key);
+            anyCompiled = true;
+        }
+        else
+        {
+            printf_s("[HotReload] ❌ Failed to compile %s → %s\n", path.c_str(), key.c_str());
+        }
+    }
+
+    return anyCompiled;
+}
+
+bool RecompileAndReloadAll()
+{
+    CompileShaderOverrides(); // ✅ Compile all shaders before reloading
+
+    bool patchedAny = false;
+
+    for (const auto& key : g_FxOverrides)
+    {
+        std::string path = key; // ✅ FIXED PATH
+
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f)
+        {
+            printf_s("[HotReload] ❌ Failed to open compiled FX: %s\n", path.c_str());
+            continue;
+        }
 
         fseek(f, 0, SEEK_END);
         size_t len = ftell(f);
         fseek(f, 0, SEEK_SET);
 
-        std::vector<char> data(len);
-        fread(data.data(), 1, len, f);
+        if (len == 0)
+        {
+            fclose(f);
+            continue;
+        }
+
+        std::vector<char> buffer(len);
+        size_t bytesRead = fread(buffer.data(), 1, len, f);
         fclose(f);
 
-        ID3DXEffect* rawFx = nullptr;
-        FxWrapper* fx = nullptr;
-        ID3DXBuffer* errors = nullptr;
+        if (bytesRead != len)
+        {
+            printf_s("[HotReload] ⚠️ fread mismatch for %s (expected %zu, got %zu)\n", path.c_str(), len, bytesRead);
+            continue;
+        }
+
         FXIncludeHandler includeHandler;
+        ID3DXEffect* rawFx = nullptr;
+        LPD3DXBUFFER errors = nullptr;
 
         HRESULT hr = D3DXCreateEffect(
-            GetGameDevice(), data.data(), (UINT)len,
+            GetGameDevice(), buffer.data(), (UINT)len,
             nullptr, &includeHandler,
             D3DXSHADER_DEBUG, nullptr, &rawFx, &errors);
 
+        std::shared_ptr<FxWrapper> fx = nullptr;
         if (SUCCEEDED(hr) && rawFx)
         {
-            fx = new FxWrapper(rawFx);
-            rawFx->Release(); // balance refcount
+            fx = std::make_shared<FxWrapper>(rawFx);
+            rawFx->Release();
         }
 
-        if (FAILED(hr))
+        if (FAILED(hr) || !fx || !IsValidShaderPointer(fx))
         {
-            printf_s("[Init] Failed to compile %s\n", fileName.c_str());
+            printf_s("[HotReload] ❌ Invalid fx pointer after load (hr=0x%08X)\n", hr);
             if (errors)
             {
-                printf_s("[Init] Error: %s\n", (char*)errors->GetBufferPointer());
+                printf_s("[HotReload] Error: %s\n", (char*)errors->GetBufferPointer());
                 errors->Release();
             }
             continue;
         }
 
-        g_ShaderOverridePaths[key] = fullPath;
-        g_ShaderBuffers[key] = data; // stores raw HLSL code
+        fx->AddRef();
+        g_ActiveEffects[key] = fx;
 
-        // ✅ Set g_LastReloadedFx if this is the visual treatment shader
-        if (key == "IDI_VISUALTREATMENT_FX" && fx)
+        if (key == "IDI_VISUALTREATMENT_FX")
         {
             g_LastReloadedFx = fx;
-            printf_s("[Init] ✅ Set g_LastReloadedFx = %p (IDI_VISUALTREATMENT_FX)\n", fx);
+            printf_s("[HotReload] ✅ Set g_LastReloadedFx = %p (%s)\n", fx.get(), key.c_str());
         }
+
+        TrackLiveEffect(key, fx);
+        ForceReplaceShaderIntoSlots(key, fx);
+        printf_s("[HotReload] ✅ Force-replaced effect in all slots for %s\n", key.c_str());
+
+        patchedAny = true;
     }
-    while (FindNextFileA(hFind, &findData));
 
-    printf_s("[Debug] g_FxOverrides contains:\n");
-    for (const auto& k : g_FxOverrides)
-        printf_s("  - %s\n", k.c_str());
+    if (patchedAny)
+    {
+        printf_s("[HotReload] Triggering ApplyGraphicsSettings()\n");
+        g_TriggerApplyGraphicsSettings = true;
+        printf_s("[HotReload] Will apply graphics settings at next Present\n");
+    }
 
-    FindClose(hFind);
+    return patchedAny;
 }
 
 // -------------------- HOOK HANDLER --------------------
@@ -389,7 +524,7 @@ void DumpShaderTable()
     printf_s("------ Shader Table Dump ------\n");
     for (int i = 0; i < ShaderTableSize; ++i)
     {
-        FxWrapper* fx = g_ShaderTable[i];
+        std::shared_ptr<FxWrapper> fx = g_ShaderTable[i];
         if (!fx || !IsValidShaderPointer(fx))
             printf_s("[Check] Slot %02d = INVALID (%p)\n", i, fx);
         else
@@ -400,7 +535,7 @@ void DumpShaderTable()
 void ApplyQueuedShaderPatches()
 {
     std::lock_guard<std::mutex> lock(g_PatchMutex);
-    static FxWrapper** table = (FxWrapper**)SHADER_TABLE_ADDRESS;
+    static std::shared_ptr<FxWrapper>* table = (std::shared_ptr<FxWrapper>*)SHADER_TABLE_ADDRESS;
 
     std::vector<QueuedPatch> stillPending;
 
@@ -412,67 +547,74 @@ void ApplyQueuedShaderPatches()
             continue;
         }
 
+        // If the patch.slot is invalid or default, try to recover it from our map
+        if ((patch.slot < 0 || patch.slot >= ARRAYSIZE(g_SlotRetainedFx)) && !patch.resourceName.empty())
+        {
+            auto it = g_DynamicFallbackSlots.find(patch.resourceName);
+            if (it != g_DynamicFallbackSlots.end())
+            {
+                patch.slot = it->second;
+                printf_s("[Patch] 🔁 Using dynamic fallback slot %d for %s\n", patch.slot, patch.resourceName.c_str());
+            }
+            else
+            {
+                printf_s("[Patch] ❌ No fallback slot registered for %s — skipping\n", patch.resourceName.c_str());
+                continue;
+            }
+        }
+        
         if (!IsValidShaderPointer(patch.fx))
         {
-            printf_s("[Patch] ❌ fx invalid for slot %d, fx=%p — skipping\n", patch.slot, patch.fx);
+            printf_s("[Patch] ❌ fx invalid for slot %d, fx=%p — skipping\n", patch.slot, patch.fx.get());
 
-            if ((uintptr_t)patch.fx == 0xCCCCCCCC)
+            if (!patch.fx || patch.fx.get() == reinterpret_cast<FxWrapper*>(0xCCCCCCCC))
                 printf_s("[Patch] ❌ fx == 0xCCCCCCCC — uninitialized stack pointer\n");
 
             continue;
         }
 
-        FxWrapper* clone = nullptr;
+        std::shared_ptr<FxWrapper> clone = nullptr;
         HRESULT hr = patch.fx->CloneEffect(GetGameDevice(), &clone);
 
         if (FAILED(hr) || !clone || !IsValidShaderPointer(clone))
         {
-            printf_s("[Patch] ❌ CloneEffect failed for fx=%p, slot=%d (hr=0x%08X)\n", patch.fx, patch.slot,
+            printf_s("[Patch] ❌ CloneEffect failed for fx=%p, slot=%d (hr=0x%08X)\n", patch.fx.get(), patch.slot,
                      (unsigned)hr);
             continue;
         }
 
-        // Defensive: check/ref original for diagnostics
+        // Diagnostic: get original refcount
         ULONG refCount = 0;
         if (IsValidShaderPointer(patch.fx))
         {
             refCount = patch.fx->AddRef();
-            patch.fx->Release();
+            patch.fx->Release(); // Net 0
         }
 
-        // Release old shader in this slot
-        if (table[patch.slot])
-        {
-            if (IsValidShaderPointer(table[patch.slot]))
-            {
-                printf_s("[Patch] 🔁 Releasing old fx in slot %d (%p)\n", patch.slot, table[patch.slot]);
-                table[patch.slot]->Release();
-            }
-            else
-            {
-                printf_s("[Patch] ⚠️ Existing fx in slot %d (%p) is invalid — replacing anyway\n", patch.slot,
-                         table[patch.slot]);
-            }
-        }
+        // Retain COM pointer for engine (manual)
+        if (ID3DXEffect* effect = clone->GetEffect())
+            effect->AddRef();
 
-        // Replace in shader table and retain
-        clone->AddRef(); // for g_ShaderTable
+        // Store in shader table (shared_ptr handles FxWrapper refcount)
         table[patch.slot] = clone;
 
-        // Release any previous retained copy
-        if (g_SlotRetainedFx[patch.slot])
+        // Clean up retained previous copy
+        // Overwrite only if you're assigning a new shader
+        if (g_SlotRetainedFx[patch.slot] != patch.fx)
         {
-            if (IsValidShaderPointer(g_SlotRetainedFx[patch.slot]))
-                g_SlotRetainedFx[patch.slot]->Release();
-            g_SlotRetainedFx[patch.slot] = nullptr;
+            if (g_SlotRetainedFx[patch.slot])
+                g_SlotRetainedFx[patch.slot].reset(); // only clear if it's different
+
+            g_SlotRetainedFx[patch.slot] = patch.fx;
+            patch.fx->AddRef(); // if needed
         }
 
-        // Store retained copy
-        clone->AddRef(); // for g_SlotRetainedFx
-        g_SlotRetainedFx[patch.slot] = clone;
+        g_SlotRetainedFx[patch.slot] = clone; // copy shared_ptr
+
+        clone->OnResetDevice(); // rebind
 
         printf_s("[Patch] ✅ Cloned and wrote fx to slot %d (clone=%p, from=%p, refcount~%lu)\n",
-                 patch.slot, clone, patch.fx, refCount);
+                 patch.slot, clone.get(), patch.fx.get(), refCount);
     }
 
     g_PendingPatches = std::move(stillPending);
@@ -512,7 +654,7 @@ void ReleaseAllActiveEffects()
     {
         if (fx && fx->GetEffect())
         {
-            void** vtable = *(void***)fx;
+            void** vtable = *(void***)fx->GetEffect();
             if (!IsBadCodePtr((FARPROC)vtable[0]))
             {
                 ULONG refCount = fx->AddRef();
@@ -543,35 +685,6 @@ void ReleaseAllActiveEffects()
     g_ActiveEffects.clear();
 }
 
-void TrackLiveEffect(const std::string& name, FxWrapper* fx)
-{
-    if (fx && fx->GetEffect())
-    {
-        g_DebugLiveEffects[name] = fx;
-    }
-}
-
-void DumpLiveEffects()
-{
-    printf_s("[Debug] 📊 g_DebugLiveEffects has %zu entries\n", g_DebugLiveEffects.size());
-    for (auto& [name, fx] : g_DebugLiveEffects)
-    {
-        printf_s("  - FX: %s @ %p\n", name.c_str(), fx);
-    }
-}
-
-void ReleaseTrackedEffects()
-{
-    for (auto& [name, fx] : g_DebugLiveEffects)
-    {
-        if (fx && fx->GetEffect())
-        {
-            fx->Release();
-        }
-    }
-    g_DebugLiveEffects.clear();
-}
-
 HRESULT WINAPI HookedCreateFromResource(
     LPDIRECT3DDEVICE9 device,
     HMODULE hModule,
@@ -583,33 +696,16 @@ HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors)
 {
-    if (!compiled)
+    SetGameDevice(device); // ✅ Set global pointer
+
+    static bool loadedOnce = false;
+    if (!loadedOnce)
     {
-        SetGameDevice(device); // Set global pointer to known-good device
-
-        CompileShaderOverride(); // Compile FX/*.fx → g_FxOverrides
-        compiled = true;
-
-        // 🛡️ Hook Present using *unhooked* vtable from freshly passed-in device
-        void** vtable = *(void***)device;
-        if (vtable && ShaderManager::RealPresent == nullptr)
-        {
-            ShaderManager::RealPresent = (ShaderManager::PresentFn)vtable[17];
-
-            if (ShaderManager::RealPresent == &HookedPresent)
-            {
-                printf_s("❌ RealPresent already points to HookedPresent — skipping hook to avoid recursion.\n");
-            }
-            else
-            {
-                DWORD oldProtect;
-                VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-                vtable[17] = (void*)&HookedPresent;
-                VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
-
-                printf_s("[Init] ✅ Hooked IDirect3DDevice9::Present — RealPresent = %p\n", ShaderManager::RealPresent);
-            }
-        }
+        printf_s("[ShaderLoader] 🔍 Calling LoadShaderOverrides()\n");
+        LoadShaderOverrides(); // ✅ This scans fx/*.fx and compiles them to IDI_*.FX
+        CompileShaderOverrides(); // ✅ This will now work correctly
+        compiled = RecompileAndReloadAll();
+        loadedOnce = true;
     }
 
     if (pResource && (strcmp(pResource, "IDI_WORLD_FX") == 0 || strcmp(pResource, "IDI_VISUALTREATMENT_FX") == 0))
@@ -636,6 +732,9 @@ HRESULT WINAPI HookedCreateFromResource(
                                           outEffect, outErrors);
             if (SUCCEEDED(hr) && *outEffect)
             {
+                std::shared_ptr<FxWrapper> wrapper = std::make_shared<FxWrapper>(*outEffect);
+                TrackLiveEffect(pResource, wrapper); // make sure pResource is IDI_XXX_FX
+
                 printf_s("[Hook] ✅ Loaded compiled FX override for %s\n", pResource);
                 return S_OK;
             }
@@ -662,8 +761,8 @@ HRESULT WINAPI HookedCreateFromResource(
             fclose(f);
 
             FXIncludeHandler includeHandler;
-            HRESULT hr = D3DXCreateEffect(device, buffer.data(), (UINT)len,
-                                          defines, &includeHandler, flags, pool, outEffect, outErrors);
+            HRESULT hr = D3DXCreateEffect(device, buffer.data(), (UINT)len, defines, &includeHandler, flags, pool,
+                                          outEffect, outErrors);
             if (SUCCEEDED(hr) && *outEffect)
             {
                 printf_s("[Hook] ✅ Loaded fallback compiled shader: %s\n", pResource);
@@ -674,12 +773,11 @@ HRESULT WINAPI HookedCreateFromResource(
         }
     }
 
-    // 🧪 Fall back to original unhooked CreateEffect
-    return RealCreateFromResource(device, hModule, pResource,
-                                  defines, include, flags, pool, outEffect, outErrors);
+    // 🧪 Fall back to original
+    return RealCreateFromResource(device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
 }
 
-bool SafePatchShaderTable(int slot, FxWrapper* fx)
+bool SafePatchShaderTable(int slot, std::shared_ptr<FxWrapper> fx, const std::string& resourceName = "<unknown>")
 {
     if (slot < 0 || slot >= ShaderTableSize)
     {
@@ -696,10 +794,45 @@ bool SafePatchShaderTable(int slot, FxWrapper* fx)
     {
         std::lock_guard<std::mutex> lock(g_PatchMutex);
         fx->AddRef(); // Safe defer
-        g_PendingPatches.push_back({slot, fx, 2});
+        g_PendingPatches.push_back({slot, fx, 2, resourceName});
     }
 
-    printf_s("[Patch] ⏳ Deferred shader patch queued: slot %d → fx=%p\n", slot, fx);
+    printf_s("[Patch] ⏳ Deferred shader patch queued: slot %d → fx=%p (%s)\n",
+             slot, fx.get(), resourceName.c_str());
+    return true;
+}
+
+bool __stdcall TryReloadFxRaw(FxWrapper* fx)
+{
+    if (!fx) return false;
+
+    __try
+    {
+        fx->OnResetDevice();
+        fx->ReloadHandles();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool SafeReloadFx(const std::shared_ptr<FxWrapper>& fx, const char* context)
+{
+    if (!fx || !fx->GetEffect())
+    {
+        printf_s("[HotReload:%s] ❌ Fx or effect is null\n", context);
+        return false;
+    }
+
+    if (!TryReloadFxRaw(fx.get()))
+    {
+        printf_s("[HotReload:%s] ❌ Exception during ReloadHandles\n", context);
+        return false;
+    }
+
     return true;
 }
 
@@ -765,24 +898,38 @@ std::vector<int> LookupShaderSlotsFromResource(const std::string& resourceName)
     else
         return results;
 
+    std::string baseLower = base;
+    std::transform(baseLower.begin(), baseLower.end(), baseLower.begin(), ::tolower);
+    printf_s("[Lookup] 🔍 Searching for shader slots matching: %s (from %s)\n", baseLower.c_str(),
+             resourceName.c_str());
+
     for (int i = 0; i < ShaderTableSize; ++i)
     {
         const char* entry = SafeGetShaderTableEntry(i);
         if (!entry || !IsSafeReadableString(entry))
             continue;
 
-        std::string name(entry);
-        size_t dot = name.find('.');
+        std::string entryName(entry);
+        size_t dot = entryName.find('.');
         if (dot != std::string::npos)
-            name = name.substr(0, dot);
+            entryName = entryName.substr(0, dot); // strip .fx or .hlsl extension if present
 
-        std::string a = base, b = name;
-        std::transform(a.begin(), a.end(), a.begin(), ::tolower);
-        std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+        std::string entryLower = entryName;
+        std::transform(entryLower.begin(), entryLower.end(), entryLower.begin(), ::tolower);
 
-        if (a == b)
+        if (entryLower == baseLower)
+        {
+            printf_s("[Lookup] ✅ Match found at slot %d: %s\n", i, entry);
             results.push_back(i);
+        }
+        else
+        {
+            printf_s("[Lookup] — Skipping non-match at slot %d: %s\n", i, entry);
+        }
     }
+
+    if (results.empty())
+        printf_s("[Lookup] ⚠️ No matching shader slots found for %s\n", resourceName.c_str());
 
     return results;
 }
@@ -791,15 +938,13 @@ const char* TryGetFxNameAnnotation(FxWrapper* fx)
 {
     __try
     {
-        // Get top-level object (global scope)
-        D3DXHANDLE dummy = fx->GetEffect()->GetParameterByName(nullptr, nullptr);
-        if (!dummy)
-            return nullptr;
+        if (!fx || !fx->GetEffect()) return nullptr;
 
-        // Get the annotation called "Name"
-        D3DXHANDLE nameHandle = fx->GetEffect()->GetAnnotationByName(dummy, "Name");
-        if (!nameHandle)
-            return nullptr;
+        D3DXHANDLE dummy = fx->GetEffect()->GetParameterByName(nullptr, nullptr);
+        if (!dummy) return nullptr;
+
+        D3DXHANDLE nameHandle = fx->GetEffect()->GetAnnotationByName(dummy, "vt");
+        if (!nameHandle) return nullptr;
 
         LPCSTR nameStr = nullptr;
         if (SUCCEEDED(fx->GetEffect()->GetString(nameHandle, &nameStr)) && nameStr && !IsBadStringPtrA(nameStr, 128))
@@ -813,13 +958,30 @@ const char* TryGetFxNameAnnotation(FxWrapper* fx)
     return nullptr;
 }
 
+void __declspec(noinline) __stdcall SafeResetVisualTreatment(void* vt)
+{
+    __try
+    {
+        IVisualTreatment_Reset(vt);
+        printf_s("[HotReload] ✅ SafeResetVisualTreatment: Reset() succeeded\n");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        printf_s("[HotReload] ❌ SafeResetVisualTreatment: Reset() threw an exception\n");
+    }
+}
+
 void VisualTreatment_Reset()
 {
     if (g_pVisualTreatment && IsValidThis(*g_pVisualTreatment))
     {
         void* vt = *g_pVisualTreatment;
 
-        FxWrapper** fxSlot = (FxWrapper**)((char*)vt + 0x18C);
+        // ⚠️ force invalidate ptr+0x140 to trigger rebuild
+        void** fx140 = (void**)((char*)vt + 0x140);
+        *fx140 = nullptr;
+
+        std::shared_ptr<FxWrapper>* fxSlot = (std::shared_ptr<FxWrapper>*)((char*)vt + 0x18C);
         if (IsValidShaderPointer(*fxSlot))
         {
             printf_s("🔧 Releasing fx at +0x18C (%p)\n", *fxSlot);
@@ -827,196 +989,21 @@ void VisualTreatment_Reset()
             *fxSlot = nullptr;
         }
 
-        __try
+        // 🧪 Optional: Add null check if unsure about vt
+        if (vt)
         {
             IVisualTreatment_Reset(vt);
             printf_s("[HotReload] ✅ Reset() called on IVisualTreatment at %p\n", vt);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        else
         {
-            printf_s("[HotReload] ❌ Exception while calling IVisualTreatment::Reset()\n");
+            printf_s("[HotReload] ❌ vt was null in VisualTreatment_Reset()\n");
         }
     }
     else
     {
         printf_s("[HotReload] ❌ g_pVisualTreatment invalid or null\n");
     }
-}
-
-void ForceReplaceShaderIntoSlots(const std::string& resourceKey, FxWrapper* fx)
-{
-    if (!fx || !IsValidShaderPointer(fx))
-    {
-        printf_s("[HotReload] ❌ Invalid fx pointer passed to ForceReplaceShaderIntoSlots for %s\n",
-                 resourceKey.c_str());
-        return;
-    }
-
-    // 🌐 Try to get the [Name] annotation safely
-    const char* annotation = TryGetFxNameAnnotation(fx);
-    if (annotation && !IsBadStringPtrA(annotation, 128))
-        printf_s("[HotReload] 🔍 Shader annotation [Name] = %s\n", annotation);
-    else
-        printf_s("[HotReload] ⚠️ Shader [Name] annotation missing or caused exception\n");
-
-    PauseGameThread();
-
-    bool didPatch = false;
-
-    // 🔍 Lookup slots by resourceKey (IDI_XXX_FX)
-    auto slots = LookupShaderSlotsFromResource(resourceKey);
-    if (!slots.empty())
-    {
-        for (int slot : slots)
-        {
-            printf_s("[HotReload] 🎯 Attempting patch into slot %d for %s\n", slot, resourceKey.c_str());
-
-            if (!SafePatchShaderTable(slot, fx))
-            {
-                printf_s("[HotReload] ❌ Failed to patch slot %d for %s\n", slot, resourceKey.c_str());
-                continue;
-            }
-
-            printf_s("[HotReload] ✅ Patched slot %d with new effect %p for %s\n", slot, fx, resourceKey.c_str());
-            didPatch = true;
-        }
-
-        if (didPatch)
-        {
-            if (g_pVisualTreatment && *g_pVisualTreatment)
-            {
-                VisualTreatment_Reset();
-                printf_s("[HotReload] 🔄 IVisualTreatment::Reset triggered for %s\n", resourceKey.c_str());
-            }
-
-            g_TriggerApplyGraphicsSettings = true;
-
-            // Optional: refresh fallback candidates
-            ScanIVisualTreatment();
-        }
-
-        if (!didPatch && fx && g_pVisualTreatment && *g_pVisualTreatment)
-        {
-            printf_s("[HotReload] 🧪 Forcing Reset on IVisualTreatment singleton\n");
-            IVisualTreatment_Reset(*g_pVisualTreatment);
-        }
-    }
-    else
-    {
-        printf_s("[HotReload] ⚠️ No slots found for %s — relying on manual hook or fallback.\n", resourceKey.c_str());
-
-        // Even without patches, trigger ApplyGraphicsSettings
-        g_TriggerApplyGraphicsSettings = true;
-    }
-
-    ResumeGameThread();
-}
-
-bool RecompileAndReloadAll()
-{
-    if (!GetGameDevice())
-    {
-        printf_s("[HotReload] ❌ GetGameDevice() is null, cannot recompile shaders.\n");
-        return false;
-    }
-
-    bool patchedAny = false;
-
-    for (const auto& key : g_FxOverrides)
-    {
-        auto it = g_ShaderOverridePaths.find(key);
-        if (it == g_ShaderOverridePaths.end())
-        {
-            printf_s("[HotReload] ❌ No path found for %s\n", key.c_str());
-            continue;
-        }
-
-        const std::string& fxPath = it->second;
-        if (!CompileAndDumpShader(key, fxPath))
-        {
-            printf_s("[HotReload] ❌ Failed to recompile %s\n", fxPath.c_str());
-            continue;
-        }
-
-        FILE* f = fopen(key.c_str(), "rb");
-        if (!f)
-        {
-            printf_s("[HotReload] ❌ Failed to reopen compiled FX: %s\n", key.c_str());
-            continue;
-        }
-
-        fseek(f, 0, SEEK_END);
-        size_t len = ftell(f);
-        fseek(f, 0, SEEK_SET);
-
-        std::vector<char> buffer(len);
-        fread(buffer.data(), 1, len, f);
-        fclose(f);
-
-        FXIncludeHandler includeHandler;
-        FxWrapper* fx = nullptr;
-        ID3DXEffect* rawFx = nullptr;
-        LPD3DXBUFFER errors = nullptr;
-
-        HRESULT hr = D3DXCreateEffect(
-            GetGameDevice(), buffer.data(), (UINT)len,
-            nullptr, &includeHandler,
-            D3DXSHADER_DEBUG, nullptr, &rawFx, &errors);
-
-        // ✅ Wrap first
-        if (SUCCEEDED(hr) && rawFx)
-        {
-            fx = new FxWrapper(rawFx);
-            rawFx->Release(); // balance refcount
-        }
-
-        // ❌ Only check fx after assigning it
-        if (FAILED(hr) || !fx || !IsValidShaderPointer(fx))
-        {
-            printf_s("[HotReload] ❌ Invalid fx pointer after compile: %p (hr=0x%08X)\n", fx, hr);
-            if (errors)
-            {
-                printf_s("[HotReload] Error: %s\n", (char*)errors->GetBufferPointer());
-                errors->Release();
-            }
-            continue;
-        }
-        printf_s("[HotReload] ✅ Reloaded shader: %s (fx=%p)\n", key.c_str(), fx);
-
-        if (!IsValidShaderPointer(fx))
-        {
-            printf_s("[HotReload] ❌ fx for %s is invalid, skipping patch\n", key.c_str());
-            if (fx && fx->GetEffect()) fx->Release(); // Only release if non-null
-            continue;
-        }
-
-        // Now it's valid — proceed
-        fx->AddRef(); // prevent premature destruction
-        g_LastReloadedFx = fx;
-
-        g_ActiveEffects["IDI_VISUALTREATMENT_FX"] = g_LastReloadedFx;
-
-        // Track for motion blur injection
-        TrackLiveEffect(key, fx);
-
-        ForceReplaceShaderIntoSlots(key, fx);
-        printf_s("[HotReload] ✅ Force-replaced effect in all slots for %s\n", key.c_str());
-
-        patchedAny = true;
-    }
-
-    if (patchedAny)
-    {
-        printf_s("[HotReload] Triggering ApplyGraphicsSettings()\n");
-        g_TriggerApplyGraphicsSettings = true;
-        printf_s("[HotReload] Will apply graphics settings at next Present\n");
-    }
-    else
-    {
-        printf_s("[HotReload] ❌ No shader slots were patched — skipping ApplyGraphicsSettings()\n");
-    }
-
-    return true;
 }
 
 void ScanIVisualTreatment()
@@ -1044,10 +1031,12 @@ void ScanIVisualTreatment()
     printf_s("[Scan] IVisualTreatment @ %p\n", g_pVisualTreatment);
     printf_s("[SubScan @ 0x18C] object = %p\n", (void*)sub);
 
-    if (IsValidShaderPointer((FxWrapper*)sub))
+    FxWrapper* raw = reinterpret_cast<FxWrapper*>(sub); // ✅ safe raw ptr
+    std::shared_ptr<FxWrapper> tempShared(raw); // risky if raw is already managed!
+    if (IsValidShaderPointer(tempShared))
     {
         printf_s("✅ SubScan at +0x18C looks valid, storing as vtObject[0]\n");
-        g_ThisCandidates[0] = (void*)sub; // ✅ use this in fallback
+        g_ThisCandidates[0] = raw; // ✅ use this in fallback
         g_ThisCount = 1;
     }
     else
@@ -1056,12 +1045,33 @@ void ScanIVisualTreatment()
     }
 }
 
-void* GetIVisualTreatmentObject()
+void* GetFirstIVisualTreatmentObject()
 {
     if (!g_ThisCandidates[0])
         ScanIVisualTreatment();
 
     return g_ThisCandidates[0];
+}
+
+void* GetIVisualTreatmentObject(void* vtObject)
+{
+    if (!vtObject || IsBadReadPtr(vtObject, sizeof(void*)))
+        return nullptr;
+
+    return *(void**)vtObject;
+}
+
+int FindAvailableFxSlot()
+{
+    constexpr int totalSlots = ARRAYSIZE(g_SlotRetainedFx);
+    for (int i = 0; i < totalSlots; ++i)
+    {
+        if (!g_SlotRetainedFx[i]) // unused slot
+            return i;
+    }
+
+    // If no free slots, return -1 (signal error)
+    return -1;
 }
 
 bool IsLikelyApplyGraphicsSettingsObject(void* candidate)
@@ -1090,9 +1100,12 @@ bool IsLikelyApplyGraphicsSettingsObject(void* candidate)
             return false;
     }
 
-    // Optional: Check if +0x30 is likely a valid FxWrapper*
+    // Optional: Check if +0x30 is likely a valid std::shared_ptr<FxWrapper>
     void* fxCandidate = *(void**)((char*)candidate + 0x30);
-    if ((uintptr_t)fxCandidate > 0x10000 && IsValidShaderPointer((FxWrapper*)fxCandidate))
+
+    FxWrapper* raw = reinterpret_cast<FxWrapper*>(fxCandidate); // ✅ safe raw ptr
+    std::shared_ptr<FxWrapper> tempShared(raw); // risky if raw is already managed!
+    if ((uintptr_t)fxCandidate > 0x10000 && IsValidShaderPointer(tempShared))
     {
         printf_s("🔍 [IsLikelyApplyGraphicsSettingsObject] Slot +0x30 is valid shader pointer: %p\n", fxCandidate);
     }
@@ -1104,56 +1117,44 @@ bool IsLikelyApplyGraphicsSettingsObject(void* candidate)
     return true;
 }
 
-bool ReplaceShaderSlot(BYTE* object, int offset, FxWrapper* newFx)
+bool ReplaceShaderSlot_RawEffect(
+    BYTE* baseObject,
+    int offset,
+    ID3DXEffect* newRawFx,
+    int slotIndex)
 {
-    if (!g_LastReloadedFx || !g_LastReloadedFx->GetEffect())
-    {
-        printf_s("❌ g_LastReloadedFx is invalid\n");
-        return false;
-    }
-
-    FxWrapper** slot = (FxWrapper**)(object + offset);
-
+    void* slotPtr = (void*)(baseObject + offset);
     MEMORY_BASIC_INFORMATION mbi = {};
-    if (!VirtualQuery(slot, &mbi, sizeof(mbi)) || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+    if (!VirtualQuery(slotPtr, &mbi, sizeof(mbi)) ||
+        !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) ||
+        mbi.State != MEM_COMMIT)
     {
-        printf_s("❌ Cannot access shader slot at +0x%02X (%p)\n", offset, slot);
+        printf_s("[ReplaceShaderSlot] ❌ Memory at %p (+0x%X) not writable or committed\n",
+                 slotPtr, offset);
         return false;
     }
 
-    FxWrapper* oldFx = nullptr;
-    __try
+    if (slotIndex >= 0 && slotIndex < ARRAYSIZE(g_SlotRetainedFx))
     {
-        oldFx = *slot;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-
-    if (!newFx || !newFx->GetEffect())
-    {
-        printf_s("[HotReload] ❌ Invalid newFx pointer passed to ReplaceShaderSlot\n");
-        return false;
-    }
-
-    if (oldFx != newFx)
-    {
-        if (oldFx && IsValidShaderPointer(oldFx))
+        if (g_SlotRetainedFx[slotIndex] &&
+            g_SlotRetainedFx[slotIndex].get()->GetEffect() != newRawFx)
         {
-            printf_s("🔁 Releasing old fx at +0x%02X = %p\n", offset, oldFx);
-            oldFx->Release();
+            g_SlotRetainedFx[slotIndex].reset();  // release old
         }
-
-        *slot = newFx;
-        newFx->AddRef();
-        printf_s("✅ Overwrote slot +0x%02X with fx = %p\n", offset, newFx);
     }
     else
     {
-        printf_s("⚠️ Slot +0x%02X already set to fx = %p — skipping\n", offset, newFx);
+        printf_s("[ReplaceShaderSlot] ⚠️ slotIndex %d out of range\n", slotIndex);
+        return false;
     }
 
+    if (newRawFx) newRawFx->AddRef();  // COM ref
+    *reinterpret_cast<ID3DXEffect**>(slotPtr) = newRawFx;
+
+    g_SlotRetainedFx[slotIndex] = g_LastReloadedFx;  // shared_ptr takes ownership
+
+    printf_s("[ReplaceShaderSlot] ✅ Wrote new ID3DXEffect* (0x%p) into offset +0x%X (slot %d)\n",
+             newRawFx, offset, slotIndex);
     return true;
 }
 
@@ -1170,7 +1171,7 @@ void* ResolveApplyGraphicsThis()
         if (IsValidThis(g_ThisCandidates[i]))
             return g_ThisCandidates[i];
 
-    void* scan = GetIVisualTreatmentObject();
+    void* scan = GetFirstIVisualTreatmentObject();
     if (IsValidThis(scan) && IsLikelyApplyGraphicsSettingsObject(scan))
         return scan;
 
@@ -1185,6 +1186,74 @@ bool AlreadyStored(void* ptr)
             return true;
     }
     return false;
+}
+
+void ForceReplaceShaderIntoSlots(const std::string& resourceName, std::shared_ptr<FxWrapper> fxWrapper)
+{
+    g_LastReloadedFx = fxWrapper;
+
+    ID3DXEffect* rawFx = fxWrapper->GetEffect(); // ✅ Not const
+    const auto slotIndices = LookupShaderSlotsFromResource(resourceName);
+
+    if (!slotIndices.empty())
+    {
+        for (int index : slotIndices)
+        {
+            BYTE* base = reinterpret_cast<BYTE*>((uintptr_t)SHADER_TABLE_ADDRESS);
+
+            ReplaceShaderSlot_RawEffect(
+                base,
+                index * sizeof(ID3DXEffect*),
+                rawFx,
+                index);
+
+            g_SlotRetainedFx[index] = fxWrapper;
+            fxWrapper->AddRef();
+        }
+    }
+    else
+    {
+        printf_s("[HotReload] ⚠️ No shader table slot for %s — falling back\n", resourceName.c_str());
+
+        for (void* vtObj : g_ThisCandidates)
+        {
+            if (!IsLikelyApplyGraphicsSettingsObject(vtObj))
+                continue;
+
+            BYTE* base = reinterpret_cast<BYTE*>(GetIVisualTreatmentObject(vtObj));
+            if (!base)
+                continue;
+
+            int fallbackIndex = FindAvailableFxSlot();
+            if (fallbackIndex < 0)
+            {
+                printf_s("[Fallback] ❌ No available slot for vtObject = %p\n", vtObj);
+                continue;
+            }
+
+            g_DynamicFallbackSlots[resourceName] = fallbackIndex;
+
+            ReplaceShaderSlot_RawEffect(
+                base,
+                0x18C,
+                rawFx,
+                fallbackIndex);
+
+            g_SlotRetainedFx[fallbackIndex] = fxWrapper;
+            fxWrapper->AddRef();
+
+            printf_s("[Fallback] ✅ Patched vtObject %p at +0x18C using slotIndex = %d\n",
+                     vtObj, fallbackIndex);
+
+            // ⏺ Queue patch for ApplyQueuedShaderPatches
+            g_PendingPatches.push_back({
+                fallbackIndex,
+                fxWrapper,
+                2,
+                resourceName
+            });
+        }
+    }
 }
 
 void LogApplyGraphicsSettingsCall(void* manager, void* object, int objectType)
@@ -1227,65 +1296,59 @@ void PrintFxAtOffsets(void* target)
     if (!target || !IsValidThis(target))
         return;
 
-    BYTE* base = (BYTE*)target;
+    BYTE* base = static_cast<BYTE*>(target);
 
-    FxWrapper* currentFx = nullptr;
-    FxWrapper** currentFxPtr = (FxWrapper**)CURRENTSHADER_OBJ_ADDR;
-    if (IsValidShaderPointer(*currentFxPtr))
+    std::shared_ptr<FxWrapper> currentFx = nullptr;
+    std::shared_ptr<FxWrapper>* currentFxPtr = reinterpret_cast<std::shared_ptr<FxWrapper>*>(CURRENTSHADER_OBJ_ADDR);
+    if (!IsBadReadPtr(currentFxPtr, sizeof(*currentFxPtr)) && IsValidShaderPointer(*currentFxPtr))
         currentFx = *currentFxPtr;
 
     printf_s("🧪 Scanning shader pointer slots (base = %p)...\n", base);
 
     for (int offset = 0; offset < 0x100; offset += 4)
     {
-        FxWrapper** fxSlot = (FxWrapper**)(base + offset);
-        FxWrapper* fx = nullptr;
+        auto fxSlot = reinterpret_cast<std::shared_ptr<FxWrapper>*>(base + offset);
+        if (IsBadReadPtr(fxSlot, sizeof(*fxSlot)))
+            continue;
 
-        __try { fx = *fxSlot; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
-
+        std::shared_ptr<FxWrapper> fx = *fxSlot;
         if (!fx || !IsValidShaderPointer(fx))
             continue;
 
-        ID3DXEffect* effect = nullptr;
-        __try { effect = fx->GetEffect(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
-
-        if (!effect || (uintptr_t)effect < 0x10000)
+        ID3DXEffect* effect = fx->GetEffect();
+        if (!effect || reinterpret_cast<uintptr_t>(effect) < 0x10000)
             continue;
 
         D3DXEFFECT_DESC d = {};
-        HRESULT hr = E_FAIL;
-
-        __try { hr = effect->GetDesc(&d); }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        HRESULT hr = effect->GetDesc(&d);
+        if (FAILED(hr))
         {
-            printf_s("⚠️ Exception calling GetDesc at offset +0x%02X (fx=%p, effect=%p)\n", offset, fx, effect);
+            printf_s("⚠️ GetDesc failed at offset +0x%02X (fx=%p)\n", offset, fx.get());
             continue;
         }
 
-        if (!SUCCEEDED(hr))
-        {
-            printf_s("⚠️ GetDesc failed at offset +0x%02X (fx=%p)\n", offset, fx);
-            continue;
-        }
-
-        // 🎯 Classification output
         if (fx == g_LastReloadedFx)
-            printf_s("🎯 g_LastReloadedFx is at +0x%02X → %p (%s)\n", offset, fx, d.Creator);
+        {
+            printf_s("🎯 g_LastReloadedFx is at +0x%02X → %p (%s)\n", offset, fx.get(), d.Creator);
+        }
         else if (fx == currentFx)
-            printf_s("🌀 Current shader (CURRENTSHADER_OBJ_ADDR) at +0x%02X → %p (%s)\n", offset, fx, d.Creator);
+        {
+            printf_s("🌀 Current shader (CURRENTSHADER_OBJ_ADDR) at +0x%02X → %p (%s)\n", offset, fx.get(), d.Creator);
+        }
         else if (offset == 0x18C)
-            printf_s("🔷 g_pVisualTreatment +0x18C slot → %p (%s)\n", fx, d.Creator);
+        {
+            printf_s("🔷 g_pVisualTreatment +0x18C slot → %p (%s)\n", fx.get(), d.Creator);
+        }
         else
-            printf_s("🔍 Found valid shader at +0x%02X → %p (%s)\n", offset, fx, d.Creator);
+        {
+            printf_s("🔍 Found valid shader at +0x%02X → %p (%s)\n", offset, fx.get(), d.Creator);
+        }
     }
 }
 
 bool TryApplyGraphicsSettingsSafely()
 {
     void* targetThis = ResolveApplyGraphicsThis();
-
     if (!targetThis)
     {
         printf_s("❌ Failed to resolve ApplyGraphicsSettings this-pointer\n");
@@ -1298,36 +1361,41 @@ bool TryApplyGraphicsSettingsSafely()
         return false;
     }
 
-    PrintFxAtOffsets(targetThis); // just do this once for diagnostics
+    PrintFxAtOffsets(targetThis); // diagnostics
 
-    // Replace any slots with g_LastReloadedFx or fuzzy match
     if (g_LastReloadedFx && IsValidShaderPointer(g_LastReloadedFx))
     {
-        printf_s("🧪 Entering TryApplyGraphicsSettingsSafely() — g_LastReloadedFx=%p\n", g_LastReloadedFx);
+        printf_s("🧪 Entering TryApplyGraphicsSettingsSafely() — g_LastReloadedFx=%p\n", g_LastReloadedFx.get());
 
-        // 📌 Patch known current shader slot first (CURRENTSHADER_OBJ_ADDR)
-        FxWrapper** currentShader = (FxWrapper**)CURRENTSHADER_OBJ_ADDR;
-        if (IsValidShaderPointer(*currentShader))
+        // 📌 Patch known shader pointer slot
+        auto currentShader = reinterpret_cast<std::shared_ptr<FxWrapper>*>(CURRENTSHADER_OBJ_ADDR);
+        if (IsBadReadPtr(currentShader, sizeof(std::shared_ptr<FxWrapper>)))
         {
-            if (*currentShader != g_LastReloadedFx)
-            {
-                printf_s("🎯 Overwriting CURRENTSHADER_OBJ_ADDR (%p → %p)\n", *currentShader, g_LastReloadedFx);
-                *currentShader = g_LastReloadedFx;
-            }
-            else
-            {
-                printf_s("✅ g_LastReloadedFx already set in CURRENTSHADER_OBJ_ADDR\n");
-            }
+            printf_s("⚠️ Cannot access CURRENTSHADER_OBJ_ADDR\n");
+        }
+        else if (*currentShader != g_LastReloadedFx)
+        {
+            printf_s("🎯 Overwriting CURRENTSHADER_OBJ_ADDR (%p → %p)\n", currentShader->get(), g_LastReloadedFx.get());
+            *currentShader = g_LastReloadedFx;
+        }
+        else
+        {
+            printf_s("✅ g_LastReloadedFx already set in CURRENTSHADER_OBJ_ADDR\n");
         }
 
-        // 📌 Patch known visual treatment slot at +0x18C if applicable
-        if (targetThis)
+        // 📌 Patch known visual treatment slot at +0x18C
+        if (!IsBadWritePtr((BYTE*)targetThis + 0x18C, sizeof(FxWrapper*)) &&
+            g_LastReloadedFx && g_LastReloadedFx->IsValid())
         {
-            ReplaceShaderSlot((BYTE*)targetThis, 0x18C, g_LastReloadedFx);
+            SafePatchShaderTable(0x18C / 4, g_LastReloadedFx);
+        }
+        else
+        {
+            printf_s("❌ Cannot patch slot +0x18C — pointer invalid or g_LastReloadedFx is not valid\n");
         }
 
-        // 📦 Fallback: scan memory for other matching FxWrapper* instances
-        BYTE* obj = (BYTE*)targetThis;
+        // 📦 Fallback: scan memory for matching shared_ptr<FxWrapper> instances
+        BYTE* obj = reinterpret_cast<BYTE*>(targetThis);
 
         D3DXEFFECT_DESC newDesc = {};
         if (FAILED(g_LastReloadedFx->GetEffect()->GetDesc(&newDesc)))
@@ -1338,39 +1406,35 @@ bool TryApplyGraphicsSettingsSafely()
 
         for (int offset = 0; offset < 0x100; offset += 4)
         {
-            FxWrapper** fxSlot = (FxWrapper**)(obj + offset);
-            FxWrapper* fx = nullptr;
+            auto fxSlot = reinterpret_cast<std::shared_ptr<FxWrapper>*>(obj + offset);
 
-            __try
-            {
-                fx = *fxSlot;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
+            if (IsBadReadPtr(fxSlot, sizeof(std::shared_ptr<FxWrapper>)))
                 continue;
-            }
 
+            std::shared_ptr<FxWrapper> fx = *fxSlot;
             if (!fx || !IsValidShaderPointer(fx))
                 continue;
 
             if (fx == g_LastReloadedFx)
             {
-                ReplaceShaderSlot(obj, offset, g_LastReloadedFx);
-                g_LastReloadedFx->ReloadHandles();
+                if (!IsBadWritePtr((BYTE*)obj + offset, sizeof(FxWrapper*)))
+                {
+                    SafePatchShaderTable(offset / 4, g_LastReloadedFx);
+                    if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
+                    {
+                        printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
+                        continue;
+                    }
+                    g_LastReloadedFx->ReloadHandles();
+                }
+                else
+                {
+                    printf_s("❌ Cannot write to +0x%02X — skipping ReplaceShaderSlot\n", offset);
+                }
                 continue;
             }
 
-            // ⚠️ Fuzzy match against previous shader based on D3DXEFFECT_DESC
-            ID3DXEffect* fxEffect = nullptr;
-            __try
-            {
-                fxEffect = fx->GetEffect();
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                continue;
-            }
-
+            ID3DXEffect* fxEffect = fx->GetEffect();
             if (!fxEffect)
                 continue;
 
@@ -1380,32 +1444,65 @@ bool TryApplyGraphicsSettingsSafely()
                 desc.Parameters == newDesc.Parameters &&
                 desc.Techniques == newDesc.Techniques)
             {
-                printf_s("🔶 Fuzzy match at +0x%02X (%p) — replacing\n", offset, fx);
-                ReplaceShaderSlot(obj, offset, g_LastReloadedFx);
+                printf_s("🔶 Fuzzy match at +0x%02X (%p) — replacing\n", offset, fx.get());
+
+                void* slotPtr = (BYTE*)obj + offset;
+                if (!IsBadWritePtr(slotPtr, sizeof(FxWrapper*)))
+                {
+                    SafePatchShaderTable(offset / 4, g_LastReloadedFx);
+                }
+                else
+                {
+                    printf_s("❌ Slot at +0x%02X not writable — skipping patch\n", offset);
+                }
             }
         }
     }
 
-    // Call ApplyGraphicsSettings
+    // ✅ Call ApplyGraphicsSettingsOriginal
     printf_s("🎯 Calling ApplyGraphicsSettingsOriginal(manager=%p, object=%p)\n",
              g_ApplyGraphicsManagerThis, targetThis);
 
-    __try
+    if (IsValidThis(targetThis))
     {
-        // PrintFxAtOffsets(targetThis);
         ApplyGraphicsSettingsOriginal(g_ApplyGraphicsManagerThis, nullptr, targetThis);
-        // PrintFxAtOffsets(targetThis);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    else
     {
-        printf_s("❌ Exception during ApplyGraphicsSettingsOriginal call\n");
+        printf_s("❌ Invalid targetThis during ApplyGraphicsSettingsOriginal call\n");
         return false;
     }
 
-    // PrintFxAtOffsets(targetThis); // again after call
-
     g_ThisCount = 0;
-    g_TriggerApplyGraphicsSettings = false; // ✅ Prevent further log spam
+    g_TriggerApplyGraphicsSettings = false;
+    return true;
+}
+
+bool TryPatchSlotIfWritable(void* obj, size_t offset, std::shared_ptr<FxWrapper> fx)
+{
+    if (!obj || !fx || !IsValidShaderPointer(fx)) return false;
+
+    if (IsBadWritePtr(reinterpret_cast<BYTE*>(obj) + offset, sizeof(FxWrapper*)))
+    {
+        printf_s("[Patch] ❌ Cannot write to offset +0x%X at %p — skipping\n", (unsigned)offset, obj);
+        return false;
+    }
+
+    // ReplaceShaderSlot(reinterpret_cast<BYTE*>(obj), offset, fx);
+    ReplaceShaderSlot_RawEffect(
+        reinterpret_cast<BYTE*>(*g_pVisualTreatment),
+        0x18C,
+        fx->GetEffect(),   // raw ID3DXEffect*
+        62                 // store/release the wrapper at g_SlotRetainedFx[62]
+    );
+
+    if (offset == 0x18C)
+    {
+        g_SlotRetainedFx[62] = fx;
+        g_SlotRetainedFx[62]->AddRef(); // 🔒 Retain
+        printf_s("[Patch] ✅ Retained new FxWrapper in g_SlotRetainedFx[62]\n");
+    }
+
     return true;
 }
 
@@ -1472,16 +1569,48 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
         if (triggerActive && g_LastReloadedFx && vtObject != lastPatchedThis)
         {
             printf_s("[HotReload] 🔁 Applying shader and reset for vtObject = %p\n", vtObject);
-            ReplaceShaderSlot((BYTE*)vtObject, 0x18C, g_LastReloadedFx);
-            g_LastReloadedFx->ReloadHandles();
 
-            if (g_pVisualTreatment && *g_pVisualTreatment)
+            bool validFx = g_LastReloadedFx && g_LastReloadedFx->GetEffect() &&
+                reinterpret_cast<uintptr_t>(g_LastReloadedFx.get()) != 0xAAAAAAAA;
+
+            if (!validFx)
             {
-                IVisualTreatment_Reset(*g_pVisualTreatment);
-                printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+                printf_s("[HotReload] ❌ g_LastReloadedFx is invalid or corrupted — skipping\n");
             }
+            else
+            {
+                auto& slotFx = g_SlotRetainedFx[62];
+                uintptr_t rawPtr = reinterpret_cast<uintptr_t>(slotFx ? slotFx->GetEffect() : 0);
 
-            lastPatchedThis = vtObject;
+                if (rawPtr < 0x10000 || rawPtr == 0x3f800000 || !IsValidShaderPointer(slotFx))
+                {
+                    printf_s("[Patch] ❌ g_SlotRetainedFx[62] is corrupted or null (fx=0x%08X) — skipping patch\n",
+                             (unsigned)rawPtr);
+                    return;
+                }
+
+
+                printf_s("[Debug] 📦 Using g_SlotRetainedFx[62] = %p\n", (void*)rawPtr);
+                // 0x18C / 4 = 62
+
+                TryPatchSlotIfWritable(vtObject, 0x18C, g_LastReloadedFx);
+
+                // ✅ Safely reload handles now
+                if (SafeReloadFx(g_LastReloadedFx, "ApplyGraphicsSettings"))
+                {
+                    if (g_pVisualTreatment && *g_pVisualTreatment)
+                    {
+                        IVisualTreatment_Reset(*g_pVisualTreatment);
+                        printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+                    }
+                }
+                else
+                {
+                    printf_s("[HotReload] ❌ ReloadHandles failed — skipping Reset\n");
+                }
+
+                lastPatchedThis = vtObject;
+            }
         }
 
         LogApplyGraphicsSettingsCall(manager, vtObject, 2);
@@ -1553,13 +1682,31 @@ HRESULT TryFullGraphicsReset()
             printf_s("[HotReload] ❌ Cannot replace shader slot — ApplyGraphicsSettingsThis unresolved\n");
             return E_POINTER;
         }
-        ReplaceShaderSlot((BYTE*)applyThis, 0x18C, g_LastReloadedFx);
+
+        void* slotPtr = (BYTE*)applyThis + 0x18C;
+        if (!IsBadWritePtr(slotPtr, sizeof(FxWrapper*)))
+        {
+            SafePatchShaderTable(62, g_LastReloadedFx); // 0x18C / 4
+        }
+        else
+        {
+            printf_s("[HotReload] ❌ Cannot write to applyThis + 0x18C — skipping patch\n");
+        }
     }
     else if (g_pVisualTreatment && *g_pVisualTreatment)
     {
         BYTE* vtObj = (BYTE*)(*g_pVisualTreatment);
         printf_s("[Fallback] Patching g_pVisualTreatment at +0x18C (vtObj = %p)\n", vtObj);
-        ReplaceShaderSlot(vtObj, 0x18C, g_LastReloadedFx);
+
+        void* slotPtr = vtObj + 0x18C;
+        if (!IsBadWritePtr(slotPtr, sizeof(FxWrapper*)))
+        {
+            SafePatchShaderTable(62, g_LastReloadedFx);
+        }
+        else
+        {
+            printf_s("[Fallback] ❌ Cannot write to g_pVisualTreatment + 0x18C — skipping patch\n");
+        }
     }
     else
     {
@@ -1675,7 +1822,8 @@ static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
 
         // 🧷 Shallow copy to prevent iterator invalidation
         std::vector<std::string> keys;
-        try {
+        try
+        {
             for (const auto& [name, fx] : g_ActiveEffects)
                 keys.push_back(name);
         }
@@ -1690,8 +1838,9 @@ static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
             auto it = g_ActiveEffects.find(name);
             if (it == g_ActiveEffects.end()) continue;
 
-            FxWrapper* fx = it->second;
-            if (!fx || !fx->GetEffect()) {
+            std::shared_ptr<FxWrapper> fx = it->second;
+            if (!fx || !fx->GetEffect())
+            {
                 printf_s("[ShaderManager] ⚠️ Skipped: null effect for %s\n", name.c_str());
                 continue;
             }
@@ -1725,6 +1874,11 @@ static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
         ID3DXEffect* e = g_LastReloadedFx->GetEffect();
         if (e && !g_AlreadyInjectedFxThisFrame.count(e))
         {
+            if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
+            {
+                printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
+                return result;
+            }
             g_LastReloadedFx->ReloadHandles();
 
             D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
@@ -1742,13 +1896,14 @@ static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
             }
             else
             {
-                printf_s("[ShaderManager] ❌ Failed to inject into g_LastReloadedFx (hr1=0x%08X, hr2=0x%08X)\n", hr1, hr2);
+                printf_s("[ShaderManager] ❌ Failed to inject into g_LastReloadedFx (hr1=0x%08X, hr2=0x%08X)\n", hr1,
+                         hr2);
             }
         }
 
         result = true;
-
-    } while (false);
+    }
+    while (false);
 
     inProgress = false;
     --callDepth;
@@ -1766,7 +1921,7 @@ bool InjectSharedTextures2(IDirect3DDevice9* device)
     // Inject into all active effects
     for (auto& [name, fx] : g_ActiveEffects)
     {
-        FxWrapper* effect = fx;
+        std::shared_ptr<FxWrapper> effect = fx;
         if (!effect)
             continue;
 
@@ -1802,7 +1957,7 @@ bool InjectSharedTextures2(IDirect3DDevice9* device)
     // Inject into hot-reloaded shader directly
     if (g_LastReloadedFx && IsValidShaderPointer(g_LastReloadedFx))
     {
-        FxWrapper* fx = g_LastReloadedFx;
+        std::shared_ptr<FxWrapper> fx = g_LastReloadedFx;
         if (fx)
         {
             D3DXHANDLE texHandle = fx->GetEffect()->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
@@ -1816,6 +1971,11 @@ bool InjectSharedTextures2(IDirect3DDevice9* device)
             if (FAILED(hr1) || FAILED(hr2))
             {
                 printf_s("[ShaderManager] ⚠️ Failed to set params on hot-reloaded effect, reloading handles...\n");
+                if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
+                {
+                    printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
+                    return false;
+                }
                 g_LastReloadedFx->ReloadHandles();
                 texHandle = fx->GetEffect()->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
                 blurHandle = fx->GetEffect()->GetParameterByName(nullptr, "BlurParams");
@@ -1834,6 +1994,56 @@ bool InjectSharedTextures2(IDirect3DDevice9* device)
     return true;
 }
 
+void ApplyShaderAndResetAll()
+{
+    ID3DXEffect* newFx = g_LastReloadedFx ? g_LastReloadedFx->GetEffect() : nullptr;
+    if (!newFx) return;
+
+    for (int i = 0; i < g_ThisCount; ++i)
+    {
+        void* obj = g_ThisCandidates[i];
+        if (!IsValidThis(obj)) continue;
+
+        ID3DXEffect** fxSlot = reinterpret_cast<ID3DXEffect**>(reinterpret_cast<BYTE*>(obj) + 0x18C);
+        if (IsBadReadPtr(fxSlot, sizeof(ID3DXEffect*))) continue;
+
+        ID3DXEffect* currentFx = *fxSlot;
+        if (currentFx == newFx)
+        {
+            printf_s("[HotReload] ⚠️ Slot +0x18C already set to fx = %p — skipping Reset\n", newFx);
+            continue;
+        }
+        printf_s("[HotReload] 🔁 Applying shader and reset for vtObject = %p\n", obj);
+
+        // Validate the pointer before writing
+        void* slotPtr = (BYTE*)obj + 0x18C;
+        if (!IsBadWritePtr(slotPtr, sizeof(FxWrapper*)))
+        {
+            SafePatchShaderTable(62, g_LastReloadedFx); // 0x18C / 4 = 62
+            if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
+            {
+                printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
+                return;
+            }
+            g_LastReloadedFx->ReloadHandles();
+        }
+        else
+        {
+            printf_s("[HotReload] ❌ Cannot write to obj + 0x18C — skipping patch\n");
+        }
+
+        if (IsValidThis(obj))
+        {
+            IVisualTreatment_Reset(obj);
+            printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+        }
+        else
+        {
+            printf_s("[HotReload] ❌ Invalid IVisualTreatment object for Reset(%p)\n", obj);
+        }
+    }
+}
+
 HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                              const RECT* src, const RECT* dest,
                              HWND hwnd, const RGNDATA* dirty)
@@ -1841,7 +2051,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
     static bool ranThisFrame = false;
     if (ranThisFrame) return ShaderManager::RealPresent(device, src, dest, hwnd, dirty);
     ranThisFrame = true;
-    
+
     if (g_EnableShaderTableDump)
         DumpShaderTable();
 
@@ -1934,6 +2144,8 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                     printf_s("[HotReload] ❌ TryApplyGraphicsSettingsSafely failed — final fallback attempt\n");
                 }
 
+                ApplyShaderAndResetAll();
+
                 ReleaseMotionBlurTexture();
                 printf_s("[ShaderManager] 🔻 Released g_MotionBlurTex (pre-reset)\n");
             }
@@ -1950,17 +2162,33 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
                     printf_s("[HotReload] ❌ Cannot replace shader slot — ApplyGraphicsSettingsThis unresolved\n");
                     return E_POINTER;
                 }
-                g_LastReloadedFx->GetEffect()->OnLostDevice();
 
-                ReplaceShaderSlot((BYTE*)applyThis, 0x18C, g_LastReloadedFx);
+                if (!IsBadWritePtr((BYTE*)applyThis + 0x18C, sizeof(FxWrapper*)))
+                {
+                    g_LastReloadedFx->GetEffect()->OnLostDevice(); // Notify effect
+                    SafePatchShaderTable(62, g_LastReloadedFx); // 0x18C / 4 = 62
+                }
+                else
+                {
+                    printf_s("[HotReload] ❌ Cannot write to applyThis + 0x18C — skipping patch\n");
+                }
             }
             else if (g_pVisualTreatment && *g_pVisualTreatment)
             {
                 BYTE* vtObj = (BYTE*)(*g_pVisualTreatment);
-                printf_s("[Fallback] Patching g_pVisualTreatment at +0x18C (vtObj = %p)\n", vtObj);
-                g_LastReloadedFx->GetEffect()->OnLostDevice();
+                void* slotPtr = vtObj + 0x18C;
 
-                ReplaceShaderSlot(vtObj, 0x18C, g_LastReloadedFx);
+                printf_s("[Fallback] Patching g_pVisualTreatment at +0x18C (vtObj = %p)\n", vtObj);
+
+                if (!IsBadWritePtr(slotPtr, sizeof(FxWrapper*)))
+                {
+                    g_LastReloadedFx->GetEffect()->OnLostDevice();
+                    SafePatchShaderTable(62, g_LastReloadedFx);
+                }
+                else
+                {
+                    printf_s("[Fallback] ❌ Cannot write to g_pVisualTreatment + 0x18C — skipping patch\n");
+                }
             }
             else
             {
@@ -2030,6 +2258,19 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
 
     ApplyQueuedShaderPatches();
 
+    if (g_PendingVisualReset && g_pVisualTreatment && *g_pVisualTreatment)
+    {
+        void* vt = *g_pVisualTreatment;
+
+        void** fx140 = (void**)((char*)vt + 0x140);
+        *fx140 = nullptr;
+
+        printf_s("[HotReload] 🔁 Deferred IVisualTreatment::Reset() triggered\n");
+        SafeResetVisualTreatment(vt);
+
+        g_PendingVisualReset = false;
+    }
+
     lastPatchedThis = nullptr; // 🔁 ready for next reload
 
     if (g_ResumeGameThreadNextPresent)
@@ -2045,8 +2286,26 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
             if (obj && IsValidShaderPointer(g_LastReloadedFx))
             {
                 printf_s("[HotReload] 🛠️ Forcing fallback shader patch via g_pVisualTreatment\n");
-                ReplaceShaderSlot(obj, 0x18C, g_LastReloadedFx);
-                g_LastReloadedFx->ReloadHandles();
+
+                // Convert to slot index: 0x18C / 4 = 62
+                int slot = 62;
+
+                void* slotPtr = obj + 0x18C;
+
+                if (!IsBadWritePtr(slotPtr, sizeof(FxWrapper*)))
+                {
+                    SafePatchShaderTable(slot, g_LastReloadedFx);
+                    if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
+                    {
+                        printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
+                        return ShaderManager::RealPresent(device, src, dest, hwnd, dirty);
+                    }
+                    g_LastReloadedFx->ReloadHandles();
+                }
+                else
+                {
+                    printf_s("[HotReload] ❌ Cannot write to obj + 0x18C — skipping SafePatchShaderTable\n");
+                }
             }
         }
     }
