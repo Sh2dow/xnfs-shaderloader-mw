@@ -9,7 +9,8 @@
 #define printf_s(...) asi_log::Log(__VA_ARGS__)
 #endif
 
-#define GLOBAL_D3DDEVICE 0x00982BDC
+// #define GLOBAL_D3DDEVICE 0x00982BDC
+constexpr uintptr_t GLOBAL_D3DDEVICE = 0x00982BDC;
 
 inline LPDIRECT3DDEVICE9 GetGameDevice()
 {
@@ -56,6 +57,9 @@ extern ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal; // ✅ extern = DE
 
 typedef int (__thiscall*ApplyGraphicsManagerMain_t)(void* thisptr);
 extern ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal;
+
+typedef HRESULT(WINAPI* Present_t)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, HWND, const RGNDATA*);
+extern Present_t oPresent;
 
 inline ID3DXEffect* g_SlotRetainedFx[64] = {};
 
