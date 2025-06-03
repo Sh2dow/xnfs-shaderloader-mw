@@ -5,6 +5,16 @@ inline IDirect3DTexture9* g_MotionBlurTexA = nullptr;
 inline IDirect3DTexture9* g_MotionBlurTexB = nullptr;
 inline IDirect3DTexture9* g_CurrentBlurTex = nullptr;
 inline IDirect3DSurface9* g_CurrentBlurSurface = nullptr;
+
+inline IDirect3DTexture9* g_GainMapTex = nullptr;
+inline IDirect3DTexture9* g_VignetteTex = nullptr;
+inline IDirect3DTexture9* g_BloomTex = nullptr;
+inline IDirect3DTexture9* g_DofTex = nullptr;
+inline IDirect3DTexture9* g_LinearDepthTex = nullptr;
+inline IDirect3DTexture9* g_ExposureTex = nullptr;
+inline IDirect3DTexture9* g_BloomLUTTex = nullptr;
+inline IDirect3DTexture9* g_DepthTex = nullptr;
+
 inline bool g_UseTexA = true;
 inline UINT g_Width = 0;
 inline UINT g_Height = 0;
@@ -38,6 +48,19 @@ extern HRESULT WINAPI HookedCreateFromResource(
 typedef HRESULT (WINAPI*PresentFn)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, HWND, const RGNDATA*);
 
 // -------------------- NFSMW-RenderTarget block --------------------
+struct Vertex
+{
+    float x, y, z, rhw;
+    float u, v;
+} screenQuadVerts[4] = {
+    {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+    {(float)g_Width, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f},
+    {0.0f, (float)g_Height, 0.0f, 1.0f, 0.0f, 1.0f},
+    {(float)g_Width, (float)g_Height, 0.0f, 1.0f, 1.0f, 1.0f},
+};
+
+LPDIRECT3DTEXTURE9 g_MyBlurTexture = nullptr;
+LPDIRECT3DSURFACE9 g_MyBlurSurface = nullptr;
 
 typedef HRESULT (WINAPI*Reset_t)(LPDIRECT3DDEVICE9, D3DPRESENT_PARAMETERS*);
 inline Reset_t oReset = nullptr;
