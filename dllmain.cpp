@@ -24,7 +24,7 @@
 
 HMODULE g_hModule = nullptr;
 IDirect3DTexture9* g_MotionBlurTex = nullptr;
-
+bool g_DeviceResetInProgress = false;
 int g_ApplyDelayCounter = 0;
 bool g_ApplyScheduled = false;
 int g_ApplyGraphicsTriggerDelay = 0;
@@ -62,47 +62,101 @@ IVisualTreatment_ResetFn IVisualTreatment_Reset = (IVisualTreatment_ResetFn)0x00
 
 // IVisualTreatment_Reset block end
 
-// void ReloadBlurBindings(ID3DXEffect* fx)
-// {
-//     if (!fx || !g_CurrentBlurTex) return;
-//
-//     D3DXEFFECT_DESC desc;
-//     if (SUCCEEDED(fx->GetDesc(&desc)))
-//     {
-//         printf_s("[BlurRebind] Attached shader has %u techniques and %u parameters\n",
-//                  desc.Techniques, desc.Parameters);
-//     }
-//
-//     fx->SetTexture("MISCMAP3", g_CurrentBlurTex);
-//
-//     D3DXVECTOR4 blurParams(0.5f, 0.2f, 1.0f, 0);
-//     fx->SetVector("BlurParams", &blurParams);
-//
-//     if (FAILED(fx->SetTechnique("visualtreatment_branching")))
-//     {
-//         printf_s("[BlurRebind] ⚠️ Failed to set technique 'visualtreatment_branching'\n");
-//     }
-//
-//     printf_s("[XNFS] 🔁 ReloadBlurBindings applied to %p\n", fx);
-// }
 void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name = "")
 {
-    if (!fx) return;
-
-    D3DXEFFECT_DESC desc{};
-    if (FAILED(fx->GetDesc(&desc)))
+    if (!fx)
+    {
+        printf_s("[BlurRebind] ❌ fx is null\n");
         return;
+    }
 
-    printf_s("[BlurRebind] Attached shader has %u techniques and %u parameters\n", desc.Techniques, desc.Parameters);
+    if (!g_CurrentBlurTex || IsBadReadPtr(g_CurrentBlurTex, sizeof(IDirect3DTexture9)))
+    {
+        printf_s("[BlurRebind] ❌ g_CurrentBlurTex is null or invalid\n");
+        return;
+    }
+
+    // Optional: detect if we're in the middle of Reset
+    if (g_DeviceResetInProgress)
+    {
+        printf_s("[BlurRebind] ⚠️ Skipped during device reset\n");
+        return;
+    }
+
+    D3DXEFFECT_DESC desc;
+    if (SUCCEEDED(fx->GetDesc(&desc)))
+    {
+        printf_s("[BlurRebind] Shader has %u techniques and %u parameters\n",
+                 desc.Techniques, desc.Parameters);
+    }
+
+    // Set texture to MISCMAP3_TEXTURE safely
+    D3DXHANDLE hMiscMap3 = fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
+    if (hMiscMap3)
+    {
+        if (FAILED(fx->SetTexture(hMiscMap3, g_CurrentBlurTex)))
+        {
+            printf_s("[BlurRebind] ⚠️ SetTexture failed for MISCMAP3_TEXTURE\n");
+        }
+    }
+    else
+    {
+        printf_s("[BlurRebind] ⚠️ Shader missing parameter MISCMAP3_TEXTURE\n");
+    }
+
+    // Set BlurParams vector safely
+    D3DXHANDLE hBlurParams = fx->GetParameterByName(nullptr, "BlurParams");
+    if (hBlurParams)
+    {
+        D3DXVECTOR4 blurParams(0.5f, 0.2f, 1.0f, 0.0f);
+        if (FAILED(fx->SetVector(hBlurParams, &blurParams)))
+        {
+            printf_s("[BlurRebind] ⚠️ Failed to set BlurParams\n");
+        }
+    }
+    else
+    {
+        printf_s("[BlurRebind] ⚠️ Shader missing parameter BlurParams\n");
+    }
 
     if (name == "IDI_VISUALTREATMENT_FX")
     {
-        fx->SetTechnique("visualtreatment_branching");
-        fx->SetTexture("MOTIONBLUR_TEXTURE", g_CurrentBlurTex);
-        fx->SetTexture("MOTIONBLUR_PREVIOUS", g_UseTexA ? g_MotionBlurTexB : g_MotionBlurTexA);
-    }
+        D3DXHANDLE tech = fx->GetTechniqueByName("visualtreatment_enchanced");
+        if (tech && SUCCEEDED(fx->ValidateTechnique(tech)))
+        {
+            if (FAILED(fx->SetTechnique(tech)))
+            {
+                printf_s("[BlurRebind] ⚠️ SetTechnique failed for 'visualtreatment_enchanced'\n");
+            }
+        }
+        else
+        {
+            printf_s("[BlurRebind] ❌ Invalid technique: visualtreatment_enchanced\n");
+        }
 
-    printf_s("[XNFS] ?? ReloadBlurBindings applied to %p\n", fx);
+        fx->SetFloat(fx->GetParameterByName(nullptr, "g_fBloomScale"), 1.0f);
+        fx->SetFloat(fx->GetParameterByName(nullptr, "VisualEffectBrightness"), 1.0f);
+        fx->SetFloat(fx->GetParameterByName(nullptr, "Desaturation"), 0.0f);
+        fx->SetFloatArray(fx->GetParameterByName(nullptr, "DepthOfFieldParams"), new float[4]{1.0f, 0.1f, 0.1f, 0}, 4);
+        fx->SetBool(fx->GetParameterByName(nullptr, "bDepthOfFieldEnabled"), TRUE);
+        fx->SetBool(fx->GetParameterByName(nullptr, "bHDREnabled"), TRUE);
+        fx->SetFloat(fx->GetParameterByName(nullptr, "g_OverBrightEnable"), 1.0f);
+        fx->SetFloat(fx->GetParameterByName(nullptr, "g_fAdaptiveLumCoeff"), 1.0f);
+
+        // BYTE* g_OverBrightEnable = (BYTE*)0x009017FC;
+        // if (*g_OverBrightEnable != 0)
+        // {
+        //     printf_s("[Init] ⚠️ g_OverBrightEnable was %d — forcing off\n", *g_OverBrightEnable);
+        //     *g_OverBrightEnable = 0;
+        // }
+        
+        if (FAILED(fx->CommitChanges()))
+        {
+            printf_s("[BlurRebind] ⚠️ CommitChanges failed\n");
+        }
+
+        printf_s("[XNFS] 🔁 ReloadBlurBindings applied to %p (%s)\n", fx, name.c_str());
+    }
 }
 
 // Hooked D3DXCreateEffectFromResourceA
@@ -124,20 +178,24 @@ HRESULT WINAPI HookedCreateFromResource(
         return E_FAIL;
     }
 
-    SetGameDevice(device);
+    // Only process specific shader
+    bool isVisualFx = strcmp(pResource, "IDI_VISUALTREATMENT_FX") == 0;
+    if (isVisualFx)
+        printf_s("[XNFS] 🎯 HookedCreateFromResource called for: %s\n", pResource);
 
-    printf_s("[XNFS] 🎯 HookedCreateFromResource called for: %s\n", pResource);
+    SetGameDevice(device);
 
     HRESULT hr = RealCreateFromResource(
         device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
 
     if (FAILED(hr) || !outEffect || !*outEffect)
     {
-        printf_s("[XNFS] ❌ Shader creation failed or returned null (hr=0x%08X)\n", hr);
+        if (isVisualFx)
+            printf_s("[XNFS] ❌ Shader creation failed or returned null (hr=0x%08X)\n", hr);
         return hr;
     }
 
-    if (strcmp(pResource, "IDI_VISUALTREATMENT_FX") == 0)
+    if (isVisualFx)
     {
         g_ActiveEffects[pResource] = *outEffect;
         printf_s("✅ Shader created and tracked: %s (%p)\n", pResource, *outEffect);
@@ -152,6 +210,8 @@ HRESULT WINAPI HookedCreateFromResource(
 void OnDeviceReset(LPDIRECT3DDEVICE9 device)
 {
     if (!device) return;
+
+    g_DeviceResetInProgress = true;
 
     D3DVIEWPORT9 vp;
     if (SUCCEEDED(device->GetViewport(&vp)))
@@ -175,22 +235,34 @@ void OnDeviceReset(LPDIRECT3DDEVICE9 device)
         printf_s("[OnDeviceReset] Recreated motion blur ping-pong targets (%ux%u)\n", g_Width, g_Height);
     }
 
-    // 🔁 Rebind blur targets to all tracked IDI_VISUALTREATMENT_FX shaders
-    for (auto& [name, fx] : g_ActiveEffects)
+    if (g_CurrentBlurTex)
     {
-        if (strcmp(name.c_str(), "IDI_VISUALTREATMENT_FX") == 0)
+        for (auto& [name, fx] : g_ActiveEffects)
         {
-            printf_s("[XNFS] ?? ReloadBlurBindings\n");
-            ReloadBlurBindings(fx, name.c_str());
+            if (strcmp(name.c_str(), "IDI_VISUALTREATMENT_FX") == 0)
+            {
+                printf_s("[XNFS] ?? ReloadBlurBindings\n");
+                ReloadBlurBindings(fx, name.c_str());
+            }
         }
     }
+    else
+    {
+        printf_s("[OnDeviceReset] ⚠️ Skipping ReloadBlurBindings due to null g_CurrentBlurTex\n");
+    }
+
+    g_DeviceResetInProgress = false;
 }
 
 void OnDeviceLost()
 {
+    g_DeviceResetInProgress = true;
+
     SAFE_RELEASE(g_MotionBlurTexA);
     SAFE_RELEASE(g_MotionBlurTexB);
     SAFE_RELEASE(g_CurrentBlurSurface);
+    g_CurrentBlurTex = nullptr;
+
     printf_s("[OnDeviceLost] Released motion blur resources\n");
 }
 
@@ -215,15 +287,15 @@ void RenderBlurPass(IDirect3DDevice9* device, LPD3DXEFFECT blurFx)
 
     // Set new render target
     device->SetRenderTarget(0, dstSurface);
-    D3DVIEWPORT9 vp = { 0, 0, g_Width, g_Height, 0.0f, 1.0f };
+    D3DVIEWPORT9 vp = {0, 0, g_Width, g_Height, 0.0f, 1.0f};
     device->SetViewport(&vp);
 
     // Debug color (pink) to test visibility
     device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(255, 255, 0, 255), 1.0f, 0);
 
     // Setup shader
-    if (FAILED(blurFx->SetTexture("PrevFrame", srcTex)))
-        printf_s("⚠️ Failed to set PrevFrame\n");
+    if (FAILED(blurFx->SetTexture("MISCMAP3_TEXTURE", srcTex)))
+        printf_s("⚠️ Failed to set MISCMAP3_TEXTURE\n");
 
     D3DXVECTOR4 blurParams(0.5f, 0.0005f, 0.0f, 0.0f);
     if (FAILED(blurFx->SetVector("BlurParams", &blurParams)))
@@ -233,10 +305,11 @@ void RenderBlurPass(IDirect3DDevice9* device, LPD3DXEFFECT blurFx)
         printf_s("⚠️ CommitChanges failed\n");
 
     // Validate technique
-    D3DXHANDLE tech = blurFx->GetTechniqueByName("visualtreatment_branching");
+    D3DXHANDLE tech = blurFx->GetTechniqueByName("visualtreatment_enchanced");
+    
     if (!tech || FAILED(blurFx->SetTechnique(tech)))
     {
-        printf_s("⚠️ Missing or invalid technique: visualtreatment_branching\n");
+        printf_s("⚠️ Missing or invalid technique: visualtreatment_enchanced\n");
         goto cleanup;
     }
 
@@ -248,12 +321,16 @@ void RenderBlurPass(IDirect3DDevice9* device, LPD3DXEFFECT blurFx)
     device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 
     // Draw full-screen quad
-    struct Vertex { float x, y, z, rhw; float u, v; } vertices[4] = {
-        { -0.5f, -0.5f, 0, 1, 0, 0 },
-        { g_Width - 0.5f, -0.5f, 0, 1, 1, 0 },
-        { -0.5f, g_Height - 0.5f, 0, 1, 0, 1 },
-        { g_Width - 0.5f, g_Height - 0.5f, 0, 1, 1, 1 }
-    };
+    struct Vertex
+    {
+        float x, y, z, rhw;
+        float u, v;
+    } vertices[4] = {
+            {-0.5f, -0.5f, 0, 1, 0, 0},
+            {g_Width - 0.5f, -0.5f, 0, 1, 1, 0},
+            {-0.5f, g_Height - 0.5f, 0, 1, 0, 1},
+            {g_Width - 0.5f, g_Height - 0.5f, 0, 1, 1, 1}
+        };
 
     UINT passes = 0;
     if (SUCCEEDED(blurFx->Begin(&passes, 0)))
@@ -262,6 +339,7 @@ void RenderBlurPass(IDirect3DDevice9* device, LPD3DXEFFECT blurFx)
         {
             device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
             device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(Vertex));
+            printf_s("[XNFS] ✅ DrawPrimitiveUP executed\n");
             blurFx->EndPass();
         }
         blurFx->End();
@@ -458,6 +536,43 @@ static void OnFramePresent()
 // Hooked EndScene
 HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
 {
+    if (!device)
+        return oEndScene(device);
+
+    OnFramePresent();
+
+    // Defer blur rendering until the shader is loaded
+    auto it = g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
+    if (it == g_ActiveEffects.end() || !it->second)
+    {
+        // Shader hasn't been created yet — skip
+        return oEndScene(device);
+    }
+
+    if (!IsValidShaderPointer(it->second))
+    {
+        printf_s("[XNFS] ❌ IDI_VISUALTREATMENT_FX is invalid\n");
+        return oEndScene(device);
+    }
+
+    // Take backbuffer snapshot
+    IDirect3DSurface9* backBuffer = nullptr;
+    if (SUCCEEDED(device->GetRenderTarget(0, &backBuffer)))
+    {
+        device->StretchRect(backBuffer, nullptr, g_CurrentBlurSurface, nullptr, D3DTEXF_LINEAR);
+        backBuffer->Release();
+    }
+
+    // Blur render pass
+    printf_s("[XNFS] ▶️ Running RenderBlurPass\n");
+    RenderBlurPass(device, it->second);
+
+    return oEndScene(device);
+}
+
+
+HRESULT WINAPI hkEndScene1(LPDIRECT3DDEVICE9 device)
+{
     printf_s("[XNFS] 🎥 hkEndScene called\n");
 
     if (!g_Device)
@@ -541,15 +656,6 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RE
         printf_s("[XNFS] ✅ hkEndScene installed via HookedPresent\n");
     }
 
-    if (!oReset)
-    {
-        DWORD oldProtect;
-        oReset = reinterpret_cast<Reset_t>(vtable[16]);
-        VirtualProtect(&vtable[16], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[16] = reinterpret_cast<void*>(&hkReset);
-        VirtualProtect(&vtable[16], sizeof(void*), oldProtect, &oldProtect);
-        printf_s("[XNFS] ✅ hkReset installed via HookedPresent\n");
-    }
     return RealPresent(device, src, dest, hwnd, dirty);
 }
 
