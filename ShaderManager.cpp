@@ -685,6 +685,7 @@ void ReleaseAllActiveEffects()
     g_ActiveEffects.clear();
 }
 
+// Hooked D3DXCreateEffectFromResourceA
 HRESULT WINAPI HookedCreateFromResource(
     LPDIRECT3DDEVICE9 device,
     HMODULE hModule,
@@ -1570,47 +1571,36 @@ void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
         {
             printf_s("[HotReload] 🔁 Applying shader and reset for vtObject = %p\n", vtObject);
 
-            bool validFx = g_LastReloadedFx && g_LastReloadedFx->GetEffect() &&
-                reinterpret_cast<uintptr_t>(g_LastReloadedFx.get()) != 0xAAAAAAAA;
-
-            if (!validFx)
+            if (!g_LastReloadedFx->GetEffect() || reinterpret_cast<uintptr_t>(g_LastReloadedFx.get()) < 0x10000)
             {
                 printf_s("[HotReload] ❌ g_LastReloadedFx is invalid or corrupted — skipping\n");
+                return;
+            }
+
+            // ✅ Force-slot into g_SlotRetainedFx[62] before any use
+            g_SlotRetainedFx[62] = g_LastReloadedFx;
+            g_SlotRetainedFx[62]->AddRef(); // Retain explicitly
+
+            printf_s("[Patch] ✅ g_SlotRetainedFx[62] initialized with g_LastReloadedFx = %p\n", g_LastReloadedFx.get());
+
+            // 🔄 Attempt to patch vtObject +0x18C using the freshly retained shader
+            TryPatchSlotIfWritable(vtObject, 0x18C, g_LastReloadedFx);
+
+            // ✅ Reload handles safely
+            if (SafeReloadFx(g_LastReloadedFx, "ApplyGraphicsSettings"))
+            {
+                if (g_pVisualTreatment && *g_pVisualTreatment)
+                {
+                    IVisualTreatment_Reset(*g_pVisualTreatment);
+                    printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+                }
             }
             else
             {
-                auto& slotFx = g_SlotRetainedFx[62];
-                uintptr_t rawPtr = reinterpret_cast<uintptr_t>(slotFx ? slotFx->GetEffect() : 0);
-
-                if (rawPtr < 0x10000 || rawPtr == 0x3f800000 || !IsValidShaderPointer(slotFx))
-                {
-                    printf_s("[Patch] ❌ g_SlotRetainedFx[62] is corrupted or null (fx=0x%08X) — skipping patch\n",
-                             (unsigned)rawPtr);
-                    return;
-                }
-
-
-                printf_s("[Debug] 📦 Using g_SlotRetainedFx[62] = %p\n", (void*)rawPtr);
-                // 0x18C / 4 = 62
-
-                TryPatchSlotIfWritable(vtObject, 0x18C, g_LastReloadedFx);
-
-                // ✅ Safely reload handles now
-                if (SafeReloadFx(g_LastReloadedFx, "ApplyGraphicsSettings"))
-                {
-                    if (g_pVisualTreatment && *g_pVisualTreatment)
-                    {
-                        IVisualTreatment_Reset(*g_pVisualTreatment);
-                        printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
-                    }
-                }
-                else
-                {
-                    printf_s("[HotReload] ❌ ReloadHandles failed — skipping Reset\n");
-                }
-
-                lastPatchedThis = vtObject;
+                printf_s("[HotReload] ❌ ReloadHandles failed — skipping Reset\n");
             }
+
+            lastPatchedThis = vtObject;
         }
 
         LogApplyGraphicsSettingsCall(manager, vtObject, 2);
