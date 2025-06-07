@@ -1,5 +1,4 @@
 #include "Hooks.h"
-
 using namespace std;
 
 #pragma runtime_checks( "", off )
