@@ -1,5 +1,7 @@
 #include "Hooks.h"
+#include "globals.h"
 #include "ShaderManager.h"
+#include "RenderTargetManager.h"
 #include <algorithm>
 #include <atomic>
 #include <windows.h>
@@ -19,71 +21,20 @@
 
 // Define a cast macro that allows old std::shared_ptr<FxWrapper> to be used with minimal refactoring
 // #define FX(x) ((std::shared_ptr<FxWrapper>)(x))
-const int ShaderTableSize = 62;
-
-static std::shared_ptr<FxWrapper>* g_ShaderTable = (std::shared_ptr<FxWrapper>*)SHADER_TABLE_ADDRESS;
-// NFS MW shader g_ShaderTable
-std::mutex g_ShaderTableLock = std::mutex();
-std::unordered_map<std::string, std::shared_ptr<FxWrapper>> g_DebugLiveEffects;
-std::unordered_set<ID3DXEffect*> g_AlreadyInjectedFxThisFrame;
 
 ShaderManager::PresentFn ShaderManager::RealPresent = nullptr;
 
-
-bool g_WaitingForReset = false;
-bool g_ApplyGraphicsSeenThisFrame = false;
-bool g_CallApplyGraphicsManagerNextFrame = false;
-int g_ApplyGraphicsTriggerDelay = 0;
-bool g_ResumeGameThreadNextPresent = false;
-
-bool g_EnableShaderTableDump = false;
-void* g_LiveVisualTreatmentObject = nullptr;
-// Map from shader resource name to fallback slot
-std::unordered_map<std::string, int> g_DynamicFallbackSlots;
-
-bool g_PendingVisualReset = false;
-
-ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal = nullptr; // ✅ definition
-ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal = nullptr; // ✅ definition
-IVisualTreatment_ResetFn IVisualTreatment_Reset = (IVisualTreatment_ResetFn)0x0073DE50;
-void* g_ApplyGraphicsManagerThis = nullptr;
-void* g_ApplyGraphicsSettingsThis = nullptr;
-
-struct QueuedPatch
-{
-    int slot = -1;
-    std::shared_ptr<FxWrapper> fx;
-    int framesRemaining = 2; // safe delay
-    std::string resourceName;
-    
-};
-
-std::unordered_map<std::string, std::vector<char>> g_ShaderBuffers;
-std::vector<QueuedPatch> g_PendingPatches;
-std::shared_ptr<FxWrapper> g_SlotRetainedFx[64] = {};
-
-std::mutex g_PatchMutex;
-std::unordered_map<std::string, std::string> g_ShaderOverridePaths;
-std::unordered_set<std::string> g_FxOverrides;
-
-static std::atomic<int> g_HookCallCount{0};
-std::atomic<bool> g_TriggerApplyGraphicsSettings = false;
-
-std::atomic<bool> g_PausePresent{false};
-std::atomic<bool> g_PresentIsWaiting{false};
 
 // -------------------- NFSMW-RenderTarget block --------------------
 
 LPDIRECT3DTEXTURE9 g_MotionBlurTex = nullptr;
 LPDIRECT3DSURFACE9 g_MotionBlurSurface = nullptr;
 
-std::unordered_map<std::string, std::shared_ptr<FxWrapper>> g_ActiveEffects;
-
 void* g_LastEView = nullptr;
 
 typedef void (__thiscall*UpdateFunc)(void* thisptr, void* eView);
 typedef void (__thiscall*FrameRenderFn)(void* thisptr);
-FrameRenderFn ForceFrameRender = (FrameRenderFn)0x006DE300;
+FrameRenderFn ForceFrameRender = (FrameRenderFn)FrameRenderFn_ADDR;
 
 UpdateFunc OriginalUpdate = nullptr;
 
@@ -157,9 +108,6 @@ void OnDeviceLost()
 
     printf_s("[OnDeviceLost] Released motion blur resources\n");
 }
-
-typedef HRESULT (WINAPI*Reset_t)(LPDIRECT3DDEVICE9, D3DPRESENT_PARAMETERS*);
-Reset_t oReset = nullptr;
 
 HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
 {
@@ -1421,12 +1369,15 @@ bool TryApplyGraphicsSettingsSafely()
                 if (!IsBadWritePtr((BYTE*)obj + offset, sizeof(FxWrapper*)))
                 {
                     SafePatchShaderTable(offset / 4, g_LastReloadedFx);
+        
                     if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
                     {
                         printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
                         continue;
                     }
-                    g_LastReloadedFx->ReloadHandles();
+
+                    g_LastReloadedFx->ReloadHandles(); // ✅ First
+                    g_RenderTargetManager.ReloadBlurBindings(g_LastReloadedFx->GetEffect(), "IDI_VISUALTREATMENT_FX"); // ✅ Then
                 }
                 else
                 {
@@ -1622,7 +1573,7 @@ void __fastcall HookedUpdate(void* thisptr, void*, void* eView)
     if (OriginalUpdate)
         OriginalUpdate(thisptr, eView);
     else
-        ((UpdateFunc)0x0074C000)(thisptr, eView); // Fallback to original address
+        ((UpdateFunc)Update_16IVisualTreatmentP5eView_ADDRESS)(thisptr, eView); // Fallback to original address
 }
 
 HRESULT TryFullGraphicsReset()
@@ -1630,14 +1581,14 @@ HRESULT TryFullGraphicsReset()
     static bool hookInstalled = false;
     if (!hookInstalled)
     {
-        injector::MakeCALL(0x006DE299, HookedUpdate, true);
+        injector::MakeCALL(call_sub_6E2F50_ADDRESS, HookedUpdate, true);
         hookInstalled = true;
     }
 
     if (!g_LastEView)
     {
-        g_LastEView = *(void**)EViewsBase;
-        printf_s("[Fallback] Using eViews[0] from 0x009195E0 → %p\n", g_LastEView);
+        g_LastEView = *(void**)EViewsBase_ADDRESS;
+        printf_s("[Fallback] Using eViews[0] from LoadedFlagMaybe_ADDRESS → %p\n", g_LastEView);
     }
 
     if (!g_LastEView || !g_pVisualTreatment || !*g_pVisualTreatment)
@@ -1742,8 +1693,8 @@ HRESULT TryFullGraphicsReset()
         printf_s("[HotReload] 🧪 Performed dummy draw to rebind device state\n");
     }
 
-    *(BYTE*)0x00982C39 = 1;
-    printf_s("[HotReload] ✅ Set LoadedFlagMaybe = 1 (0x00982C39)\n");
+    *(BYTE*)LoadedFlagMaybe_ADDRESS = 1;
+    printf_s("[HotReload] ✅ Set LoadedFlagMaybe = 1 (LoadedFlagMaybe_ADDRESS)\n");
 
     if (ForceFrameRender && g_ApplyGraphicsManagerThis)
     {
@@ -1777,12 +1728,11 @@ HRESULT TryFullGraphicsReset()
     return S_OK;
 }
 
-static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
+static bool InjectSharedTextures(IDirect3DDevice9* device)
 {
     static thread_local int callDepth = 0;
     static thread_local bool inProgress = false;
 
-    // Prevent re-entry or stack explosion
     if (inProgress || callDepth > 10)
     {
         if (callDepth > 10)
@@ -1839,25 +1789,12 @@ static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
             if (!e || g_AlreadyInjectedFxThisFrame.count(e)) continue;
 
             fx->ReloadHandles();
+            g_RenderTargetManager.ReloadBlurBindings(e, name);  // ✅ Replaces manual texture setup
 
-            D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-            D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
+            if (frameCounter % 60 == 0)
+                printf_s("[ShaderManager] ✅ Injected blur bindings into: %s\n", name.c_str());
 
-            HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
-            D3DXVECTOR4 blurParams(0.5f, 0.3f, 1.0f, 0.0f);
-            HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &blurParams) : E_FAIL;
-
-            if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
-            {
-                if (frameCounter % 60 == 0)
-                    printf_s("[ShaderManager] ✅ Set motion blur texture in: %s\n", name.c_str());
-                g_AlreadyInjectedFxThisFrame.insert(e);
-            }
-            else
-            {
-                printf_s("[ShaderManager] ❌ Failed to inject into: %s (hr1=0x%08X, hr2=0x%08X)\n",
-                         name.c_str(), hr1, hr2);
-            }
+            g_AlreadyInjectedFxThisFrame.insert(e);
         }
 
         // Handle g_LastReloadedFx separately
@@ -1867,28 +1804,16 @@ static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
             if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
             {
                 printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
-                return result;
+                break;
             }
+
             g_LastReloadedFx->ReloadHandles();
+            g_RenderTargetManager.ReloadBlurBindings(e, "IDI_VISUALTREATMENT_FX"); // or pass a dynamic name
 
-            D3DXHANDLE texHandle = e->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-            D3DXHANDLE blurHandle = e->GetParameterByName(nullptr, "BlurParams");
+            if (frameCounter % 60 == 0)
+                printf_s("[ShaderManager] ✅ Injected blur bindings into: g_LastReloadedFx\n");
 
-            HRESULT hr1 = texHandle ? e->SetTexture(texHandle, g_MotionBlurTex) : E_FAIL;
-            D3DXVECTOR4 blurParams(0.5f, 0.3f, 1.0f, 0.0f);
-            HRESULT hr2 = blurHandle ? e->SetVector(blurHandle, &blurParams) : E_FAIL;
-
-            if (SUCCEEDED(hr1) && SUCCEEDED(hr2))
-            {
-                if (frameCounter % 60 == 0)
-                    printf_s("[ShaderManager] ✅ Set motion blur texture in: g_LastReloadedFx\n");
-                g_AlreadyInjectedFxThisFrame.insert(e);
-            }
-            else
-            {
-                printf_s("[ShaderManager] ❌ Failed to inject into g_LastReloadedFx (hr1=0x%08X, hr2=0x%08X)\n", hr1,
-                         hr2);
-            }
+            g_AlreadyInjectedFxThisFrame.insert(e);
         }
 
         result = true;
@@ -1898,90 +1823,6 @@ static bool InjectSharedTextures(IDirect3DDevice9* /*unused*/)
     inProgress = false;
     --callDepth;
     return result;
-}
-
-bool InjectSharedTextures2(IDirect3DDevice9* device)
-{
-    if (!device)
-        return false;
-
-    if (!g_MotionBlurTex && !CreateMotionBlurResources(device))
-        return false;
-
-    // Inject into all active effects
-    for (auto& [name, fx] : g_ActiveEffects)
-    {
-        std::shared_ptr<FxWrapper> effect = fx;
-        if (!effect)
-            continue;
-
-        fx->ReloadHandles(); // Reload after hot-reload
-
-        // ✅ 3. Validate handles before SetTexture/SetVector
-        D3DXHANDLE texHandle = effect->GetEffect()->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-        D3DXHANDLE blurHandle = effect->GetEffect()->GetParameterByName(nullptr, "BlurParams");
-
-        HRESULT hr1 = texHandle ? effect->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-        HRESULT hr2 = blurHandle
-                          ? effect->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
-                          : E_POINTER;
-
-        if (FAILED(hr1) || FAILED(hr2))
-        {
-            printf_s("[ShaderManager] ⚠️ Failed to set one or more params in %s (retrying ReloadHandles)\n",
-                     name.c_str());
-            fx->ReloadHandles(); // ✅ point 4 — force handle reset
-            texHandle = effect->GetEffect()->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-            blurHandle = effect->GetEffect()->GetParameterByName(nullptr, "BlurParams");
-
-            if (!g_MotionBlurTex || !fx->GetEffect())
-                continue;
-
-            hr1 = texHandle ? effect->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-            hr2 = blurHandle
-                      ? effect->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
-                      : E_POINTER;
-        }
-    }
-
-    // Inject into hot-reloaded shader directly
-    if (g_LastReloadedFx && IsValidShaderPointer(g_LastReloadedFx))
-    {
-        std::shared_ptr<FxWrapper> fx = g_LastReloadedFx;
-        if (fx)
-        {
-            D3DXHANDLE texHandle = fx->GetEffect()->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-            D3DXHANDLE blurHandle = fx->GetEffect()->GetParameterByName(nullptr, "BlurParams");
-
-            HRESULT hr1 = texHandle ? fx->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-            HRESULT hr2 = blurHandle
-                              ? fx->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
-                              : E_POINTER;
-
-            if (FAILED(hr1) || FAILED(hr2))
-            {
-                printf_s("[ShaderManager] ⚠️ Failed to set params on hot-reloaded effect, reloading handles...\n");
-                if (!g_LastReloadedFx || !g_LastReloadedFx->IsValid())
-                {
-                    printf_s("[Error] ❌ g_LastReloadedFx is invalid before ReloadHandles\n");
-                    return false;
-                }
-                g_LastReloadedFx->ReloadHandles();
-                texHandle = fx->GetEffect()->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-                blurHandle = fx->GetEffect()->GetParameterByName(nullptr, "BlurParams");
-
-                if (fx && g_MotionBlurTex)
-                {
-                    hr1 = texHandle ? fx->GetEffect()->SetTexture(texHandle, g_MotionBlurTex) : E_POINTER;
-                    hr2 = blurHandle
-                              ? fx->GetEffect()->SetVector(blurHandle, &D3DXVECTOR4(0.5f, 0.3f, 1.0f, 0.0f))
-                              : E_POINTER;
-                }
-            }
-        }
-    }
-
-    return true;
 }
 
 void ApplyShaderAndResetAll()

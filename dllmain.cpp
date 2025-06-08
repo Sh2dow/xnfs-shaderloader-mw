@@ -1,18 +1,18 @@
 ﻿#include "Hooks.h"
+#include "globals.h"
 #include "ShaderManager.h"
-#include "dllmain.h"
 #include <windows.h>
 #include <d3d9.h>
 #include <cstdio>
 #include "includes/injector/injector.hpp"
 #include <mutex>
-
-#include "Validators.h"
 #define printf_s(...) asi_log::Log(__VA_ARGS__)
 
 // -------------------- GLOBALS --------------------
 int g_ApplyDelayCounter = 0;
 bool g_ApplyScheduled = false;
+
+// End of Init globals 
 
 DWORD WINAPI DeferredHookThread(LPVOID)
 {
@@ -91,13 +91,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         {
             void* addr = GetProcAddress(d3dx, "D3DXCreateEffectFromResourceA");
             RealCreateFromResource = (D3DXCreateEffectFromResourceAFn)addr;
-            injector::MakeCALL(0x006C60D2, HookedCreateFromResource, true);
+            injector::MakeCALL(call_D3DXCreateEffectFromResourceA_ADDRESS, HookedCreateFromResource, true);
 
-            ApplyGraphicsManagerMainOriginal = (decltype(ApplyGraphicsManagerMainOriginal))0x004F17F0;
-            printf_s("[Init] ApplyGraphicsManagerMainOriginal set to 0x004F17F0\n");
+            ApplyGraphicsManagerMainOriginal = (decltype(ApplyGraphicsManagerMainOriginal))call_ApplyGraphicsManagerMainOriginal_ADDRESS;
+            printf_s("[Init] ApplyGraphicsManagerMainOriginal set to call_ApplyGraphicsManagerMainOriginal_ADDRESS\n");
 
-            ApplyGraphicsSettingsOriginal = reinterpret_cast<ApplyGraphicsSettingsFn>(0x004EA0D0);
-            injector::MakeCALL(0x004F186E, HookApplyGraphicsSettings, true);
+            ApplyGraphicsSettingsOriginal = reinterpret_cast<ApplyGraphicsSettingsFn>(sub_ApplyGraphicsSettingsFn_ADDRESS);
+            injector::MakeCALL(call_ApplyGraphicsSettingsFn_ADDRESS, HookApplyGraphicsSettings, true);
 
             CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)HotkeyThread, nullptr, 0, nullptr);
             CreateThread(nullptr, 0, DeferredHookThread, nullptr, 0, nullptr);

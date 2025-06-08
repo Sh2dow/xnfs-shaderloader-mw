@@ -1,35 +1,58 @@
 #pragma once
 #include <atomic>
+#include <d3d9.h>
+#include <d3dx9math.h>
 #include <vector>
-#include "FxWrapper.h"
 
 #if _DEBUG
 #include "Log.h"
 #define printf_s(...) asi_log::Log(__VA_ARGS__)
 #endif
 
-#define GLOBAL_D3DDEVICE 0x00982BDC
+// #define GLOBAL_D3DDEVICE 0x00982BDC
+constexpr uintptr_t GLOBAL_D3DDEVICE = 0x00982BDC;
 
 inline LPDIRECT3DDEVICE9 GetGameDevice()
 {
     return *(LPDIRECT3DDEVICE9*)GLOBAL_D3DDEVICE;
 }
 
-inline void SetGameDevice(LPDIRECT3DDEVICE9 device)
-{
-    *(LPDIRECT3DDEVICE9*)GLOBAL_D3DDEVICE = device;
-}
-
 inline LPDIRECT3DDEVICE9& g_Device = *(LPDIRECT3DDEVICE9*)GLOBAL_D3DDEVICE;
 
+// inline void SetGameDevice(LPDIRECT3DDEVICE9 device)
+// {
+//     *(LPDIRECT3DDEVICE9*)GLOBAL_D3DDEVICE = device;
+// }
+
+inline void SetGameDevice(LPDIRECT3DDEVICE9 device)
+{
+    if (device && !IsBadReadPtr(device, 4))
+        g_Device = device;
+}
+
+typedef HRESULT (WINAPI*PresentFn)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, HWND, const RGNDATA*);
+static PresentFn RealPresent = nullptr;
+
+constexpr uintptr_t FrameRenderFn_ADDR = 0x006DE300;
 constexpr uintptr_t GAMEFLOWSTATUS_ADDR = 0x00925E90;
 constexpr uintptr_t FASTMEM_ADDR = 0x00925B30;
 constexpr uintptr_t NISINSTANCE_ADDR = 0x009885C8;
-constexpr uintptr_t WORLDPRELITSHADER_OBJ_ADDR = 0x93DEBC;
+constexpr uintptr_t WORLDPRELITSHADER_OBJ_ADDR = 0x0093DEBC;
 constexpr uintptr_t CURRENTSHADER_OBJ_ADDR = 0x00982C80;
+constexpr uintptr_t SHADER_CLEANUP_TABLE_ADDRESS = 0x0093DAB8; // inferred
 constexpr uintptr_t SHADER_TABLE_ADDRESS = 0x0093DE78;
 constexpr uintptr_t WORLDSHADER_TABLE_ADDRESS = 0x008F9B60;
-constexpr uintptr_t EViewsBase = 0x009195E0; // Replace old guess 0x008FAF30
+constexpr uintptr_t EViewsBase_ADDRESS = 0x009195E0; // Replace old guess 0x008FAF30
+constexpr uintptr_t pVisualTreatmentPlat_ADDRESS = 0x00982AF0;
+constexpr uintptr_t Reset_16IVisualTreatment_ADDRESS = 0x0073DE50;
+constexpr uintptr_t LoadedFlagMaybe_ADDRESS = 0x00982C39;
+constexpr uintptr_t call_D3DXCreateEffectFromResourceA_ADDRESS = 0x006C60D2;
+constexpr uintptr_t call_ApplyGraphicsManagerMainOriginal_ADDRESS = 0x004F17F0;
+constexpr uintptr_t sub_ApplyGraphicsSettingsFn_ADDRESS = 0x004EA0D0;
+constexpr uintptr_t call_ApplyGraphicsSettingsFn_ADDRESS = 0x004F186E;
+constexpr uintptr_t Update_16IVisualTreatmentP5eView_ADDRESS = 0x0074C000;
+constexpr uintptr_t call_sub_6E2F50_ADDRESS = 0x006DE299;
+
 
 #define FRAMECOUNTER_ADDR 0x00982B78
 #define eFrameCounter *(uint32_t*)FRAMECOUNTER_ADDR
@@ -52,6 +75,25 @@ extern ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal; // ✅ extern = DE
 
 typedef int (__thiscall*ApplyGraphicsManagerMain_t)(void* thisptr);
 extern ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal;
+
+typedef HRESULT (WINAPI*Reset_t)(LPDIRECT3DDEVICE9, D3DPRESENT_PARAMETERS*);
+
+typedef HRESULT (WINAPI*Present_t)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, HWND, const RGNDATA*);
+extern Present_t oPresent;
+
+using EndScene_t = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9);
+inline EndScene_t oEndScene = nullptr;
+
+HRESULT WINAPI HookedCreateFromResource(
+    LPDIRECT3DDEVICE9 device,
+    HMODULE hModule,
+    LPCSTR pResource,
+    const D3DXMACRO* defines,
+    LPD3DXINCLUDE include,
+    DWORD flags,
+    LPD3DXEFFECTPOOL pool,
+    LPD3DXEFFECT* outEffect,
+    LPD3DXBUFFER* outErrors);
 
 extern bool g_WaitingForReset;
 extern int g_ApplyGraphicsTriggerDelay;

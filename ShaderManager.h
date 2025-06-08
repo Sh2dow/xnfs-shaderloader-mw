@@ -58,19 +58,6 @@ inline void ReleaseMotionBlurTexture();
 inline void* GetFirstIVisualTreatmentObject();
 inline bool IsLikelyApplyGraphicsSettingsObject(void* candidate);
 
-inline static void* lastPatchedThis = nullptr;
-inline std::shared_ptr<FxWrapper> g_LastReloadedFx = nullptr;
-
-static bool compiled = false;
-inline void* g_ThisCandidates[3] = {};
-inline int g_ThisCount = 0;
-inline void* g_LatestEView;
-inline unsigned g_FrameId;
-inline unsigned g_LastApplySeenFrame;
-inline void** g_pVisualTreatment = (void**)0x00982AF0;
-inline std::pair<void*, int> lastKey;
-inline int repeatCount;
-
 typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
     LPDIRECT3DDEVICE9, HMODULE, LPCSTR, const D3DXMACRO*,
     LPD3DXINCLUDE, DWORD, LPD3DXEFFECTPOOL, LPD3DXEFFECT*, LPD3DXBUFFER*);
@@ -97,7 +84,7 @@ extern HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
 // -------------------- NFSMW-RenderTarget block --------------------
 
 typedef HRESULT (WINAPI*Reset_t)(LPDIRECT3DDEVICE9, D3DPRESENT_PARAMETERS*);
-extern Reset_t oReset;
+inline Reset_t oReset;
 extern HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params);
 
 

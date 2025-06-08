@@ -95,11 +95,12 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="dllmain.h" />
     <ClInclude Include="FxWrapper.h" />
+    <ClInclude Include="globals.h" />
     <ClInclude Include="Hooks.cpp" />
     <ClInclude Include="Hooks.h" />
     <ClInclude Include="Log.h" />
+    <ClInclude Include="RenderTargetManager.h" />
     <ClInclude Include="ShaderManager.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="targetver.h" />
@@ -115,6 +116,7 @@
       </PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="FxWrapper.cpp" />
+    <ClCompile Include="RenderTargetManager.cpp" />
     <ClCompile Include="ShaderManager.cpp" />
     <ClCompile Include="stdafx.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
