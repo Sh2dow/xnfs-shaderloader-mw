@@ -139,7 +139,7 @@ void VisualTreatment_Reset()
                     g_RenderTargetManager.g_LastReloadedFx = nullptr;
                 }
 
-                for (int i = 0; i < 64; i++)
+                for (int i = 0; i < 62; i++)
                 {
                     if (g_SlotRetainedFx[i] == *fxSlot)
                         g_SlotRetainedFx[i] = nullptr;
@@ -368,6 +368,11 @@ HRESULT WINAPI HookedCreateFromResource(
         existingFx = *outEffect;
         (*outEffect)->AddRef(); // Retain since we're storing it
         printf_s("✅ Shader created and tracked: %s (%p)\n", pResource, *outEffect);
+        SAFE_RELEASE(g_RenderTargetManager.g_BlurEffect);
+        if (FAILED((*outEffect)->CloneEffect(device, &g_RenderTargetManager.g_BlurEffect)))
+        {
+            printf_s("[XNFS] ?? CloneEffect failed for %s\\n", pResource);
+        }
 
         if (g_RenderTargetManager.g_CurrentBlurTex)
         {
@@ -428,9 +433,16 @@ void RenderBlurPass(IDirect3DDevice9* device)
 {
     if (!device || !g_RenderTargetManager.g_CurrentBlurTex) return;
 
-    auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-    if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second)) return;
-    ID3DXEffect* fx = it->second;
+    ID3DXEffect* fx = g_RenderTargetManager.g_BlurEffect;
+    if (!fx)
+    {
+        auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
+        if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
+            return;
+        if (FAILED(it->second->CloneEffect(device, &g_RenderTargetManager.g_BlurEffect)))
+            return;
+        fx = g_RenderTargetManager.g_BlurEffect;
+    }
 
     IDirect3DSurface9* oldRT = nullptr;
     if (FAILED(device->GetRenderTarget(0, &oldRT)) || !oldRT) return;
@@ -466,28 +478,50 @@ void RenderBlurPass(IDirect3DDevice9* device)
 
     device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(255, 255, 0, 255), 1.0f, 0);
 
-    // setup shader…
-    fx->SetTexture("DIFFUSEMAP_TEXTURE", srcTex);
-    D3DXVECTOR4 blurParams(0.5f, 0.0005f, 0.0f, 0.0f);
-    fx->SetVector("BlurParams", &blurParams);
+    D3DXHANDLE hBlurParams = fx->GetParameterByName(nullptr, "BlurParams");
+    D3DXHANDLE hMiscMap3 = fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
+
+    IDirect3DBaseTexture9* oldMiscMap3 = nullptr;
+    D3DXVECTOR4 oldBlurParams{};
+    bool haveOldBlurParams = false;
+
+    if (hMiscMap3)
+        fx->GetTexture(hMiscMap3, &oldMiscMap3);
+    if (hBlurParams && SUCCEEDED(fx->GetVector(hBlurParams, &oldBlurParams)))
+        haveOldBlurParams = true;
+
+    // setup shader:
+    if (hMiscMap3)
+        fx->SetTexture(hMiscMap3, srcTex);
+    if (hBlurParams)
+    {
+        D3DXVECTOR4 blurParams(0.5f, 0.0005f, 0.0f, 0.0f);
+        fx->SetVector(hBlurParams, &blurParams);
+    }
 
     D3DXHANDLE tech = fx->GetTechniqueByName("visualtreatment_branching");
     if (!tech || FAILED(fx->SetTechnique(tech))) goto cleanup;
 
+    D3DXHANDLE oldTech = fx->GetCurrentTechnique();
     device->SetRenderState(D3DRS_ZENABLE, FALSE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-    device->SetRenderState(D3DRS_COLORWRITEENABLE,
-        D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_ALPHA);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 
     if (UINT passes = 0; SUCCEEDED(fx->Begin(&passes, 0))) {
         for (UINT i = 0; i < passes; ++i) {
             if (SUCCEEDED(fx->BeginPass(i))) {
+                RenderTargetManager::Vertex vertices[4] = {
+                    {-0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f},
+                    {(float)g_RenderTargetManager.g_Width - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f},
+                    {-0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f},
+                    {(float)g_RenderTargetManager.g_Width - 0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f,
+                     1.0f, 1.0f, 1.0f},
+                };
                 device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
                 device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2,
-                    g_RenderTargetManager.screenQuadVerts,
-                    sizeof(RenderTargetManager::Vertex));
+                    vertices, sizeof(RenderTargetManager::Vertex));
                 fx->EndPass();
             }
         }
@@ -495,6 +529,15 @@ void RenderBlurPass(IDirect3DDevice9* device)
     }
 
 cleanup:
+    if (hMiscMap3)
+        fx->SetTexture(hMiscMap3, oldMiscMap3);
+    if (oldMiscMap3)
+        oldMiscMap3->Release();
+    if (hBlurParams && haveOldBlurParams)
+        fx->SetVector(hBlurParams, &oldBlurParams);
+    if (oldTech)
+        fx->SetTechnique(oldTech);
+
     // 🔁 Restore previous RT and viewport
     device->SetRenderTarget(0, oldRT);
     device->SetViewport(&savedVP);
@@ -513,9 +556,16 @@ void RenderBlurCompositePass(IDirect3DDevice9* device)
 {
     if (!device || !g_RenderTargetManager.g_CurrentBlurTex) return;
 
-    auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-    if (it == g_RenderTargetManager.g_ActiveEffects.end() || !IsValidShaderPointer(it->second)) return;
-    ID3DXEffect* fx = it->second;
+    ID3DXEffect* fx = g_RenderTargetManager.g_BlurEffect;
+    if (!fx)
+    {
+        auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
+        if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
+            return;
+        if (FAILED(it->second->CloneEffect(device, &g_RenderTargetManager.g_BlurEffect)))
+            return;
+        fx = g_RenderTargetManager.g_BlurEffect;
+    }
 
     IDirect3DSurface9* backBuffer = nullptr;
     if (FAILED(device->GetRenderTarget(0, &backBuffer)) || !backBuffer) return;
@@ -536,6 +586,7 @@ void RenderBlurCompositePass(IDirect3DDevice9* device)
 
     device->SetRenderTarget(0, backBuffer); // (already is, but explicit is fine)
 
+    D3DXHANDLE oldTech = fx->GetCurrentTechnique();
     // Technique safety: validate exists
     D3DXHANDLE tech = fx->GetTechniqueByName("composite_blur");
     if (!tech || FAILED(fx->ValidateTechnique(tech)) || FAILED(fx->SetTechnique(tech))) {
@@ -545,34 +596,46 @@ void RenderBlurCompositePass(IDirect3DDevice9* device)
         return;
     }
 
-    fx->SetTexture("DIFFUSEMAP_TEXTURE", g_RenderTargetManager.g_CurrentBlurTex);
+    D3DXHANDLE hMiscMap3 = fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
 
-    static IDirect3DTexture9* dummy = GetDummyWhiteTexture(device);
-    fx->SetTexture("MISCMAP1_TEXTURE", g_RenderTargetManager.g_GainMapTex     ? g_RenderTargetManager.g_GainMapTex     : dummy);
-    fx->SetTexture("MISCMAP2_TEXTURE", g_RenderTargetManager.g_VignetteTex    ? g_RenderTargetManager.g_VignetteTex    : dummy);
-    fx->SetTexture("MISCMAP3_TEXTURE", g_RenderTargetManager.g_BloomTex       ? g_RenderTargetManager.g_BloomTex       : dummy);
-    fx->SetTexture("MISCMAP4_TEXTURE", g_RenderTargetManager.g_DofTex         ? g_RenderTargetManager.g_DofTex         : dummy);
-    fx->SetTexture("HEIGHTMAP_TEXTURE", g_RenderTargetManager.g_LinearDepthTex? g_RenderTargetManager.g_LinearDepthTex : dummy);
+    IDirect3DBaseTexture9* oldMiscMap3 = nullptr;
+
+    if (hMiscMap3)
+        fx->GetTexture(hMiscMap3, &oldMiscMap3);
+
+    fx->SetTexture("MISCMAP3_TEXTURE", g_RenderTargetManager.g_CurrentBlurTex);
 
     device->SetRenderState(D3DRS_ZENABLE, FALSE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-    device->SetRenderState(D3DRS_COLORWRITEENABLE,
-        D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_ALPHA);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 
     if (UINT passes = 0; SUCCEEDED(fx->Begin(&passes, 0))) {
         for (UINT i = 0; i < passes; ++i) {
             if (SUCCEEDED(fx->BeginPass(i))) {
+                RenderTargetManager::Vertex vertices[4] = {
+                    {-0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f},
+                    {(float)g_RenderTargetManager.g_Width - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f},
+                    {-0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f},
+                    {(float)g_RenderTargetManager.g_Width - 0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f,
+                     1.0f, 1.0f, 1.0f},
+                };
                 device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
                 device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2,
-                    g_RenderTargetManager.screenQuadVerts,
-                    sizeof(RenderTargetManager::Vertex));
+                    vertices, sizeof(RenderTargetManager::Vertex));
                 fx->EndPass();
             }
         }
         fx->End();
     }
+
+    if (hMiscMap3)
+        fx->SetTexture(hMiscMap3, oldMiscMap3);
+    if (oldMiscMap3)
+        oldMiscMap3->Release();
+    if (oldTech)
+        fx->SetTechnique(oldTech);
 
     // 🔁 Restore viewport
     device->SetViewport(&savedVP);
@@ -585,9 +648,9 @@ HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
         return D3DERR_INVALIDCALL;
 
     HRESULT coop = device->TestCooperativeLevel();
-    if (coop != D3DERR_DEVICENOTRESET)
+    if (coop == D3DERR_DEVICELOST)
     {
-        printf_s("[XNFS] ❌ Device not ready for Reset, TestCooperativeLevel = 0x%08X\n", coop);
+        printf_s("[XNFS] ? Device still lost, TestCooperativeLevel = 0x%08X\\n", coop);
         return coop;
     }
 
@@ -656,9 +719,12 @@ HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
         !g_RenderTargetManager.g_MotionBlurTexB)
         return oEndScene(device);
 
-    auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-    if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
-        return oEndScene(device);
+    if (!g_RenderTargetManager.g_BlurEffect)
+    {
+        auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
+        if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
+            return oEndScene(device);
+    }
 
     // 🔒 Save ALL render state (including viewport) and restore on exit
     ScopedStateBlock _sb(device);
@@ -995,7 +1061,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             g_RenderTargetManager.g_LastReloadedFx = nullptr;
         }
 
-        for (int i = 0; i < 64; ++i)
+        for (int i = 0; i < 62; ++i)
         {
             if (g_SlotRetainedFx[i])
             {

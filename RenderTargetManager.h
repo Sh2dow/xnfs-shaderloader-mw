@@ -19,6 +19,7 @@ public:
     void* g_ApplyGraphicsManagerThis = nullptr;
 
     ID3DXEffect* g_LastReloadedFx = nullptr;
+    ID3DXEffect* g_BlurEffect = nullptr;
 
     IDirect3DTexture9* g_MotionBlurTexA = nullptr;
     IDirect3DTexture9* g_MotionBlurTexB = nullptr;

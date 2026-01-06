@@ -17,6 +17,7 @@ void RenderTargetManager::OnDeviceLost()
             fx->OnLostDevice(); // Important for safety
     }
 
+    SAFE_RELEASE(g_BlurEffect)
     SAFE_RELEASE(g_GainMapTex)
     SAFE_RELEASE(g_VignetteTex)
     SAFE_RELEASE(g_BloomTex)
