@@ -17,14 +17,16 @@ void RenderTargetManager::OnDeviceLost()
             fx->OnLostDevice(); // Important for safety
     }
 
-    SAFE_RELEASE(g_GainMapTex);
-    SAFE_RELEASE(g_VignetteTex);
-    SAFE_RELEASE(g_BloomTex);
-    SAFE_RELEASE(g_DofTex);
-    SAFE_RELEASE(g_LinearDepthTex);
-    SAFE_RELEASE(g_ExposureTex);
-    SAFE_RELEASE(g_BloomLUTTex);
-    SAFE_RELEASE(g_DepthTex);
+    SAFE_RELEASE(g_GainMapTex)
+    SAFE_RELEASE(g_VignetteTex)
+    SAFE_RELEASE(g_BloomTex)
+    SAFE_RELEASE(g_DofTex)
+    SAFE_RELEASE(g_LinearDepthTex)
+    SAFE_RELEASE(g_ExposureTex)
+    SAFE_RELEASE(g_BloomLUTTex)
+    SAFE_RELEASE(g_DepthTex)
+    SAFE_RELEASE(g_BackBufferSurface)
+    SAFE_RELEASE(g_LastSceneSurface)
 }
 
 bool RenderTargetManager::OnDeviceReset(LPDIRECT3DDEVICE9 device)

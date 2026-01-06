@@ -52,7 +52,7 @@ bool IsValidShaderPointer_SEH(ID3DXEffect* fx, void*** outVtable, DWORD* outProt
             return false;
 
         void** vtable = *(void***)fx;
-        if (!vtable || IsBadReadPtr(vtable, sizeof(void*)))
+        if (IsBadReadPtr(vtable, sizeof(void*)))
             return false;
 
         MEMORY_BASIC_INFORMATION mbi = {};

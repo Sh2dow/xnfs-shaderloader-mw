@@ -1,4 +1,4 @@
-﻿// dllmain.cpp - Backbuffer hook for NFS MW (2005)
+// dllmain.cpp - Backbuffer hook for NFS MW (2005)
 #include <windows.h>
 #include <iostream>
 #include <filesystem>
@@ -24,16 +24,12 @@
 
 RenderTargetManager g_RenderTargetManager;
 
-typedef void (__fastcall*ApplyGraphicsSettingsFn)(void* ecx, void* edx, void* arg1);
-ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal = nullptr; // ✅ definition
-
-typedef int (__thiscall*ApplyGraphicsManagerMain_t)(void* thisptr);
-ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal = nullptr; // ✅ definition
-
-typedef HRESULT (WINAPI*Reset_t)(LPDIRECT3DDEVICE9, D3DPRESENT_PARAMETERS*);
-
 // IVisualTreatment_Reset block
 void* g_LastEView = nullptr;
+
+void (__fastcall* ApplyGraphicsSettingsOriginal)(void* ecx, void* edx, void* arg1) = nullptr;
+int (__thiscall* ApplyGraphicsManagerMainOriginal)(void* thisptr) = nullptr;
+bool g_WaitingForReset = false;
 
 typedef void (__thiscall*UpdateFunc)(void* thisptr, void* eView);
 typedef void (__cdecl*FrameRenderFn)();
@@ -44,6 +40,20 @@ using IVisualTreatment_ResetFn = void(__thiscall*)(void* thisPtr);
 IVisualTreatment_ResetFn IVisualTreatment_Reset = (IVisualTreatment_ResetFn)Reset_16IVisualTreatment_ADDRESS;
 
 // Helpers
+struct ScopedStateBlock {
+    IDirect3DDevice9* dev = nullptr;
+    IDirect3DStateBlock9* sb = nullptr;
+    ScopedStateBlock(IDirect3DDevice9* d) : dev(d) {
+        if (dev) {
+            dev->CreateStateBlock(D3DSBT_ALL, &sb);
+            if (sb) sb->Capture();
+        }
+    }
+    ~ScopedStateBlock() {
+        if (sb) { sb->Apply(); sb->Release(); }
+    }
+};
+
 
 IDirect3DTexture9* GetDummyWhiteTexture(IDirect3DDevice9* device)
 {
@@ -114,7 +124,7 @@ void VisualTreatment_Reset()
             printf_s("[HotReload] ❌ vt was null in VisualTreatment_Reset() (early)\n");
             return;
         }
-        
+
         // ⚠️ force invalidate ptr+0x140 to trigger rebuild
         void** fx140 = (void**)((char*)vt + 0x140);
         *fx140 = nullptr;
@@ -140,6 +150,8 @@ void VisualTreatment_Reset()
                 *fxSlot = nullptr;
             }
         }
+        else
+            return;
 
         // 🧪 Optional: Add null check if unsure about vt
         if (vt)
@@ -251,7 +263,8 @@ void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name = "")
         return;
     }
 
-    if (!g_RenderTargetManager.g_CurrentBlurTex || IsBadReadPtr(g_RenderTargetManager.g_CurrentBlurTex, sizeof(IDirect3DTexture9)))
+    if (!g_RenderTargetManager.g_CurrentBlurTex || IsBadReadPtr(g_RenderTargetManager.g_CurrentBlurTex,
+                                                                sizeof(IDirect3DTexture9)))
     {
         printf_s("[BlurRebind] ❌ g_CurrentBlurTex is null or invalid\n");
         return;
@@ -328,6 +341,12 @@ HRESULT WINAPI HookedCreateFromResource(
 
     HRESULT hr = g_RenderTargetManager.RealCreateFromResource(
         device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
+
+    if (!g_RenderTargetManager.RealCreateFromResource)
+    {
+        printf_s("❌ RealCreateFromResource was null!\n");
+        return E_FAIL;
+    }
 
     if (FAILED(hr) || !outEffect || !*outEffect)
     {
@@ -407,110 +426,79 @@ void OnDeviceLost()
 
 void RenderBlurPass(IDirect3DDevice9* device)
 {
-    if (!device || !g_RenderTargetManager.g_CurrentBlurTex)
-        return;
+    if (!device || !g_RenderTargetManager.g_CurrentBlurTex) return;
 
-    // Get active shader
     auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-    if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
-        return;
-
+    if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second)) return;
     ID3DXEffect* fx = it->second;
 
-    // Backup current render target
     IDirect3DSurface9* oldRT = nullptr;
-    if (FAILED(device->GetRenderTarget(0, &oldRT)) || !oldRT)
-        return;
+    if (FAILED(device->GetRenderTarget(0, &oldRT)) || !oldRT) return;
 
-    IDirect3DTexture9* srcTex = g_RenderTargetManager.g_UseTexA ? g_RenderTargetManager.g_MotionBlurTexA : g_RenderTargetManager.g_MotionBlurTexB;
-    IDirect3DTexture9* dstTex = g_RenderTargetManager.g_UseTexA ? g_RenderTargetManager.g_MotionBlurTexB : g_RenderTargetManager.g_MotionBlurTexA;
+    // 🔽 Save the CURRENT viewport and restore later
+    D3DVIEWPORT9 savedVP{};
+    device->GetViewport(&savedVP);
+
+    IDirect3DTexture9* srcTex = g_RenderTargetManager.g_UseTexA
+        ? g_RenderTargetManager.g_MotionBlurTexA
+        : g_RenderTargetManager.g_MotionBlurTexB;
+    IDirect3DTexture9* dstTex = g_RenderTargetManager.g_UseTexA
+        ? g_RenderTargetManager.g_MotionBlurTexB
+        : g_RenderTargetManager.g_MotionBlurTexA;
 
     IDirect3DSurface9* dstSurface = nullptr;
-    if (FAILED(dstTex->GetSurfaceLevel(0, &dstSurface)) || !dstSurface)
-    {
+    if (FAILED(dstTex->GetSurfaceLevel(0, &dstSurface)) || !dstSurface) {
         SAFE_RELEASE(oldRT);
         return;
     }
 
-    // Set new render target
     device->SetRenderTarget(0, dstSurface);
-    // D3DVIEWPORT9 vp = {0, 0, g_Width, g_Height, 0.0f, 1.0f};
-    D3DVIEWPORT9 vp = {};
-    if (SUCCEEDED(device->GetViewport(&vp)))
-    {
-        // Use actual viewport for correct dimensions
-        device->SetViewport(&vp);
-    }
+
+    // ✅ Set viewport to the SIZE of dstSurface
+    D3DSURFACE_DESC sd{};
+    dstSurface->GetDesc(&sd);
+    D3DVIEWPORT9 vp{};
+    vp.X = 0; vp.Y = 0;
+    vp.Width  = sd.Width;
+    vp.Height = sd.Height;
+    vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
     device->SetViewport(&vp);
 
-    // Debug color (pink) to test visibility
     device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(255, 255, 0, 255), 1.0f, 0);
 
-    // Setup shader
-    if (FAILED(fx->SetTexture("DIFFUSEMAP_TEXTURE", srcTex)))
-        printf_s("⚠️ Failed to set DIFFUSEMAP_TEXTURE\n");
-
+    // setup shader…
+    fx->SetTexture("DIFFUSEMAP_TEXTURE", srcTex);
     D3DXVECTOR4 blurParams(0.5f, 0.0005f, 0.0f, 0.0f);
-    if (FAILED(fx->SetVector("BlurParams", &blurParams)))
-        printf_s("⚠️ Failed to set BlurParams\n");
+    fx->SetVector("BlurParams", &blurParams);
 
-    if (FAILED(fx->CommitChanges()))
-        printf_s("⚠️ CommitChanges failed\n");
-
-    // Validate technique
     D3DXHANDLE tech = fx->GetTechniqueByName("visualtreatment_branching");
+    if (!tech || FAILED(fx->SetTechnique(tech))) goto cleanup;
 
-    if (!tech || FAILED(fx->SetTechnique(tech)))
-    {
-        printf_s("⚠️ Missing or invalid technique: visualtreatment_branching\n");
-        goto cleanup;
-    }
-
-    // Render state setup
     device->SetRenderState(D3DRS_ZENABLE, FALSE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE); // ✅ No blending
-    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE); // ✅ Irrelevant since blend is off
-    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     device->SetRenderState(D3DRS_COLORWRITEENABLE,
-                           D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN |
-                           D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+        D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_ALPHA);
 
-    // test Alpha or additive blending — the shader already applies HDR, tone, vignette, bloom,
-    // so it's better to avoid these params
-    // device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-    // device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
-
-
-    // Draw full-screen quad
-    UINT passes = 0;
-    if (SUCCEEDED(fx->Begin(&passes, 0)))
-    {
-        for (UINT i = 0; i < passes; ++i)
-        {
-            if (SUCCEEDED(fx->BeginPass(i)))
-            {
+    if (UINT passes = 0; SUCCEEDED(fx->Begin(&passes, 0))) {
+        for (UINT i = 0; i < passes; ++i) {
+            if (SUCCEEDED(fx->BeginPass(i))) {
                 device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-                device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, g_RenderTargetManager.screenQuadVerts, sizeof(RenderTargetManager::Vertex));
-                printf_s("[XNFS] ✅ DrawPrimitiveUP executed\n");
+                device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2,
+                    g_RenderTargetManager.screenQuadVerts,
+                    sizeof(RenderTargetManager::Vertex));
                 fx->EndPass();
-            }
-            else
-            {
-                printf_s("[XNFS] ⚠️ BeginPass(%u) failed\n", i);
             }
         }
         fx->End();
     }
-    else
-    {
-        printf_s("[XNFS] ❌ fx->Begin failed\n");
-    }
-
 
 cleanup:
+    // 🔁 Restore previous RT and viewport
     device->SetRenderTarget(0, oldRT);
+    device->SetViewport(&savedVP);
+
     SAFE_RELEASE(dstSurface);
     SAFE_RELEASE(oldRT);
 
@@ -523,50 +511,71 @@ cleanup:
 
 void RenderBlurCompositePass(IDirect3DDevice9* device)
 {
-    if (!device || !g_RenderTargetManager.g_CurrentBlurTex)
-        return;
+    if (!device || !g_RenderTargetManager.g_CurrentBlurTex) return;
 
     auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-    if (it == g_RenderTargetManager.g_ActiveEffects.end() || !IsValidShaderPointer(it->second))
-        return;
-
+    if (it == g_RenderTargetManager.g_ActiveEffects.end() || !IsValidShaderPointer(it->second)) return;
     ID3DXEffect* fx = it->second;
 
-    // Restore backbuffer as render target
     IDirect3DSurface9* backBuffer = nullptr;
-    if (FAILED(device->GetRenderTarget(0, &backBuffer)) || !backBuffer)
+    if (FAILED(device->GetRenderTarget(0, &backBuffer)) || !backBuffer) return;
+
+    // 🔽 Save viewport and set to backbuffer size
+    D3DVIEWPORT9 savedVP{};
+    device->GetViewport(&savedVP);
+
+    D3DSURFACE_DESC bbDesc{};
+    backBuffer->GetDesc(&bbDesc);
+
+    D3DVIEWPORT9 vp{};
+    vp.X = 0; vp.Y = 0;
+    vp.Width  = bbDesc.Width;
+    vp.Height = bbDesc.Height;
+    vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
+    device->SetViewport(&vp);
+
+    device->SetRenderTarget(0, backBuffer); // (already is, but explicit is fine)
+
+    // Technique safety: validate exists
+    D3DXHANDLE tech = fx->GetTechniqueByName("composite_blur");
+    if (!tech || FAILED(fx->ValidateTechnique(tech)) || FAILED(fx->SetTechnique(tech))) {
+        printf_s("⚠️ Technique 'composite_blur' missing/invalid\n");
+        device->SetViewport(&savedVP);
+        SAFE_RELEASE(backBuffer);
         return;
+    }
 
-    device->SetRenderTarget(0, backBuffer);
-
-    // Setup
-    fx->SetTechnique("composite_blur"); // You must define this technique in the shader
     fx->SetTexture("DIFFUSEMAP_TEXTURE", g_RenderTargetManager.g_CurrentBlurTex);
 
-    // Dummy texture fallbacks (optional)
     static IDirect3DTexture9* dummy = GetDummyWhiteTexture(device);
-    fx->SetTexture("MISCMAP1_TEXTURE", g_RenderTargetManager.g_GainMapTex ? g_RenderTargetManager.g_GainMapTex : dummy);
-    fx->SetTexture("MISCMAP2_TEXTURE", g_RenderTargetManager.g_VignetteTex ? g_RenderTargetManager.g_VignetteTex : dummy);
-    fx->SetTexture("MISCMAP3_TEXTURE", g_RenderTargetManager.g_BloomTex ? g_RenderTargetManager.g_BloomTex : dummy);
-    fx->SetTexture("MISCMAP4_TEXTURE", g_RenderTargetManager.g_DofTex ? g_RenderTargetManager.g_DofTex : dummy);
-    fx->SetTexture("HEIGHTMAP_TEXTURE", g_RenderTargetManager.g_LinearDepthTex ? g_RenderTargetManager.g_LinearDepthTex : dummy);
+    fx->SetTexture("MISCMAP1_TEXTURE", g_RenderTargetManager.g_GainMapTex     ? g_RenderTargetManager.g_GainMapTex     : dummy);
+    fx->SetTexture("MISCMAP2_TEXTURE", g_RenderTargetManager.g_VignetteTex    ? g_RenderTargetManager.g_VignetteTex    : dummy);
+    fx->SetTexture("MISCMAP3_TEXTURE", g_RenderTargetManager.g_BloomTex       ? g_RenderTargetManager.g_BloomTex       : dummy);
+    fx->SetTexture("MISCMAP4_TEXTURE", g_RenderTargetManager.g_DofTex         ? g_RenderTargetManager.g_DofTex         : dummy);
+    fx->SetTexture("HEIGHTMAP_TEXTURE", g_RenderTargetManager.g_LinearDepthTex? g_RenderTargetManager.g_LinearDepthTex : dummy);
 
-    // Draw
-    UINT passes = 0;
-    if (SUCCEEDED(fx->Begin(&passes, 0)))
-    {
-        for (UINT i = 0; i < passes; ++i)
-        {
-            if (SUCCEEDED(fx->BeginPass(i)))
-            {
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE,
+        D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_ALPHA);
+
+    if (UINT passes = 0; SUCCEEDED(fx->Begin(&passes, 0))) {
+        for (UINT i = 0; i < passes; ++i) {
+            if (SUCCEEDED(fx->BeginPass(i))) {
                 device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-                device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, g_RenderTargetManager.screenQuadVerts, sizeof(RenderTargetManager::Vertex));
+                device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2,
+                    g_RenderTargetManager.screenQuadVerts,
+                    sizeof(RenderTargetManager::Vertex));
                 fx->EndPass();
             }
         }
         fx->End();
     }
 
+    // 🔁 Restore viewport
+    device->SetViewport(&savedVP);
     SAFE_RELEASE(backBuffer);
 }
 
@@ -637,36 +646,71 @@ static void OnFramePresent()
 // Hooked EndScene
 HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
 {
-    if (!device)
-        return oEndScene(device);
-
-    if (!g_Device)
-        SetGameDevice(device);
+    if (!device) return oEndScene(device);
+    if (!g_Device) SetGameDevice(device);
 
     OnFramePresent();
 
-    // Check if blur system is initialized
-    if (!g_RenderTargetManager.g_CurrentBlurSurface || !g_RenderTargetManager.g_MotionBlurTexA || !g_RenderTargetManager.g_MotionBlurTexB)
+    if (!g_RenderTargetManager.g_CurrentBlurSurface ||
+        !g_RenderTargetManager.g_MotionBlurTexA ||
+        !g_RenderTargetManager.g_MotionBlurTexB)
         return oEndScene(device);
 
-    // Check if shader exists and is valid
     auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
     if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
         return oEndScene(device);
 
-    // Step 1: Copy current backbuffer into g_CurrentBlurSurface
-    IDirect3DSurface9* backBuffer = nullptr;
-    if (SUCCEEDED(device->GetRenderTarget(0, &backBuffer)))
+    // 🔒 Save ALL render state (including viewport) and restore on exit
+    ScopedStateBlock _sb(device);
+
+    // 1) Copy backbuffer for blur input
+    if (g_RenderTargetManager.g_LastSceneSurface)
+    {
+        device->StretchRect(g_RenderTargetManager.g_LastSceneSurface, nullptr,
+                            g_RenderTargetManager.g_CurrentBlurSurface, nullptr, D3DTEXF_LINEAR);
+    }
+    else if (IDirect3DSurface9* backBuffer = nullptr;
+             SUCCEEDED(device->GetRenderTarget(0, &backBuffer)) && backBuffer)
     {
         device->StretchRect(backBuffer, nullptr, g_RenderTargetManager.g_CurrentBlurSurface, nullptr, D3DTEXF_LINEAR);
         backBuffer->Release();
     }
 
-    // ✅ Step 2: Run the actual blur pass using the full effect system
-    RenderBlurPass(device); // writes blur to ping-pong tex
-    RenderBlurCompositePass(device); // draws it to screen
+    // 2) Blur into ping-pong RT
+    RenderBlurPass(device);
+
+    // 3) Composite back to backbuffer
+    RenderBlurCompositePass(device);
 
     return oEndScene(device);
+}
+
+HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3DSurface9* renderTarget)
+{
+    if (device && index == 0)
+    {
+        if (!g_RenderTargetManager.g_BackBufferSurface)
+        {
+            IDirect3DSurface9* backBuffer = nullptr;
+            if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
+            {
+                SAFE_RELEASE(g_RenderTargetManager.g_BackBufferSurface);
+                g_RenderTargetManager.g_BackBufferSurface = backBuffer;
+            }
+        }
+
+        if (renderTarget && renderTarget != g_RenderTargetManager.g_BackBufferSurface)
+        {
+            if (renderTarget != g_RenderTargetManager.g_LastSceneSurface)
+            {
+                SAFE_RELEASE(g_RenderTargetManager.g_LastSceneSurface);
+                g_RenderTargetManager.g_LastSceneSurface = renderTarget;
+                g_RenderTargetManager.g_LastSceneSurface->AddRef();
+            }
+        }
+    }
+
+    return g_RenderTargetManager.oSetRenderTarget(device, index, renderTarget);
 }
 
 HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RECT* dest, HWND hwnd,
@@ -683,7 +727,18 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RE
         VirtualProtect(&vtable[42], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
         vtable[42] = reinterpret_cast<void*>(&hkEndScene);
         VirtualProtect(&vtable[42], sizeof(void*), oldProtect, &oldProtect);
-        printf_s("[XNFS] ✅ hkEndScene installed via HookedPresent\n");
+        printf_s("[XNFS] ? hkEndScene installed via HookedPresent\n");
+    }
+
+    if (!g_RenderTargetManager.oSetRenderTarget)
+    {
+        DWORD oldProtect;
+        g_RenderTargetManager.oSetRenderTarget =
+            reinterpret_cast<RenderTargetManager::SetRenderTarget_t>(vtable[37]);
+        VirtualProtect(&vtable[37], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+        vtable[37] = reinterpret_cast<void*>(&hkSetRenderTarget);
+        VirtualProtect(&vtable[37], sizeof(void*), oldProtect, &oldProtect);
+        printf_s("[XNFS] ? hkSetRenderTarget installed via HookedPresent\n");
     }
 
     return RealPresent(device, src, dest, hwnd, dirty);
@@ -726,77 +781,140 @@ static void SafeApplyGraphicsSettingsMain(void* manager)
     }
 }
 
+bool IsProbablyValidManager(void* manager)
+{
+    if (!manager) return false;
+    uintptr_t field4 = *((uintptr_t*)manager + 1);
+    return field4 > 0x10000 && !IsBadReadPtr((void*)field4, 4);
+}
+
+bool SafeReloadFx(ID3DXEffect* fx, const char* context)
+{
+    if (!fx)
+    {
+        printf_s("[HotReload:%s] ❌ fx is NULL\n", context);
+        return false;
+    }
+
+    void** vtable = nullptr;
+
+    // Validate vtable access
+    if (IsBadReadPtr(fx, sizeof(void*)) || IsBadReadPtr(*(void**)fx, sizeof(void*)))
+    {
+        printf_s("[HotReload:%s] ❌ fx or fx->vtable is unreadable\n", context);
+        return false;
+    }
+
+    vtable = *(void***)fx;
+
+    if (!vtable || IsBadCodePtr((FARPROC)vtable[0]))
+    {
+        printf_s("[HotReload:%s] ❌ Invalid or corrupt vtable: %p\n", context, vtable);
+        return false;
+    }
+
+    // We assume fx is valid now — call the methods
+    fx->OnResetDevice();
+    ReloadBlurBindings(fx);
+    return true;
+}
+
+void LogEffectStatus(ID3DXEffect* fx, const char* label)
+{
+    if (!fx)
+    {
+        printf_s("[Debug:%s] ❌ fx is NULL\n", label);
+        return;
+    }
+
+    void** vtbl = nullptr;
+    __try
+    {
+        vtbl = *(void***)fx;
+        printf_s("[Debug:%s] fx = %p, vtable = %p, vtable[0] = %p\n", label, fx, vtbl, vtbl[0]);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        printf_s("[Debug:%s] ❌ EXCEPTION reading vtable from fx = %p\n", label, fx);
+    }
+}
+
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject)
 {
     LogApplyGraphicsSettingsCall(manager, vtObject, 1);
 
-    if (!manager || IsBadReadPtr(manager, sizeof(void*)))
-    {
-        printf_s("[HookApplyGraphicsSettings] ❌ manager is NULL or unreadable — skipping\n");
+    if (g_WaitingForReset)
         return;
-    }
 
-    void** vtbl = *(void***)manager;
-
-    DWORD field4 = 0;
-    bool canReadField = !IsBadReadPtr((BYTE*)manager + 4, sizeof(DWORD));
-    if (canReadField)
-        field4 = *(DWORD*)((BYTE*)manager + 4);
-
-    static std::unordered_set<void*> seenInvalidManagers;
-
-    if (IsBadReadPtr(vtbl, sizeof(void*)) || !canReadField || IsBadReadPtr((void*)field4, 4))
-    {
-        // Only log once per invalid manager pointer
-        if (seenInvalidManagers.insert(manager).second)
-        {
-            printf_s("[HookApplyGraphicsSettings] ⚠️ Skipping: manager = %p, field4 = 0x%08X (invalid)\n", manager,
-                     field4);
-        }
-        return;
-    }
-
-    static std::unordered_set<void*> triedManagers;
-    if (triedManagers.insert(manager).second)
-    {
-        printf_s("[HookApplyGraphicsSettings] 🔍 First-time seen manager = %p, field4 = 0x%08X\n", manager, field4);
-    }
-
-    if (!g_RenderTargetManager.g_ApplyGraphicsManagerThis &&
-        IsValidThis(manager) &&
-        !IsBadReadPtr((void*)field4, 4) && // field4 must be readable if used internally
-        field4 > 0x10000) // skip tiny constants
+    if (IsValidThis(manager))
     {
         g_RenderTargetManager.g_ApplyGraphicsManagerThis = manager;
-        printf_s("[HookApplyGraphicsSettings] ✅ Captured g_ApplyGraphicsManagerThis = %p\n", manager);
-    }
-
-    if (g_RenderTargetManager.g_LastReloadedFx && IsValidShaderPointer(g_RenderTargetManager.g_LastReloadedFx) &&
-        g_pVisualTreatment && *g_pVisualTreatment && IsValidThis(*g_pVisualTreatment) &&
-        g_RenderTargetManager.g_ApplyGraphicsManagerThis && IsValidThis(g_RenderTargetManager.g_ApplyGraphicsManagerThis))
-    {
-        if (TryPatchSlotIfWritable(*g_pVisualTreatment, 0x18C, g_RenderTargetManager.g_LastReloadedFx))
-        {
-            printf_s("[HotReload] 🔧 Patched fx slot at +0x18C\n");
-        }
-
-        ScrubShaderCleanupTable();
-        VisualTreatment_Reset();
-        *(BYTE*)LoadedFlagMaybe_ADDRESS = 1;
-        printf_s("[HotReload] ✅ Set LoadedFlagMaybe = 1 (0x00982C39)\n");
-
-        SafeApplyGraphicsSettingsMain(g_RenderTargetManager.g_ApplyGraphicsManagerThis);
-
-        if (g_LastEView)
-        {
-            ForceFrameRender();
-            printf_s("[HotReload] ✅ ForceFrameRender (sub_6DE300)\n");
-        }
     }
     else
     {
-        ApplyGraphicsSettingsOriginal(manager, nullptr, manager);
+        static void* lastInvalidMgr = nullptr;
+        if (manager != lastInvalidMgr)
+        {
+            printf_s("[HookApplyGraphicsSettings] ❌ Invalid manager: %p\n", manager);
+            lastInvalidMgr = manager;
+        }
     }
+
+    if (!IsValidThis(vtObject))
+        return;
+
+    // Only proceed if there's a new effect to inject
+    if (g_RenderTargetManager.g_LastReloadedFx)
+    {
+        printf_s("[HotReload] 🔁 Patching vtObject = %p\n", vtObject);
+
+        const auto& fx = g_RenderTargetManager.g_LastReloadedFx;
+        bool validFx =
+            fx &&
+            reinterpret_cast<uintptr_t>(fx) > 0x10000 &&
+            IsValidShaderPointer(fx);
+
+        if (!validFx)
+        {
+            printf_s("[HotReload] ❌ g_LastReloadedFx is invalid — skipping\n");
+        }
+        else
+        {
+            auto& slotFx = g_SlotRetainedFx[62];
+            auto rawPtr = reinterpret_cast<uintptr_t>(slotFx ? slotFx : nullptr);
+
+            if (rawPtr < 0x10000 || rawPtr == 0x3f800000 || !IsValidShaderPointer(slotFx))
+            {
+                printf_s("[Patch] ❌ g_SlotRetainedFx[62] invalid or null (fx=0x%08X) — skipping patch\n",
+                         (unsigned)rawPtr);
+            }
+            else
+            {
+                printf_s("[Patch] 📦 Using g_SlotRetainedFx[62] = %p\n", (void*)rawPtr);
+                TryPatchSlotIfWritable(vtObject, 0x18C, fx);
+
+                LogEffectStatus(fx, "BeforeReload");
+
+                if (SafeReloadFx(fx, "ApplyGraphicsSettings"))
+                {
+                    if (g_pVisualTreatment && *g_pVisualTreatment)
+                    {
+                        IVisualTreatment_Reset(*g_pVisualTreatment);
+                        printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
+                    }
+                }
+                else
+                {
+                    printf_s("[HotReload] ❌ ReloadHandles failed — skipping Reset\n");
+                }
+            }
+        }
+    }
+
+    LogApplyGraphicsSettingsCall(manager, vtObject, 2);
+
+    if (ApplyGraphicsSettingsOriginal)
+        ApplyGraphicsSettingsOriginal(manager, nullptr, vtObject);
 }
 
 DWORD WINAPI DeferredHookThread(LPVOID)
@@ -857,7 +975,45 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        printf_s("[Shutdown] Cleaning up...\n");
+
+        OnDeviceLost(); // Releases all textures, surfaces, etc.
+
+        for (auto& [name, fx] : g_RenderTargetManager.g_ActiveEffects)
+        {
+            if (fx)
+            {
+                printf_s("[Shutdown] Releasing shader: %s (%p)\n", name.c_str(), fx);
+                fx->Release();
+            }
+        }
+        g_RenderTargetManager.g_ActiveEffects.clear();
+
+        if (g_RenderTargetManager.g_LastReloadedFx)
+        {
+            g_RenderTargetManager.g_LastReloadedFx->Release();
+            g_RenderTargetManager.g_LastReloadedFx = nullptr;
+        }
+
+        for (int i = 0; i < 64; ++i)
+        {
+            if (g_SlotRetainedFx[i])
+            {
+                g_SlotRetainedFx[i]->Release();
+                g_SlotRetainedFx[i] = nullptr;
+            }
+        }
+
+        g_RenderTargetManager.g_ApplyGraphicsManagerThis = nullptr;
+        g_Device = nullptr;
+        g_LastEView = nullptr;
+        g_pVisualTreatment = nullptr;
+
         ScrubShaderCleanupTable();
+
+        printf_s("[Shutdown] ✅ Cleanup complete.\n");
     }
+
     return TRUE;
 }
+

@@ -73,6 +73,8 @@ extern ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal; // ✅ extern = DE
 typedef int (__thiscall*ApplyGraphicsManagerMain_t)(void* thisptr);
 extern ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal;
 
+typedef HRESULT (WINAPI*Reset_t)(LPDIRECT3DDEVICE9, D3DPRESENT_PARAMETERS*);
+
 typedef HRESULT (WINAPI*Present_t)(LPDIRECT3DDEVICE9, const RECT*, const RECT*, HWND, const RGNDATA*);
 extern Present_t oPresent;
 
@@ -81,10 +83,22 @@ inline EndScene_t oEndScene = nullptr;
 
 inline ID3DXEffect* g_SlotRetainedFx[64] = {};
 
+HRESULT WINAPI HookedCreateFromResource(
+    LPDIRECT3DDEVICE9 device,
+    HMODULE hModule,
+    LPCSTR pResource,
+    const D3DXMACRO* defines,
+    LPD3DXINCLUDE include,
+    DWORD flags,
+    LPD3DXEFFECTPOOL pool,
+    LPD3DXEFFECT* outEffect,
+    LPD3DXBUFFER* outErrors);
+
 extern bool g_WaitingForReset;
 extern int g_ApplyGraphicsTriggerDelay;
 extern void* g_ApplyGraphicsSettingsThis;
 void __fastcall HookApplyGraphicsSettings(void* manager, void*, void* vtObject);
+extern std::atomic<bool> g_TriggerApplyGraphicsSettings;
 
 using IVisualTreatment_ResetFn = void(__thiscall*)(void* thisPtr);
 // ✅ Header declaration only:

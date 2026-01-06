@@ -23,7 +23,6 @@
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>false</WholeProgramOptimization>
-    <CharacterSet>MultiByte</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
@@ -68,7 +67,7 @@
       <GenerateMapFile>true</GenerateMapFile>
     </Link>
     <PostBuildEvent>
-      <Command>start XCOPY /Y /R "$(ProjectDir)\$(ConfigurationName)\*" "d:\Games\NFS MW - X360\SCRIPTS\"</Command>
+      <Command>start XCOPY /Y /R "$(ProjectDir)\$(ConfigurationName)\*" "d:\Games\NFS MW - Vanilla\SCRIPTS\"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -91,7 +90,7 @@
       <AdditionalLibraryDirectories>$(DXSDK_DIR)Lib\x86;%(AdditionalLibraryDirectories);$(SolutionDir)Release;</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent>
-      <Command>start XCOPY /Y /R "$(ProjectDir)\$(ConfigurationName)\*" "d:\Games\NFS MW - X360\SCRIPTS\"</Command>
+      <Command>start XCOPY /Y /R "$(ProjectDir)\$(ConfigurationName)\*" "d:\Games\NFS MW - Vanilla\SCRIPTS\"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
