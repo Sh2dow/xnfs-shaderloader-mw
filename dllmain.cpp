@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <string>
 #include <fstream>
+#include <cctype>
 #include "includes/injector/injector.hpp"
 #include <d3dx9effect.h>
 #include <cstdio>
@@ -13,8 +14,12 @@
 #include <unordered_set>
 #include "Hooks.h"
 #include "RenderTargetManager.h"
+#include "Globals.h"
+#include "EffectManager.h"
+#include "MotionBlurPass.h"
 #include "Validators.h"
-#include "MinHook.h"
+#include "ScopedStateBlock.h"
+#include "Modules/minhook/include/MinHook.h"
 #pragma comment(lib, "d3d9.lib")
 
 // -------------------- GLOBALS --------------------
@@ -22,13 +27,38 @@
 
 #define SAFE_RELEASE(p) if (p) { p->Release(); p = nullptr; }
 
-RenderTargetManager g_RenderTargetManager;
+static void PatchMotionBlurFix()
+{
+    struct PatchByte
+    {
+        uintptr_t addr;
+        BYTE value;
+    };
+    const PatchByte patches[] =
+    {
+        {0x006DBE79, 0x01},
+        {0x006DBE7B, 0x02},
+        {0x006DF1D2, 0xEB}, // skip vanilla blur call (NGG behavior)
+    };
+
+    for (const auto& p : patches)
+    {
+        BYTE* ptr = reinterpret_cast<BYTE*>(p.addr);
+        DWORD oldProtect = 0;
+        if (VirtualProtect(ptr, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+        {
+            *ptr = p.value;
+            VirtualProtect(ptr, 1, oldProtect, &oldProtect);
+        }
+    }
+    printf_s("[XNFS] ? NextGenMotionBlur patch applied (disable vanilla blur)\n");
+}
 
 // IVisualTreatment_Reset block
 void* g_LastEView = nullptr;
 
-void (__fastcall* ApplyGraphicsSettingsOriginal)(void* ecx, void* edx, void* arg1) = nullptr;
-int (__thiscall* ApplyGraphicsManagerMainOriginal)(void* thisptr) = nullptr;
+void (__fastcall*ApplyGraphicsSettingsOriginal)(void* ecx, void* edx, void* arg1) = nullptr;
+int (__thiscall*ApplyGraphicsManagerMainOriginal)(void* thisptr) = nullptr;
 bool g_WaitingForReset = false;
 
 typedef void (__thiscall*UpdateFunc)(void* thisptr, void* eView);
@@ -39,21 +69,64 @@ void** g_pVisualTreatment = (void**)pVisualTreatmentPlat_ADDRESS;
 using IVisualTreatment_ResetFn = void(__thiscall*)(void* thisPtr);
 IVisualTreatment_ResetFn IVisualTreatment_Reset = (IVisualTreatment_ResetFn)Reset_16IVisualTreatment_ADDRESS;
 
-// Helpers
-struct ScopedStateBlock {
-    IDirect3DDevice9* dev = nullptr;
-    IDirect3DStateBlock9* sb = nullptr;
-    ScopedStateBlock(IDirect3DDevice9* d) : dev(d) {
-        if (dev) {
-            dev->CreateStateBlock(D3DSBT_ALL, &sb);
-            if (sb) sb->Capture();
-        }
-    }
-    ~ScopedStateBlock() {
-        if (sb) { sb->Apply(); sb->Release(); }
-    }
-};
+using RenderDispatchFn = void(__cdecl*)(void* arg0, void* arg4);
+static RenderDispatchFn g_RenderDispatchOriginal = (RenderDispatchFn)0x00744DD0;
+using IVisualTreatmentGetFn = void* (__cdecl*)();
+static IVisualTreatmentGetFn RealIVisualTreatmentGet = nullptr;
+using D3DXCreateEffectFromFileAFn = HRESULT (WINAPI*)(
+    LPDIRECT3DDEVICE9,
+    LPCSTR,
+    const D3DXMACRO*,
+    LPD3DXINCLUDE,
+    DWORD,
+    LPD3DXEFFECTPOOL,
+    LPD3DXEFFECT*,
+    LPD3DXBUFFER*);
+static D3DXCreateEffectFromFileAFn RealCreateFromFileA = nullptr;
+using D3DXCreateEffectFromFileExAFn = HRESULT (WINAPI*)(
+    LPDIRECT3DDEVICE9,
+    LPCSTR,
+    const D3DXMACRO*,
+    LPD3DXINCLUDE,
+    LPCSTR,
+    DWORD,
+    LPD3DXEFFECTPOOL,
+    LPD3DXEFFECT*,
+    LPD3DXBUFFER*);
+static D3DXCreateEffectFromFileExAFn RealCreateFromFileExA = nullptr;
+using D3DXCreateEffectFn = HRESULT (WINAPI*)(
+    LPDIRECT3DDEVICE9,
+    LPCVOID,
+    UINT,
+    const D3DXMACRO*,
+    LPD3DXINCLUDE,
+    DWORD,
+    LPD3DXEFFECTPOOL,
+    LPD3DXEFFECT*,
+    LPD3DXBUFFER*);
+static D3DXCreateEffectFn RealCreateEffect = nullptr;
+static bool g_D3DXHooksInstalled = false;
 
+static void __cdecl RenderDispatchHook(void* arg0, void* arg4)
+{
+    // const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
+    // if (gameFlow < 3 || g_RenderTargetManager.g_DeviceResetInProgress)
+    // {
+    //     if (g_RenderDispatchOriginal)
+    //         g_RenderDispatchOriginal(arg0, arg4);
+    //     return;
+    // }
+
+    static uint32_t lastLogFrame = 0;
+    if (eFrameCounter != lastLogFrame)
+    {
+        lastLogFrame = eFrameCounter;
+        printf_s("[Blur] dispatch index=0\n");
+    }
+    MotionBlurPass::CustomMotionBlurHook();
+    if (g_RenderDispatchOriginal)
+        g_RenderDispatchOriginal(arg0, arg4);
+}
 
 IDirect3DTexture9* GetDummyWhiteTexture(IDirect3DDevice9* device)
 {
@@ -87,6 +160,11 @@ void ReplaceShaderSlot(void* objectBase, int offset, ID3DXEffect* replacement)
 
 void ScrubShaderCleanupTable()
 {
+    return;
+    int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
+    if (gameFlow < 3 || !g_Device || g_RenderTargetManager.g_DeviceResetInProgress)
+        return;
+
     for (int i = 0; i < 11; i++)
     {
         uintptr_t entryBase = SHADER_CLEANUP_TABLE_ADDRESS + i * 0x1C;
@@ -99,14 +177,27 @@ void ScrubShaderCleanupTable()
         }
         else if (*fxPtr)
         {
-            void* vtbl = *(void**)(*fxPtr);
-            if (!IsBadCodePtr((FARPROC)((void**)vtbl)[2]))
+            __try
             {
-                printf_s("[Scrub] ✅ fx[%d] valid: %p (vtable: %p)\n", i, *fxPtr, vtbl);
+                void** vtbl = *(void***)(*fxPtr);
+                if (IsBadReadPtr(vtbl, sizeof(void*)))
+                {
+                    printf_s("[Scrub] ⚠️ fx[%d] vtable unreadable — nulling\n", i);
+                    *fxPtr = nullptr;
+                }
+                else if (!IsBadCodePtr((FARPROC)vtbl[2]))
+                {
+                    printf_s("[Scrub] ✅ fx[%d] valid: %p (vtable: %p)\n", i, *fxPtr, vtbl);
+                }
+                else
+                {
+                    printf_s("[Scrub] ⚠️ fx[%d] has invalid vtable func ptr: %p — nulling\n", i, vtbl[2]);
+                    *fxPtr = nullptr;
+                }
             }
-            else
+            __except (EXCEPTION_EXECUTE_HANDLER)
             {
-                printf_s("[Scrub] ⚠️ fx[%d] has invalid vtable func ptr: %p — nulling\n", i, *fxPtr);
+                printf_s("[Scrub] ⚠️ fx[%d] threw during vtable read — nulling\n", i);
                 *fxPtr = nullptr;
             }
         }
@@ -257,6 +348,15 @@ bool TryPatchSlotIfWritable(void* obj, size_t offset, ID3DXEffect* fx)
 
 void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name = "")
 {
+    static uint32_t lastEnterLogFrame = 0;
+    if (eFrameCounter != lastEnterLogFrame)
+    {
+        lastEnterLogFrame = eFrameCounter;
+        printf_s("[BlurRebind] enter fx=%p blurTex=%p reset=%u\n",
+                 fx,
+                 g_RenderTargetManager.g_CurrentBlurTex,
+                 g_RenderTargetManager.g_DeviceResetInProgress ? 1u : 0u);
+    }
     if (!fx)
     {
         printf_s("[BlurRebind] ❌ fx is null\n");
@@ -276,24 +376,118 @@ void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name = "")
         return;
     }
 
-    // Basic texture setup
-    fx->SetTexture(fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE"), g_RenderTargetManager.g_CurrentBlurTex);
+    D3DXHANDLE hDiffuse = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
+    if (!hDiffuse)
+        hDiffuse = fx->GetParameterByName(nullptr, "DiffuseMap");
+    if (!hDiffuse)
+        hDiffuse = fx->GetParameterBySemantic(nullptr, "DiffuseMap");
+
+    D3DXHANDLE hBlur = fx->GetParameterByName(nullptr, "MOTIONBLUR_TEXTURE");
+    if (!hBlur)
+        hBlur = fx->GetParameterByName(nullptr, "MOTIONBLUR");
+    if (!hBlur)
+        hBlur = fx->GetParameterBySemantic(nullptr, "MOTIONBLUR");
+
+    if (!hDiffuse || !hBlur)
+    {
+        printf_s("[BlurRebind] ? Missing handles: DIFFUSE=%p BLUR=%p\n", hDiffuse, hBlur);
+        static uint32_t lastDumpFrame = 0;
+        if (eFrameCounter != lastDumpFrame)
+        {
+            lastDumpFrame = eFrameCounter;
+            D3DXEFFECT_DESC ed = {};
+            if (SUCCEEDED(fx->GetDesc(&ed)))
+            {
+                printf_s("[BlurRebind] ? Effect params: %u\n", ed.Parameters);
+                for (UINT i = 0; i < ed.Parameters; ++i)
+                {
+                    D3DXHANDLE p = fx->GetParameter(nullptr, i);
+                    if (!p)
+                        continue;
+                    D3DXPARAMETER_DESC pd = {};
+                    if (FAILED(fx->GetParameterDesc(p, &pd)))
+                        continue;
+                    if (pd.Class == D3DXPC_OBJECT && pd.Type == D3DXPT_TEXTURE)
+                    {
+                        printf_s("[BlurRebind] ? tex[%u] name=%s semantic=%s\n",
+                                 i,
+                                 pd.Name ? pd.Name : "(null)",
+                                 pd.Semantic ? pd.Semantic : "(null)");
+                    }
+                }
+            }
+        }
+    }
+
+    if (hDiffuse)
+    {
+        if (g_RenderTargetManager.g_LastSceneFullTex)
+        {
+            fx->SetTexture(hDiffuse, g_RenderTargetManager.g_LastSceneFullTex);
+        }
+        else if (g_RenderTargetManager.g_MotionBlurTexA)
+        {
+            fx->SetTexture(hDiffuse, g_RenderTargetManager.g_MotionBlurTexA);
+        }
+        else
+        {
+            fx->SetTexture(hDiffuse, g_RenderTargetManager.g_CurrentBlurTex);
+        }
+    }
+
+    if (hBlur)
+        fx->SetTexture(hBlur, g_RenderTargetManager.g_CurrentBlurTex);
     fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP1_TEXTURE"), g_RenderTargetManager.g_ExposureTex);
     fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP2_TEXTURE"), g_RenderTargetManager.g_VignetteTex);
     fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE"), g_RenderTargetManager.g_BloomLUTTex);
     fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP4_TEXTURE"), g_RenderTargetManager.g_DofTex);
     fx->SetTexture(fx->GetParameterByName(nullptr, "HEIGHTMAP_TEXTURE"), g_RenderTargetManager.g_DepthTex);
 
-    // BlurParams
+    // BlurParams / XNFS_MotionBlurAmount
+    const D3DXVECTOR4 blurVec(1.0f, 0.2f, 1.0f, 0.0f);
     D3DXHANDLE h = fx->GetParameterByName(nullptr, "BlurParams");
     if (h)
-    {
-        D3DXVECTOR4 blurVec(0.5f, 0.2f, 1.0f, 0.0f);
         fx->SetVector(h, &blurVec);
+    D3DXHANDLE hMb = fx->GetParameterByName(nullptr, "XNFS_MotionBlurAmount");
+    if (hMb)
+        fx->SetFloat(hMb, g_MotionBlurAmount);
+
+    static uint32_t lastBindLogFrame = 0;
+    if (eFrameCounter != lastBindLogFrame)
+    {
+        lastBindLogFrame = eFrameCounter;
+        IDirect3DBaseTexture9* diff = nullptr;
+        IDirect3DBaseTexture9* blur = nullptr;
+        D3DXHANDLE hDiff = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
+        D3DXHANDLE hBlur = fx->GetParameterByName(nullptr, "MOTIONBLUR_TEXTURE");
+        if (hDiff)
+            fx->GetTexture(hDiff, &diff);
+        if (hBlur)
+            fx->GetTexture(hBlur, &blur);
+        printf_s("[BlurRebind] diff=%p blur=%p amount=%.3f\n", diff, blur, g_MotionBlurAmount);
+        SAFE_RELEASE(diff);
+        SAFE_RELEASE(blur);
     }
 
     if (name == "IDI_VISUALTREATMENT_FX")
     {
+        if (g_RenderTargetManager.g_Width && g_RenderTargetManager.g_Height)
+        {
+            const float texelX = 1.0f / static_cast<float>(g_RenderTargetManager.g_Width);
+            const float texelY = 1.0f / static_cast<float>(g_RenderTargetManager.g_Height);
+            D3DXHANDLE hOff0 = fx->GetParameterByName(nullptr, "DownSampleOffset0");
+            D3DXHANDLE hOff1 = fx->GetParameterByName(nullptr, "DownSampleOffset1");
+            if (hOff0 && hOff1)
+            {
+                const D3DXVECTOR4 off0(-1.5f * texelX, -1.5f * texelY,
+                                       0.5f * texelX, -1.5f * texelY);
+                const D3DXVECTOR4 off1(-1.5f * texelX, 0.5f * texelY,
+                                       0.5f * texelX, 0.5f * texelY);
+                fx->SetVector(hOff0, &off0);
+                fx->SetVector(hOff1, &off1);
+            }
+        }
+
         D3DXHANDLE tech = fx->GetTechniqueByName("visualtreatment_branching");
         if (tech && SUCCEEDED(fx->ValidateTechnique(tech)))
             fx->SetTechnique(tech);
@@ -325,37 +519,82 @@ HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors)
 {
-    if (!device || !pResource || !g_RenderTargetManager.RealCreateFromResource)
+    if (!device || !pResource)
     {
         printf_s("[XNFS] ⚠️ Skipping invalid shader load — device or pResource is null\n");
         if (outEffect) *outEffect = nullptr;
         return E_FAIL;
     }
 
-    // Only process specific shader
+    HRESULT hr = E_FAIL;
+    // Only process specific shaders
     bool isVisualFx = strcmp(pResource, "IDI_VISUALTREATMENT_FX") == 0;
-    if (isVisualFx)
-        printf_s("[XNFS] 🎯 HookedCreateFromResource called for: %s\n", pResource);
+    bool isOverbrightFx = strcmp(pResource, "IDI_OVERBRIGHT_FX") == 0;
+    if (isVisualFx || isOverbrightFx)
+        SetGameDevice(device);
 
-    SetGameDevice(device);
+    // If a file override exists, compile it instead of the embedded resource.
+    if (isVisualFx || isOverbrightFx)
+    {
+        const char* overrideFile = isVisualFx ? "fx\\visualtreatment.fx" : "fx\\overbright.fx";
+        DWORD attr = GetFileAttributesA(overrideFile);
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            D3DXCreateEffectFromFileAFn createFromFile = RealCreateFromFileA;
+            if (!createFromFile)
+            {
+                const char* kD3dxDlls[] = {"d3dx9_43.dll", "d3dx9_42.dll", "d3dx9_41.dll", "d3dx9_40.dll"};
+                HMODULE d3dx = nullptr;
+                for (const char* dll : kD3dxDlls)
+                {
+                    d3dx = GetModuleHandleA(dll);
+                    if (d3dx)
+                        break;
+                }
+                if (d3dx)
+                    createFromFile = reinterpret_cast<D3DXCreateEffectFromFileAFn>(
+                        GetProcAddress(d3dx, "D3DXCreateEffectFromFileA"));
+            }
 
-    HRESULT hr = g_RenderTargetManager.RealCreateFromResource(
-        device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
+            if (createFromFile)
+            {
+                printf_s("[XNFS] ? Using FX override: %s\n", overrideFile);
+                HRESULT hrFile = createFromFile(
+                    device, overrideFile, defines, include, flags, pool, outEffect, outErrors);
+                if (SUCCEEDED(hrFile) && outEffect && *outEffect)
+                {
+                    // Treat the file override as the resource load result.
+                    hr = hrFile;
+                    goto track_effect;
+                }
+                if (outErrors && *outErrors)
+                {
+                    printf_s("[XNFS] ? FX override compile failed: %s\n",
+                             (const char*)(*outErrors)->GetBufferPointer());
+                }
+                // Fall back to the embedded resource on failure.
+            }
+        }
+    }
 
     if (!g_RenderTargetManager.RealCreateFromResource)
     {
-        printf_s("❌ RealCreateFromResource was null!\n");
+        printf_s("? RealCreateFromResource was null!\\n");
         return E_FAIL;
     }
 
+    hr = g_RenderTargetManager.RealCreateFromResource(
+        device, hModule, pResource, defines, include, flags, pool, outEffect, outErrors);
+
     if (FAILED(hr) || !outEffect || !*outEffect)
     {
-        if (isVisualFx)
+        if (isVisualFx || isOverbrightFx)
             printf_s("[XNFS] ❌ Shader creation failed or returned null (hr=0x%08X)\n", hr);
         return hr;
     }
 
-    if (isVisualFx)
+track_effect:
+    if (isVisualFx || isOverbrightFx)
     {
         auto& existingFx = g_RenderTargetManager.g_ActiveEffects[pResource];
 
@@ -367,6 +606,10 @@ HRESULT WINAPI HookedCreateFromResource(
 
         existingFx = *outEffect;
         (*outEffect)->AddRef(); // Retain since we're storing it
+        if (g_RenderTargetManager.g_LastReloadedFx)
+            g_RenderTargetManager.g_LastReloadedFx->Release();
+        g_RenderTargetManager.g_LastReloadedFx = *outEffect;
+        (*outEffect)->AddRef();
         printf_s("✅ Shader created and tracked: %s (%p)\n", pResource, *outEffect);
         SAFE_RELEASE(g_RenderTargetManager.g_BlurEffect);
         if (FAILED((*outEffect)->CloneEffect(device, &g_RenderTargetManager.g_BlurEffect)))
@@ -386,6 +629,317 @@ HRESULT WINAPI HookedCreateFromResource(
     }
 
     return hr;
+}
+
+static void* __cdecl HookedIVisualTreatmentGet()
+{
+    static bool inHook = false;
+    if (inHook)
+        return RealIVisualTreatmentGet ? RealIVisualTreatmentGet() : nullptr;
+
+    inHook = true;
+    const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
+    void* vt = RealIVisualTreatmentGet ? RealIVisualTreatmentGet() : nullptr;
+
+    if (gameFlow >= 3 && !g_RenderTargetManager.g_DeviceResetInProgress && vt)
+    {
+        if (!IsBadReadPtr(vt, sizeof(void*)))
+        {
+            ID3DXEffect* fx = *reinterpret_cast<ID3DXEffect**>((char*)vt + 0x18C);
+            if (IsValidShaderPointer(fx))
+            {
+                auto& existingFx = g_RenderTargetManager.g_ActiveEffects["IDI_VISUALTREATMENT_FX"];
+                if (existingFx && existingFx != fx)
+                    existingFx->Release();
+                existingFx = fx;
+                existingFx->AddRef();
+
+                if (g_RenderTargetManager.g_LastReloadedFx)
+                    g_RenderTargetManager.g_LastReloadedFx->Release();
+                g_RenderTargetManager.g_LastReloadedFx = fx;
+                g_RenderTargetManager.g_LastReloadedFx->AddRef();
+
+                if (g_RenderTargetManager.g_CurrentBlurTex)
+                    ReloadBlurBindings(fx, "IDI_VISUALTREATMENT_FX");
+            }
+        }
+    }
+
+    inHook = false;
+    return vt;
+}
+
+static bool IsTargetEffectFile(const char* path, std::string& outKey)
+{
+    if (!path)
+        return false;
+
+    const char* base = strrchr(path, '\\');
+    if (!base)
+        base = strrchr(path, '/');
+    base = base ? (base + 1) : path;
+
+    std::string lower(base);
+    for (char& c : lower)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+    if (lower == "visualtreatment.fx")
+    {
+        outKey = "IDI_VISUALTREATMENT_FX";
+        return true;
+    }
+    if (lower == "overbright.fx")
+    {
+        outKey = "IDI_OVERBRIGHT_FX";
+        return true;
+    }
+    return false;
+}
+
+static bool IsVisualTreatmentEffect(ID3DXEffect* fx)
+{
+    if (!fx)
+        return false;
+
+    D3DXHANDLE h = fx->GetParameterByName(nullptr, "VisualEffectRadialBlur");
+    if (h)
+        return true;
+    h = fx->GetParameterByName(nullptr, "VisualEffectBrightness");
+    if (h)
+        return true;
+    h = fx->GetParameterByName(nullptr, "MOTIONBLUR_TEXTURE");
+    if (h)
+        return true;
+    h = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
+    return h != nullptr;
+}
+
+HRESULT WINAPI HookedCreateEffect(
+    LPDIRECT3DDEVICE9 device,
+    LPCVOID pSrcData,
+    UINT srcDataLen,
+    const D3DXMACRO* defines,
+    LPD3DXINCLUDE include,
+    DWORD flags,
+    LPD3DXEFFECTPOOL pool,
+    LPD3DXEFFECT* outEffect,
+    LPD3DXBUFFER* outErrors)
+{
+    if (!RealCreateEffect)
+        return E_FAIL;
+
+    HRESULT hr = RealCreateEffect(
+        device, pSrcData, srcDataLen, defines, include, flags, pool, outEffect, outErrors);
+
+    if (FAILED(hr) || !outEffect || !*outEffect)
+        return hr;
+
+    if (IsVisualTreatmentEffect(*outEffect))
+    {
+        auto& existingFx = g_RenderTargetManager.g_ActiveEffects["IDI_VISUALTREATMENT_FX"];
+        if (existingFx != *outEffect)
+        {
+            // VT-owned effects can be recreated often; keep raw pointers without refcount changes.
+            existingFx = *outEffect;
+            g_RenderTargetManager.g_LastReloadedFx = *outEffect;
+            printf_s("[XNFS] ✅ Shader created and tracked (effect): IDI_VISUALTREATMENT_FX (%p)\n", *outEffect);
+        }
+
+        const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
+        if (gameFlow >= 3 && !g_RenderTargetManager.g_DeviceResetInProgress && g_RenderTargetManager.g_CurrentBlurTex)
+            ReloadBlurBindings(*outEffect, "IDI_VISUALTREATMENT_FX");
+    }
+
+    return hr;
+}
+
+HRESULT WINAPI HookedCreateFromFileA(
+    LPDIRECT3DDEVICE9 device,
+    LPCSTR pFilename,
+    const D3DXMACRO* defines,
+    LPD3DXINCLUDE include,
+    DWORD flags,
+    LPD3DXEFFECTPOOL pool,
+    LPD3DXEFFECT* outEffect,
+    LPD3DXBUFFER* outErrors)
+{
+    if (!RealCreateFromFileA)
+        return E_FAIL;
+
+    std::string key;
+    const bool isTarget = IsTargetEffectFile(pFilename, key);
+    if (isTarget)
+        printf_s("[XNFS] ? D3DXCreateEffectFromFileA: %s\n", pFilename ? pFilename : "(null)");
+
+    HRESULT hr = RealCreateFromFileA(
+        device, pFilename, defines, include, flags, pool, outEffect, outErrors);
+
+    if (!isTarget || FAILED(hr) || !outEffect || !*outEffect)
+        return hr;
+
+    auto& existingFx = g_RenderTargetManager.g_ActiveEffects[key];
+    if (existingFx && existingFx != *outEffect)
+    {
+        printf_s("[XNFS] ?? Replacing previous effect (%p) for %s\n", existingFx, key.c_str());
+        existingFx->Release();
+    }
+
+    existingFx = *outEffect;
+    existingFx->AddRef();
+
+    if (g_RenderTargetManager.g_LastReloadedFx)
+        g_RenderTargetManager.g_LastReloadedFx->Release();
+    g_RenderTargetManager.g_LastReloadedFx = *outEffect;
+    g_RenderTargetManager.g_LastReloadedFx->AddRef();
+
+    printf_s("[XNFS] ? Shader created and tracked (file): %s (%p)\n", key.c_str(), *outEffect);
+
+    {
+        const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
+        if (gameFlow >= 3 && !g_RenderTargetManager.g_DeviceResetInProgress && g_RenderTargetManager.g_CurrentBlurTex)
+            ReloadBlurBindings(*outEffect, key);
+    }
+
+    return hr;
+}
+
+HRESULT WINAPI HookedCreateFromFileExA(
+    LPDIRECT3DDEVICE9 device,
+    LPCSTR pFilename,
+    const D3DXMACRO* defines,
+    LPD3DXINCLUDE include,
+    LPCSTR skipConstants,
+    DWORD flags,
+    LPD3DXEFFECTPOOL pool,
+    LPD3DXEFFECT* outEffect,
+    LPD3DXBUFFER* outErrors)
+{
+    if (!RealCreateFromFileExA)
+        return E_FAIL;
+
+    std::string key;
+    const bool isTarget = IsTargetEffectFile(pFilename, key);
+    if (isTarget)
+        printf_s("[XNFS] ? D3DXCreateEffectFromFileExA: %s\n", pFilename ? pFilename : "(null)");
+
+    HRESULT hr = RealCreateFromFileExA(
+        device, pFilename, defines, include, skipConstants, flags, pool, outEffect, outErrors);
+
+    if (!isTarget || FAILED(hr) || !outEffect || !*outEffect)
+        return hr;
+
+    auto& existingFx = g_RenderTargetManager.g_ActiveEffects[key];
+    if (existingFx && existingFx != *outEffect)
+    {
+        printf_s("[XNFS] ?? Replacing previous effect (%p) for %s\n", existingFx, key.c_str());
+        existingFx->Release();
+    }
+
+    existingFx = *outEffect;
+    existingFx->AddRef();
+
+    if (g_RenderTargetManager.g_LastReloadedFx)
+        g_RenderTargetManager.g_LastReloadedFx->Release();
+    g_RenderTargetManager.g_LastReloadedFx = *outEffect;
+    g_RenderTargetManager.g_LastReloadedFx->AddRef();
+
+    printf_s("[XNFS] ? Shader created and tracked (file ex): %s (%p)\n", key.c_str(), *outEffect);
+
+    {
+        const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
+        if (gameFlow >= 3 && !g_RenderTargetManager.g_DeviceResetInProgress && g_RenderTargetManager.g_CurrentBlurTex)
+            ReloadBlurBindings(*outEffect, key);
+    }
+
+    return hr;
+}
+
+static void TryInstallD3DXHooks()
+{
+    if (g_D3DXHooksInstalled)
+        return;
+
+    const char* kD3dxDlls[] =
+    {
+        "d3dx9_43.dll",
+        "d3dx9_42.dll",
+        "d3dx9_41.dll",
+        "d3dx9_40.dll",
+    };
+
+    HMODULE d3dx = nullptr;
+    for (const char* dll : kD3dxDlls)
+    {
+        d3dx = GetModuleHandleA(dll);
+        if (d3dx)
+        {
+            printf_s("[Init] ? Found %s\n", dll);
+            break;
+        }
+    }
+    if (!d3dx)
+        return;
+
+    void* addr = GetProcAddress(d3dx, "D3DXCreateEffectFromResourceA");
+    if (addr && !g_RenderTargetManager.RealCreateFromResource)
+        g_RenderTargetManager.RealCreateFromResource =
+            (RenderTargetManager::D3DXCreateEffectFromResourceAFn)addr;
+
+    void* fileAddr = GetProcAddress(d3dx, "D3DXCreateEffectFromFileA");
+    void* fileExAddr = GetProcAddress(d3dx, "D3DXCreateEffectFromFileExA");
+    void* effectAddr = GetProcAddress(d3dx, "D3DXCreateEffect");
+
+    if (!fileAddr && !fileExAddr && !effectAddr)
+        return;
+
+    if (MH_Initialize() != MH_OK)
+    {
+        printf_s("[Init] ? MH_Initialize failed\n");
+        return;
+    }
+
+    bool hooked = false;
+    if (fileAddr)
+    {
+        if (!RealCreateFromFileA)
+            RealCreateFromFileA = reinterpret_cast<D3DXCreateEffectFromFileAFn>(fileAddr);
+        if (MH_CreateHook(fileAddr, HookedCreateFromFileA,
+                          reinterpret_cast<void**>(&RealCreateFromFileA)) == MH_OK &&
+            MH_EnableHook(fileAddr) == MH_OK)
+        {
+            printf_s("[Init] Hooked D3DXCreateEffectFromFileA (late)\n");
+            hooked = true;
+        }
+    }
+
+    if (fileExAddr)
+    {
+        if (!RealCreateFromFileExA)
+            RealCreateFromFileExA = reinterpret_cast<D3DXCreateEffectFromFileExAFn>(fileExAddr);
+        if (MH_CreateHook(fileExAddr, HookedCreateFromFileExA,
+                          reinterpret_cast<void**>(&RealCreateFromFileExA)) == MH_OK &&
+            MH_EnableHook(fileExAddr) == MH_OK)
+        {
+            printf_s("[Init] Hooked D3DXCreateEffectFromFileExA (late)\n");
+            hooked = true;
+        }
+    }
+
+    if (effectAddr)
+    {
+        if (!RealCreateEffect)
+            RealCreateEffect = reinterpret_cast<D3DXCreateEffectFn>(effectAddr);
+        if (MH_CreateHook(effectAddr, HookedCreateEffect,
+                          reinterpret_cast<void**>(&RealCreateEffect)) == MH_OK &&
+            MH_EnableHook(effectAddr) == MH_OK)
+        {
+            printf_s("[Init] Hooked D3DXCreateEffect (late)\n");
+            hooked = true;
+        }
+    }
+
+    if (hooked)
+        g_D3DXHooksInstalled = true;
 }
 
 void OnDeviceReset(LPDIRECT3DDEVICE9 device)
@@ -410,9 +964,11 @@ void OnDeviceReset(LPDIRECT3DDEVICE9 device)
     {
         for (auto& [name, fx] : g_RenderTargetManager.g_ActiveEffects)
         {
+            if (!IsValidShaderPointer(fx))
+                continue;
             fx->OnResetDevice();
 
-            if (name == "IDI_VISUALTREATMENT_FX")
+            if (name == "IDI_VISUALTREATMENT_FX" || name == "IDI_OVERBRIGHT_FX")
                 ReloadBlurBindings(fx, name);
         }
     }
@@ -424,253 +980,77 @@ void OnDeviceReset(LPDIRECT3DDEVICE9 device)
 
 void OnDeviceLost()
 {
+    int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
     g_RenderTargetManager.OnDeviceLost(); // Delegate to RenderTargetManager's cleanup
-    ScrubShaderCleanupTable();
+    if (gameFlow >= 3)
+        ScrubShaderCleanupTable();
     printf_s("[XNFS] ✅ Delegated OnDeviceLost to RenderTargetManager\n");
 }
 
-void RenderBlurPass(IDirect3DDevice9* device)
-{
-    if (!device || !g_RenderTargetManager.g_CurrentBlurTex) return;
-
-    ID3DXEffect* fx = g_RenderTargetManager.g_BlurEffect;
-    if (!fx)
-    {
-        auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-        if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
-            return;
-        if (FAILED(it->second->CloneEffect(device, &g_RenderTargetManager.g_BlurEffect)))
-            return;
-        fx = g_RenderTargetManager.g_BlurEffect;
-    }
-
-    IDirect3DSurface9* oldRT = nullptr;
-    if (FAILED(device->GetRenderTarget(0, &oldRT)) || !oldRT) return;
-
-    // 🔽 Save the CURRENT viewport and restore later
-    D3DVIEWPORT9 savedVP{};
-    device->GetViewport(&savedVP);
-
-    IDirect3DTexture9* srcTex = g_RenderTargetManager.g_UseTexA
-        ? g_RenderTargetManager.g_MotionBlurTexA
-        : g_RenderTargetManager.g_MotionBlurTexB;
-    IDirect3DTexture9* dstTex = g_RenderTargetManager.g_UseTexA
-        ? g_RenderTargetManager.g_MotionBlurTexB
-        : g_RenderTargetManager.g_MotionBlurTexA;
-
-    IDirect3DSurface9* dstSurface = nullptr;
-    if (FAILED(dstTex->GetSurfaceLevel(0, &dstSurface)) || !dstSurface) {
-        SAFE_RELEASE(oldRT);
-        return;
-    }
-
-    device->SetRenderTarget(0, dstSurface);
-
-    // ✅ Set viewport to the SIZE of dstSurface
-    D3DSURFACE_DESC sd{};
-    dstSurface->GetDesc(&sd);
-    D3DVIEWPORT9 vp{};
-    vp.X = 0; vp.Y = 0;
-    vp.Width  = sd.Width;
-    vp.Height = sd.Height;
-    vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
-    device->SetViewport(&vp);
-
-    device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(255, 255, 0, 255), 1.0f, 0);
-
-    D3DXHANDLE hBlurParams = fx->GetParameterByName(nullptr, "BlurParams");
-    D3DXHANDLE hMiscMap3 = fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-
-    IDirect3DBaseTexture9* oldMiscMap3 = nullptr;
-    D3DXVECTOR4 oldBlurParams{};
-    bool haveOldBlurParams = false;
-
-    if (hMiscMap3)
-        fx->GetTexture(hMiscMap3, &oldMiscMap3);
-    if (hBlurParams && SUCCEEDED(fx->GetVector(hBlurParams, &oldBlurParams)))
-        haveOldBlurParams = true;
-
-    // setup shader:
-    if (hMiscMap3)
-        fx->SetTexture(hMiscMap3, srcTex);
-    if (hBlurParams)
-    {
-        D3DXVECTOR4 blurParams(0.5f, 0.0005f, 0.0f, 0.0f);
-        fx->SetVector(hBlurParams, &blurParams);
-    }
-
-    D3DXHANDLE tech = fx->GetTechniqueByName("visualtreatment_branching");
-    if (!tech || FAILED(fx->SetTechnique(tech))) goto cleanup;
-
-    D3DXHANDLE oldTech = fx->GetCurrentTechnique();
-    device->SetRenderState(D3DRS_ZENABLE, FALSE);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-
-    if (UINT passes = 0; SUCCEEDED(fx->Begin(&passes, 0))) {
-        for (UINT i = 0; i < passes; ++i) {
-            if (SUCCEEDED(fx->BeginPass(i))) {
-                RenderTargetManager::Vertex vertices[4] = {
-                    {-0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f},
-                    {(float)g_RenderTargetManager.g_Width - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f},
-                    {-0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f},
-                    {(float)g_RenderTargetManager.g_Width - 0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f,
-                     1.0f, 1.0f, 1.0f},
-                };
-                device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-                device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2,
-                    vertices, sizeof(RenderTargetManager::Vertex));
-                fx->EndPass();
-            }
-        }
-        fx->End();
-    }
-
-cleanup:
-    if (hMiscMap3)
-        fx->SetTexture(hMiscMap3, oldMiscMap3);
-    if (oldMiscMap3)
-        oldMiscMap3->Release();
-    if (hBlurParams && haveOldBlurParams)
-        fx->SetVector(hBlurParams, &oldBlurParams);
-    if (oldTech)
-        fx->SetTechnique(oldTech);
-
-    // 🔁 Restore previous RT and viewport
-    device->SetRenderTarget(0, oldRT);
-    device->SetViewport(&savedVP);
-
-    SAFE_RELEASE(dstSurface);
-    SAFE_RELEASE(oldRT);
-
-    g_RenderTargetManager.g_UseTexA = !g_RenderTargetManager.g_UseTexA;
-    g_RenderTargetManager.g_CurrentBlurTex = dstTex;
-
-    SAFE_RELEASE(g_RenderTargetManager.g_CurrentBlurSurface);
-    dstTex->GetSurfaceLevel(0, &g_RenderTargetManager.g_CurrentBlurSurface);
-}
-
-void RenderBlurCompositePass(IDirect3DDevice9* device)
-{
-    if (!device || !g_RenderTargetManager.g_CurrentBlurTex) return;
-
-    ID3DXEffect* fx = g_RenderTargetManager.g_BlurEffect;
-    if (!fx)
-    {
-        auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-        if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
-            return;
-        if (FAILED(it->second->CloneEffect(device, &g_RenderTargetManager.g_BlurEffect)))
-            return;
-        fx = g_RenderTargetManager.g_BlurEffect;
-    }
-
-    IDirect3DSurface9* backBuffer = nullptr;
-    if (FAILED(device->GetRenderTarget(0, &backBuffer)) || !backBuffer) return;
-
-    // 🔽 Save viewport and set to backbuffer size
-    D3DVIEWPORT9 savedVP{};
-    device->GetViewport(&savedVP);
-
-    D3DSURFACE_DESC bbDesc{};
-    backBuffer->GetDesc(&bbDesc);
-
-    D3DVIEWPORT9 vp{};
-    vp.X = 0; vp.Y = 0;
-    vp.Width  = bbDesc.Width;
-    vp.Height = bbDesc.Height;
-    vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
-    device->SetViewport(&vp);
-
-    device->SetRenderTarget(0, backBuffer); // (already is, but explicit is fine)
-
-    D3DXHANDLE oldTech = fx->GetCurrentTechnique();
-    // Technique safety: validate exists
-    D3DXHANDLE tech = fx->GetTechniqueByName("composite_blur");
-    if (!tech || FAILED(fx->ValidateTechnique(tech)) || FAILED(fx->SetTechnique(tech))) {
-        printf_s("⚠️ Technique 'composite_blur' missing/invalid\n");
-        device->SetViewport(&savedVP);
-        SAFE_RELEASE(backBuffer);
-        return;
-    }
-
-    D3DXHANDLE hMiscMap3 = fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE");
-
-    IDirect3DBaseTexture9* oldMiscMap3 = nullptr;
-
-    if (hMiscMap3)
-        fx->GetTexture(hMiscMap3, &oldMiscMap3);
-
-    fx->SetTexture("MISCMAP3_TEXTURE", g_RenderTargetManager.g_CurrentBlurTex);
-
-    device->SetRenderState(D3DRS_ZENABLE, FALSE);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-
-    if (UINT passes = 0; SUCCEEDED(fx->Begin(&passes, 0))) {
-        for (UINT i = 0; i < passes; ++i) {
-            if (SUCCEEDED(fx->BeginPass(i))) {
-                RenderTargetManager::Vertex vertices[4] = {
-                    {-0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f},
-                    {(float)g_RenderTargetManager.g_Width - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f},
-                    {-0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f},
-                    {(float)g_RenderTargetManager.g_Width - 0.5f, (float)g_RenderTargetManager.g_Height - 0.5f, 0.0f,
-                     1.0f, 1.0f, 1.0f},
-                };
-                device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-                device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2,
-                    vertices, sizeof(RenderTargetManager::Vertex));
-                fx->EndPass();
-            }
-        }
-        fx->End();
-    }
-
-    if (hMiscMap3)
-        fx->SetTexture(hMiscMap3, oldMiscMap3);
-    if (oldMiscMap3)
-        oldMiscMap3->Release();
-    if (oldTech)
-        fx->SetTechnique(oldTech);
-
-    // 🔁 Restore viewport
-    device->SetViewport(&savedVP);
-    SAFE_RELEASE(backBuffer);
-}
 
 HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
 {
     if (!device || !params)
         return D3DERR_INVALIDCALL;
 
+    if (g_RenderTargetManager.g_DeviceResetInProgress)
+        return g_RenderTargetManager.oReset(device, params);
+
+    g_RenderTargetManager.g_DeviceResetInProgress = true;
+
     HRESULT coop = device->TestCooperativeLevel();
+
+    if (coop == D3D_OK)
+    {
+        g_RenderTargetManager.g_DeviceResetInProgress = false;
+        return g_RenderTargetManager.oReset(device, params);
+    }
+
     if (coop == D3DERR_DEVICELOST)
     {
-        printf_s("[XNFS] ? Device still lost, TestCooperativeLevel = 0x%08X\\n", coop);
+        printf_s("[XNFS] Device still lost, TestCooperativeLevel = 0x%08X\n", coop);
+        g_RenderTargetManager.g_DeviceResetInProgress = false;
         return coop;
+    }
+
+    if (coop != D3DERR_DEVICENOTRESET)
+    {
+        printf_s("[XNFS] Device not ready for Reset, TestCooperativeLevel = 0x%08X\n", coop);
+        g_RenderTargetManager.g_DeviceResetInProgress = false;
+        return coop;
+    }
+
+    printf_s(
+        "[XNFS] Reset start: coop=0x%08X bb=%ux%u fmt=%u win=%d msaa=%u\n",
+        coop,
+        params->BackBufferWidth,
+        params->BackBufferHeight,
+        params->BackBufferFormat,
+        params->Windowed,
+        params->MultiSampleType
+    );
+
+    if (params->Windowed && params->BackBufferFormat != D3DFMT_UNKNOWN)
+    {
+        printf_s(
+            "[XNFS] Forcing BackBufferFormat to UNKNOWN for windowed reset (was %u)\n",
+            params->BackBufferFormat
+        );
+        params->BackBufferFormat = D3DFMT_UNKNOWN;
     }
 
     OnDeviceLost(); // release safely
 
-    // This is mostly for D3DPOOL_MANAGED, but calling it after OnDeviceLost():
-    // device->EvictManagedResources();  // CRASH ?
+    // device->EvictManagedResources();  // don't call — crashes in MW
 
     HRESULT hr = g_RenderTargetManager.oReset(device, params);
 
     if (SUCCEEDED(hr))
-    {
         OnDeviceReset(device);
-        g_RenderTargetManager.g_DeviceResetInProgress = false;
-    }
     else
-    {
-        printf_s("[XNFS] ❌ oReset failed: HRESULT = 0x%08X\n", hr);
-    }
+        printf_s("[XNFS] oReset failed: HRESULT = 0x%08X\n", hr);
 
+    g_RenderTargetManager.g_DeviceResetInProgress = false;
     return hr;
 }
 
@@ -706,9 +1086,11 @@ static void OnFramePresent()
     }
 }
 
+
 // Hooked EndScene
 HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
 {
+    static uint32_t lastSceneLogFrame = 0;
     if (!device) return oEndScene(device);
     if (!g_Device) SetGameDevice(device);
 
@@ -719,34 +1101,8 @@ HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
         !g_RenderTargetManager.g_MotionBlurTexB)
         return oEndScene(device);
 
-    if (!g_RenderTargetManager.g_BlurEffect)
-    {
-        auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
-        if (it == g_RenderTargetManager.g_ActiveEffects.end() || !it->second || !IsValidShaderPointer(it->second))
-            return oEndScene(device);
-    }
-
     // 🔒 Save ALL render state (including viewport) and restore on exit
     ScopedStateBlock _sb(device);
-
-    // 1) Copy backbuffer for blur input
-    if (g_RenderTargetManager.g_LastSceneSurface)
-    {
-        device->StretchRect(g_RenderTargetManager.g_LastSceneSurface, nullptr,
-                            g_RenderTargetManager.g_CurrentBlurSurface, nullptr, D3DTEXF_LINEAR);
-    }
-    else if (IDirect3DSurface9* backBuffer = nullptr;
-             SUCCEEDED(device->GetRenderTarget(0, &backBuffer)) && backBuffer)
-    {
-        device->StretchRect(backBuffer, nullptr, g_RenderTargetManager.g_CurrentBlurSurface, nullptr, D3DTEXF_LINEAR);
-        backBuffer->Release();
-    }
-
-    // 2) Blur into ping-pong RT
-    RenderBlurPass(device);
-
-    // 3) Composite back to backbuffer
-    RenderBlurCompositePass(device);
 
     return oEndScene(device);
 }
@@ -755,18 +1111,119 @@ HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3
 {
     if (device && index == 0)
     {
-        if (!g_RenderTargetManager.g_BackBufferSurface)
+        static uint32_t lastRtLogFrame = 0;
+        static uint32_t lastRtFrame = 0;
+        static IDirect3DSurface9* firstFullSizeRt = nullptr;
+        static bool sawSmallRtThisFrame = false;
+        if (eFrameCounter != lastRtFrame)
         {
-            IDirect3DSurface9* backBuffer = nullptr;
-            if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
+            lastRtFrame = eFrameCounter;
+            g_CustomMotionBlurRanThisFrame = false;
+            g_SceneTargetThisFrame = nullptr;
+            g_SceneTargetBestArea = 0;
+            SAFE_RELEASE(firstFullSizeRt);
+            sawSmallRtThisFrame = false;
+        }
+        IDirect3DSurface9* backBuffer = nullptr;
+        D3DSURFACE_DESC bbDesc{};
+        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
+        {
+            backBuffer->GetDesc(&bbDesc);
+            if (bbDesc.Width != g_LastBackBufferW || bbDesc.Height != g_LastBackBufferH)
             {
-                SAFE_RELEASE(g_RenderTargetManager.g_BackBufferSurface);
-                g_RenderTargetManager.g_BackBufferSurface = backBuffer;
+                g_LastBackBufferW = bbDesc.Width;
+                g_LastBackBufferH = bbDesc.Height;
+                printf_s("[XNFS] ? BackBuffer: %ux%u fmt=%u ptr=%p\n",
+                         bbDesc.Width, bbDesc.Height, bbDesc.Format, backBuffer);
+            }
+        }
+        SAFE_RELEASE(g_RenderTargetManager.g_BackBufferSurface);
+        g_RenderTargetManager.g_BackBufferSurface = backBuffer;
+
+        const bool isOurBlurSurface =
+            renderTarget &&
+            (renderTarget == g_RenderTargetManager.g_CurrentBlurSurface ||
+                renderTarget == g_RenderTargetManager.g_MotionBlurSurfaceA ||
+                renderTarget == g_RenderTargetManager.g_MotionBlurSurfaceB);
+
+        if (renderTarget)
+        {
+            D3DSURFACE_DESC sd{};
+            if (SUCCEEDED(renderTarget->GetDesc(&sd)))
+            {
+                if (g_KnownRenderTargets.insert(renderTarget).second)
+                {
+                    printf_s("[XNFS] ? RT0 set: %ux%u fmt=%u ptr=%p\n",
+                             sd.Width, sd.Height, sd.Format, renderTarget);
+                }
             }
         }
 
-        if (renderTarget && renderTarget != g_RenderTargetManager.g_BackBufferSurface)
+        if (renderTarget && renderTarget != g_RenderTargetManager.g_BackBufferSurface && !isOurBlurSurface)
         {
+            D3DSURFACE_DESC sd{};
+            if (SUCCEEDED(renderTarget->GetDesc(&sd)) && bbDesc.Width && bbDesc.Height)
+            {
+                if (sd.Width == bbDesc.Width && sd.Height == bbDesc.Height && !sawSmallRtThisFrame &&
+                    !firstFullSizeRt)
+                {
+                    firstFullSizeRt = renderTarget;
+                    firstFullSizeRt->AddRef();
+                }
+                if (sd.Width < bbDesc.Width || sd.Height < bbDesc.Height)
+                    sawSmallRtThisFrame = true;
+
+                const float bbAspect = (float)bbDesc.Width / (float)bbDesc.Height;
+                const float rtAspect = (float)sd.Width / (float)sd.Height;
+                const float aspectDiff = fabsf(rtAspect - bbAspect);
+                const uint32_t area = sd.Width * sd.Height;
+                const uint32_t bbArea = bbDesc.Width * bbDesc.Height;
+                if (aspectDiff <= 0.02f && area >= (bbArea * 8 / 10))
+                {
+                    const bool betterArea = area > g_SceneTargetBestArea;
+                    const bool sameArea = area == g_SceneTargetBestArea;
+                    const bool lowerPtr = g_SceneTargetThisFrame &&
+                        reinterpret_cast<uintptr_t>(renderTarget) <
+                        reinterpret_cast<uintptr_t>(g_SceneTargetThisFrame);
+                    if (betterArea || (sameArea && (g_SceneTargetThisFrame == nullptr || lowerPtr)))
+                    {
+                        g_SceneTargetBestArea = area;
+                        g_SceneTargetThisFrame = renderTarget;
+                        g_LastSceneFullFrame = eFrameCounter;
+                        if (g_RenderTargetManager.g_LastSceneFullSurface != renderTarget)
+                        {
+                            SAFE_RELEASE(g_RenderTargetManager.g_LastSceneFullSurface);
+                            g_RenderTargetManager.g_LastSceneFullSurface = renderTarget;
+                            g_RenderTargetManager.g_LastSceneFullSurface->AddRef();
+                        }
+                        if (g_RenderTargetManager.g_LastSceneFullSurface)
+                        {
+                            IDirect3DTexture9* sceneTex = nullptr;
+                            if (SUCCEEDED(g_RenderTargetManager.g_LastSceneFullSurface->GetContainer(
+                                    __uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&sceneTex))) &&
+                                sceneTex)
+                            {
+                                if (sceneTex != g_RenderTargetManager.g_LastSceneFullTex)
+                                {
+                                    SAFE_RELEASE(g_RenderTargetManager.g_LastSceneFullTex);
+                                    g_RenderTargetManager.g_LastSceneFullTex = sceneTex;
+                                }
+                                else
+                                {
+                                    sceneTex->Release();
+                                }
+                            }
+                        }
+                        if (eFrameCounter != lastRtLogFrame)
+                        {
+                            lastRtLogFrame = eFrameCounter;
+                            printf_s("[XNFS] ? Scene RT picked: %ux%u fmt=%u usage=%u ptr=%p\n",
+                                     sd.Width, sd.Height, sd.Format, sd.Usage, renderTarget);
+                        }
+                    }
+                }
+            }
+
             if (renderTarget != g_RenderTargetManager.g_LastSceneSurface)
             {
                 SAFE_RELEASE(g_RenderTargetManager.g_LastSceneSurface);
@@ -782,7 +1239,27 @@ HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3
 HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RECT* dest, HWND hwnd,
                              const RGNDATA* dirty)
 {
+    static uint32_t lastSceneLogFrame = 0;
     SetGameDevice(device);
+
+    if (device)
+    {
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
+        {
+            D3DSURFACE_DESC bbDesc{};
+            if (SUCCEEDED(backBuffer->GetDesc(&bbDesc)) &&
+                (bbDesc.Width != g_RenderTargetManager.g_Width || bbDesc.Height != g_RenderTargetManager.g_Height))
+            {
+                printf_s("[XNFS] ? Blur RT resize: %ux%u -> %ux%u\n",
+                         g_RenderTargetManager.g_Width, g_RenderTargetManager.g_Height,
+                         bbDesc.Width, bbDesc.Height);
+                g_RenderTargetManager.OnDeviceLost();
+                g_RenderTargetManager.OnDeviceReset(device);
+            }
+        }
+        SAFE_RELEASE(backBuffer);
+    }
 
     void** vtable = *reinterpret_cast<void***>(device);
 
@@ -1007,6 +1484,13 @@ DWORD WINAPI DeferredHookThread(LPVOID)
     vtable[16] = (void*)&hkReset;
     VirtualProtect(&vtable[16], sizeof(void*), oldProtect, &oldProtect);
     printf_s("[Init] Hooked IDirect3DDevice9::Reset (deferred)\n");
+
+    for (int i = 0; i < 200 && !g_D3DXHooksInstalled; ++i)
+    {
+        TryInstallD3DXHooks();
+        if (!g_D3DXHooksInstalled)
+            Sleep(50);
+    }
     return 0;
 }
 
@@ -1026,6 +1510,90 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             g_RenderTargetManager.RealCreateFromResource = (RenderTargetManager::D3DXCreateEffectFromResourceAFn)addr;
             injector::MakeCALL(call_D3DXCreateEffectFromResourceA_ADDRESS, HookedCreateFromResource, true);
 
+            void* fileAddr = GetProcAddress(d3dx, "D3DXCreateEffectFromFileA");
+            void* effectAddr = GetProcAddress(d3dx, "D3DXCreateEffect");
+            if (fileAddr)
+            {
+                RealCreateFromFileA = reinterpret_cast<D3DXCreateEffectFromFileAFn>(fileAddr);
+                if (MH_Initialize() == MH_OK)
+                {
+                    if (MH_CreateHook(fileAddr, HookedCreateFromFileA,
+                                      reinterpret_cast<void**>(&RealCreateFromFileA)) == MH_OK &&
+                        MH_EnableHook(fileAddr) == MH_OK)
+                    {
+                        printf_s("[Init] Hooked D3DXCreateEffectFromFileA\n");
+                        g_D3DXHooksInstalled = true;
+                    }
+                    else
+                    {
+                        printf_s("[Init] ? Failed to hook D3DXCreateEffectFromFileA\n");
+                    }
+                }
+                else
+                {
+                    printf_s("[Init] ? MH_Initialize failed\n");
+                }
+            }
+
+            if (effectAddr)
+            {
+                if (!RealCreateEffect)
+                    RealCreateEffect = reinterpret_cast<D3DXCreateEffectFn>(effectAddr);
+                const MH_STATUS createStatus =
+                    MH_CreateHook(effectAddr, HookedCreateEffect,
+                                  reinterpret_cast<void**>(&RealCreateEffect));
+                const MH_STATUS enableStatus =
+                    (createStatus == MH_OK || createStatus == MH_ERROR_ALREADY_CREATED)
+                        ? MH_EnableHook(effectAddr)
+                        : createStatus;
+
+                if ((createStatus == MH_OK || createStatus == MH_ERROR_ALREADY_CREATED) &&
+                    (enableStatus == MH_OK || enableStatus == MH_ERROR_ENABLED))
+                {
+                    printf_s("[Init] Hooked D3DXCreateEffect\n");
+                }
+                else
+                {
+                    printf_s("[Init] ? Failed to hook D3DXCreateEffect: create=%d enable=%d\n",
+                             (int)createStatus,
+                             (int)enableStatus);
+                }
+            }
+
+            {
+                const MH_STATUS initStatus = MH_Initialize();
+                if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+                {
+                    printf_s("[Init] ? MH_Initialize failed for IVisualTreatment::Get: %d\n",
+                             (int)initStatus);
+                }
+                else
+                {
+                    const MH_STATUS createStatus =
+                        MH_CreateHook((LPVOID)0x006DFAF0, HookedIVisualTreatmentGet,
+                                      reinterpret_cast<void**>(&RealIVisualTreatmentGet));
+                    const MH_STATUS enableStatus =
+                        (createStatus == MH_OK || createStatus == MH_ERROR_ALREADY_CREATED)
+                            ? MH_EnableHook((LPVOID)0x006DFAF0)
+                            : createStatus;
+
+                    if ((createStatus == MH_OK || createStatus == MH_ERROR_ALREADY_CREATED) &&
+                        (enableStatus == MH_OK || enableStatus == MH_ERROR_ENABLED))
+                    {
+                        printf_s("[Init] Hooked IVisualTreatment::Get\n");
+                    }
+                    else
+                    {
+                        printf_s("[Init] ? Failed to hook IVisualTreatment::Get: create=%d enable=%d\n",
+                                 (int)createStatus,
+                                 (int)enableStatus);
+                    }
+                }
+            }
+
+            injector::MakeJMP(0x00750B10, RenderDispatchHook, true);
+            PatchMotionBlurFix();
+
             ApplyGraphicsManagerMainOriginal = (decltype(ApplyGraphicsManagerMainOriginal))
                 call_ApplyGraphicsManagerMainOriginal_ADDRESS;
             printf_s("[Init] ApplyGraphicsManagerMainOriginal set to 0x004F17F0\n");
@@ -1042,12 +1610,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         printf_s("[Shutdown] Cleaning up...\n");
-
-        OnDeviceLost(); // Releases all textures, surfaces, etc.
+        g_RenderTargetManager.g_DeviceResetInProgress = true;
 
         for (auto& [name, fx] : g_RenderTargetManager.g_ActiveEffects)
         {
-            if (fx)
+            if (fx && IsValidShaderPointer(fx))
             {
                 printf_s("[Shutdown] Releasing shader: %s (%p)\n", name.c_str(), fx);
                 fx->Release();
@@ -1055,7 +1622,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         }
         g_RenderTargetManager.g_ActiveEffects.clear();
 
-        if (g_RenderTargetManager.g_LastReloadedFx)
+        if (g_RenderTargetManager.g_LastReloadedFx &&
+            IsValidShaderPointer(g_RenderTargetManager.g_LastReloadedFx))
         {
             g_RenderTargetManager.g_LastReloadedFx->Release();
             g_RenderTargetManager.g_LastReloadedFx = nullptr;
@@ -1063,7 +1631,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 
         for (int i = 0; i < 62; ++i)
         {
-            if (g_SlotRetainedFx[i])
+            if (g_SlotRetainedFx[i] && IsValidShaderPointer(g_SlotRetainedFx[i]))
             {
                 g_SlotRetainedFx[i]->Release();
                 g_SlotRetainedFx[i] = nullptr;
@@ -1075,11 +1643,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         g_LastEView = nullptr;
         g_pVisualTreatment = nullptr;
 
-        ScrubShaderCleanupTable();
+        // Avoid touching engine tables during detach.
 
         printf_s("[Shutdown] ✅ Cleanup complete.\n");
     }
 
     return TRUE;
 }
-

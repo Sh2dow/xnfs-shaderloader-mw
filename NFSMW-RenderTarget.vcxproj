@@ -94,6 +94,8 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="EffectManager.h" />
+    <ClInclude Include="Globals.h" />
     <ClInclude Include="Hooks.h" />
     <ClInclude Include="Log.h" />
     <ClInclude Include="RenderTargetManager.h" />
@@ -102,6 +104,8 @@
     <ClInclude Include="Validators.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="EffectManager.cpp" />
+    <ClCompile Include="Globals.cpp" />
     <ClCompile Include="dllmain.cpp">
       <CompileAsManaged Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">false</CompileAsManaged>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -111,6 +115,7 @@
       </PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Hooks.cpp" />
+    <ClCompile Include="MotionBlurPass.cpp" />
     <ClCompile Include="RenderTargetManager.cpp" />
     <ClCompile Include="Modules\minhook\src\hde\hde32.c" />
     <ClCompile Include="Modules\minhook\src\trampoline.c" />

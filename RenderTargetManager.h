@@ -20,11 +20,15 @@ public:
 
     ID3DXEffect* g_LastReloadedFx = nullptr;
     ID3DXEffect* g_BlurEffect = nullptr;
+    ID3DXEffect* g_CustomBlurEffect = nullptr;
+    IDirect3DVertexDeclaration9* g_ScreenQuadDecl = nullptr;
 
     IDirect3DTexture9* g_MotionBlurTexA = nullptr;
     IDirect3DTexture9* g_MotionBlurTexB = nullptr;
     IDirect3DTexture9* g_CurrentBlurTex = nullptr;
     IDirect3DSurface9* g_CurrentBlurSurface = nullptr;
+    IDirect3DSurface9* g_MotionBlurSurfaceA = nullptr;
+    IDirect3DSurface9* g_MotionBlurSurfaceB = nullptr;
 
     IDirect3DTexture9* g_GainMapTex = nullptr;
     IDirect3DTexture9* g_VignetteTex = nullptr;
@@ -36,6 +40,8 @@ public:
     IDirect3DTexture9* g_DepthTex = nullptr;
     IDirect3DSurface9* g_BackBufferSurface = nullptr;
     IDirect3DSurface9* g_LastSceneSurface = nullptr;
+    IDirect3DSurface9* g_LastSceneFullSurface = nullptr;
+    IDirect3DTexture9* g_LastSceneFullTex = nullptr;
 
     bool g_UseTexA = true;
     UINT g_Width = 0;
@@ -64,6 +70,19 @@ public:
         float x, y, z, rhw;
         float u, v;
     } screenQuadVerts[4];
+
+    struct QuadVertex8
+    {
+        float x, y, z, rhw;
+        float t0[4];
+        float t1[4];
+        float t2[4];
+        float t3[4];
+        float t4[4];
+        float t5[4];
+        float t6[4];
+        float t7[4];
+    };
 
     LPDIRECT3DTEXTURE9 g_MyBlurTexture = nullptr;
     LPDIRECT3DSURFACE9 g_MyBlurSurface = nullptr;

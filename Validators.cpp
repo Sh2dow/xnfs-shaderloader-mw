@@ -31,12 +31,18 @@ bool IsValidThis(void* ptr)
 
     __try
     {
+        if (IsBadReadPtr(ptr, sizeof(void*)))
+            return false;
+
         void* vtable = *(void**)ptr;
         if (!vtable)
             return false;
 
+        if (IsBadReadPtr(vtable, sizeof(void*)))
+            return false;
+
         void* fn = *((void**)vtable); // vtable[0]
-        return fn != nullptr && !IsBadCodePtr((FARPROC)fn);
+        return fn != nullptr && IsValidCodePtr(fn);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -82,7 +88,41 @@ bool IsValidShaderPointer(ID3DXEffect* fx)
     if (!IsValidShaderPointer_SEH(fx, &vtable, &prot))
         return false;
 
-    bool valid = !IsBadCodePtr((FARPROC)vtable[0]);
+    MEMORY_BASIC_INFORMATION mbiFx = {};
+    if (!VirtualQuery(fx, &mbiFx, sizeof(mbiFx)) || mbiFx.State != MEM_COMMIT)
+        return false;
+
+    auto isInModule = [](void* ptr, HMODULE mod) -> bool
+    {
+        if (!mod || !ptr)
+            return false;
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(ptr, &mbi, sizeof(mbi)))
+            return false;
+        return mbi.AllocationBase == mod;
+    };
+
+    HMODULE d3dxMod = GetModuleHandleA("d3dx9_43.dll");
+    if (!d3dxMod) d3dxMod = GetModuleHandleA("d3dx9_42.dll");
+    if (!d3dxMod) d3dxMod = GetModuleHandleA("d3dx9_41.dll");
+
+    bool valid = false;
+    if (d3dxMod)
+    {
+        if (isInModule(vtable, d3dxMod) && isInModule(vtable[0], d3dxMod))
+        {
+            valid = IsValidCodePtr(vtable[0]);
+        }
+        else
+        {
+            // Some builds place the vtable outside d3dx; fall back to executable check.
+            valid = IsValidCodePtr(vtable[0]) && !IsBadCodePtr((FARPROC)vtable[0]);
+        }
+    }
+    else
+    {
+        valid = IsValidCodePtr(vtable[0]) && !IsBadCodePtr((FARPROC)vtable[0]);
+    }
 
     static std::unordered_map<uintptr_t, int> invalidVtableHits;
     if (!valid)
@@ -94,6 +134,78 @@ bool IsValidShaderPointer(ID3DXEffect* fx)
     }
 
     return valid;
+}
+
+bool IsValidEffectObject(ID3DXEffect* fx)
+{
+    if (!fx || reinterpret_cast<uintptr_t>(fx) < 0x10000)
+        return false;
+
+    __try
+    {
+        D3DXEFFECT_DESC desc = {};
+        HRESULT hr = fx->GetDesc(&desc);
+        if (FAILED(hr))
+            return false;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool IsLikelyEffectPointer(ID3DXEffect* fx)
+{
+    if (!fx || reinterpret_cast<uintptr_t>(fx) < 0x10000)
+        return false;
+
+    __try
+    {
+        if (IsBadReadPtr(fx, sizeof(void*)))
+            return false;
+        void** vtable = *(void***)fx;
+        if (!vtable || IsBadReadPtr(vtable, sizeof(void*)))
+            return false;
+        void* fn = vtable[0];
+        MEMORY_BASIC_INFORMATION mbi1 = {};
+        MEMORY_BASIC_INFORMATION mbi2 = {};
+        if (!VirtualQuery(vtable, &mbi1, sizeof(mbi1)))
+            return false;
+        if (!VirtualQuery(fn, &mbi2, sizeof(mbi2)))
+            return false;
+        if (mbi1.State != MEM_COMMIT || mbi2.State != MEM_COMMIT)
+            return false;
+        return IsValidCodePtr(fn);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool ProbeEffectHandles(ID3DXEffect* fx)
+{
+    if (!fx || reinterpret_cast<uintptr_t>(fx) < 0x10000)
+        return false;
+
+    __try
+    {
+        D3DXHANDLE h = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
+        if (h)
+            return true;
+        h = fx->GetParameterByName(nullptr, "DiffuseMap");
+        if (h)
+            return true;
+        D3DXEFFECT_DESC desc = {};
+        if (SUCCEEDED(fx->GetDesc(&desc)) && desc.Parameters > 0)
+            return true;
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
 }
 
 bool IsD3D9ExAvailable()

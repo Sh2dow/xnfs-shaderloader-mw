@@ -81,7 +81,7 @@ extern Present_t oPresent;
 using EndScene_t = HRESULT(WINAPI*)(LPDIRECT3DDEVICE9);
 inline EndScene_t oEndScene = nullptr;
 
-inline ID3DXEffect* g_SlotRetainedFx[64] = {};
+inline ID3DXEffect* g_SlotRetainedFx[62] = {};
 
 HRESULT WINAPI HookedCreateFromResource(
     LPDIRECT3DDEVICE9 device,
