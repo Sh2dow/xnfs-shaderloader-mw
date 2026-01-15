@@ -103,9 +103,6 @@ bool IsValidShaderPointer(ID3DXEffect* fx)
     };
 
     HMODULE d3dxMod = GetModuleHandleA("d3dx9_43.dll");
-    if (!d3dxMod) d3dxMod = GetModuleHandleA("d3dx9_42.dll");
-    if (!d3dxMod) d3dxMod = GetModuleHandleA("d3dx9_41.dll");
-
     bool valid = false;
     if (d3dxMod)
     {

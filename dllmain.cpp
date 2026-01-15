@@ -1,31 +1,31 @@
 // dllmain.cpp - Backbuffer hook for NFS MW (2005)
 #include <windows.h>
-#include <iostream>
 #include <filesystem>
 #include <string>
-#include <fstream>
 #include <cctype>
-#include "includes/injector/injector.hpp"
-#include <d3dx9effect.h>
 #include <cstdio>
+#include <cmath>
+#include <d3dx9math.h>
 #include <psapi.h>  // Required for MODULEINFO and GetModuleInformation
 #include <d3d9.h>
 #include <unordered_map>
 #include <unordered_set>
+
+#include "includes/injector/injector.hpp"
+#include "Modules/minhook/include/MinHook.h"
+
 #include "Hooks.h"
 #include "RenderTargetManager.h"
 #include "Globals.h"
-#include "EffectManager.h"
 #include "MotionBlurPass.h"
 #include "Validators.h"
-#include "ScopedStateBlock.h"
-#include "Modules/minhook/include/MinHook.h"
-#pragma comment(lib, "d3d9.lib")
 
 // -------------------- GLOBALS --------------------
 #define CHECKMARK(x) ((x) ? "OK" : "MISSING")
 
 #define SAFE_RELEASE(p) if (p) { p->Release(); p = nullptr; }
+
+void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name);
 
 static void PatchMotionBlurFix()
 {
@@ -38,7 +38,6 @@ static void PatchMotionBlurFix()
     {
         {0x006DBE79, 0x01},
         {0x006DBE7B, 0x02},
-        {0x006DF1D2, 0xEB}, // skip vanilla blur call (NGG behavior)
     };
 
     for (const auto& p : patches)
@@ -51,7 +50,7 @@ static void PatchMotionBlurFix()
             VirtualProtect(ptr, 1, oldProtect, &oldProtect);
         }
     }
-    printf_s("[XNFS] ? NextGenMotionBlur patch applied (disable vanilla blur)\n");
+    printf_s("[XNFS] ? NextGenMotionBlur patch applied (keep blur path)\n");
 }
 
 // IVisualTreatment_Reset block
@@ -107,158 +106,371 @@ using D3DXCreateEffectFn = HRESULT (WINAPI*)(
 static D3DXCreateEffectFn RealCreateEffect = nullptr;
 static bool g_D3DXHooksInstalled = false;
 
-static void __cdecl RenderDispatchHook(void* arg0, void* arg4)
-{
-    // const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
-    // if (gameFlow < 3 || g_RenderTargetManager.g_DeviceResetInProgress)
-    // {
-    //     if (g_RenderDispatchOriginal)
-    //         g_RenderDispatchOriginal(arg0, arg4);
-    //     return;
-    // }
+using Sub6D3B80_t = int(__cdecl*)(void* ctx, int a2, void* a3, void* a4, int a5, int a6, int a7);
+static Sub6D3B80_t g_Sub6D3B80 = reinterpret_cast<Sub6D3B80_t>(0x006D3B80);
 
-    static uint32_t lastLogFrame = 0;
-    if (eFrameCounter != lastLogFrame)
-    {
-        lastLogFrame = eFrameCounter;
-        printf_s("[Blur] dispatch index=0\n");
-    }
-    MotionBlurPass::CustomMotionBlurHook();
-    if (g_RenderDispatchOriginal)
-        g_RenderDispatchOriginal(arg0, arg4);
+using Sub4499E0_t = int(__thiscall*)(void* self, float dt);
+static Sub4499E0_t g_Sub4499E0 = reinterpret_cast<Sub4499E0_t>(0x004499E0);
+static Sub4499E0_t g_Sub4499E0_VtableOrig = nullptr;
+using Sub4467A0_t = void(__thiscall*)(void* self, int arg0, float* outVec3);
+static Sub4467A0_t g_Sub4467A0 = reinterpret_cast<Sub4467A0_t>(0x004467A0);
+static D3DXMATRIX g_LastViewMatrix{};
+
+static bool IsMotionBlurVariant(int a6, int a7)
+{
+    return (a6 == 8 && a7 == 7) || (a6 == 0x0E && a7 == 0x0F);
 }
 
-IDirect3DTexture9* GetDummyWhiteTexture(IDirect3DDevice9* device)
+static void PatchCall(uintptr_t callSite, void* newFunc)
 {
-    static IDirect3DTexture9* tex = nullptr;
-    if (!tex)
+    DWORD oldProt{};
+    VirtualProtect(reinterpret_cast<void*>(callSite), 5, PAGE_EXECUTE_READWRITE, &oldProt);
+    *reinterpret_cast<uint8_t*>(callSite) = 0xE8;
+    const int32_t rel = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(newFunc) - (callSite + 5));
+    *reinterpret_cast<int32_t*>(callSite + 1) = rel;
+    VirtualProtect(reinterpret_cast<void*>(callSite), 5, oldProt, &oldProt);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(callSite), 5);
+}
+
+static int __fastcall hkSub4499E0(void* self, void* /*edx*/, float dt)
+{
+    int ret = g_Sub4499E0(self, dt);
+    if (self)
     {
-        device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr);
-        D3DLOCKED_RECT lr;
-        if (SUCCEEDED(tex->LockRect(0, &lr, nullptr, 0)))
+        const char* base = reinterpret_cast<const char*>(self);
+        void* node = *reinterpret_cast<void* const*>(base + 0x0C);
+        if (node)
         {
-            *((DWORD*)lr.pBits) = 0xFFFFFFFF;
-            tex->UnlockRect(0);
+            const float* v = reinterpret_cast<const float*>(reinterpret_cast<const char*>(node) + 0xB0);
+            g_MotionVec[0] = v[0];
+            g_MotionVec[1] = v[1];
+            g_MotionVec[2] = v[2];
+            g_MotionVec[3] = 0.0f;
         }
     }
-    return tex;
+    static DWORD s_lastLogTick = 0;
+    const DWORD nowTick = GetTickCount();
+    if (nowTick - s_lastLogTick >= 1000)
+    {
+        s_lastLogTick = nowTick;
+        printf_s("[MotionVec] sub_4499E0 (%.4f, %.4f, %.4f)\n",
+                 g_MotionVec[0], g_MotionVec[1], g_MotionVec[2]);
+    }
+    return ret;
 }
 
-void ReplaceShaderSlot(void* objectBase, int offset, ID3DXEffect* replacement)
+static int __cdecl XNFS_Sub6D3B80_Hook(void* ctx, int a2, void* a3, void* a4, int a5, int a6, int a7)
 {
-    ID3DXEffect** slot = (ID3DXEffect**)((BYTE*)objectBase + offset);
-    if (!IsBadWritePtr(slot, sizeof(void*)))
+    if (!IsMotionBlurVariant(a6, a7) || g_RenderTargetManager.g_DeviceResetInProgress)
+        return g_Sub6D3B80(ctx, a2, a3, a4, a5, a6, a7);
+
+    IDirect3DDevice9* dev = g_Device;
+    if (!dev)
+        return 0;
+
+    IDirect3DSurface9* dstRT = nullptr;
+    IDirect3DBaseTexture9* src0 = nullptr;
+    IDirect3DBaseTexture9* src1 = nullptr;
+
+    dev->GetRenderTarget(0, &dstRT);
+    dev->GetTexture(0, &src0);
+    dev->GetTexture(1, &src1);
+
+    bool addedSrc0Ref = false;
+    bool addedSrc1Ref = false;
+    if (g_RenderTargetManager.g_LastSceneFullTex)
     {
-        if (*slot != replacement)
+        if (src0)
+            src0->Release();
+        src0 = g_RenderTargetManager.g_LastSceneFullTex;
+        src0->AddRef();
+        addedSrc0Ref = true;
+    }
+    else if (!src0 && g_RenderTargetManager.g_SceneCopyTex)
+    {
+        src0 = g_RenderTargetManager.g_SceneCopyTex;
+        src0->AddRef();
+        addedSrc0Ref = true;
+    }
+    if (!src1 && g_RenderTargetManager.g_CurrentBlurTex)
+    {
+        src1 = g_RenderTargetManager.g_CurrentBlurTex;
+        src1->AddRef();
+        addedSrc1Ref = true;
+    }
+
+    static DWORD s_lastLogTick = 0;
+    DWORD nowTick = GetTickCount();
+    if (nowTick - s_lastLogTick >= 1000)
+    {
+        s_lastLogTick = nowTick;
+        printf_s("[BlurOverride] rt=%p src0=%p src1=%p fallback0=%d fallback1=%d\n",
+                 dstRT, src0, src1, addedSrc0Ref ? 1 : 0, addedSrc1Ref ? 1 : 0);
+    }
+
+    if (dstRT && src0)
+    {
+        MotionBlurPass::RenderBlurOverride(dev, src0, src1, dstRT);
+
+        static DWORD s_lastBlurLogTick = 0;
+        const DWORD nowTick = GetTickCount();
+        if (nowTick - s_lastBlurLogTick >= 1000)
         {
-            if (*slot) (*slot)->Release();
-            *slot = replacement;
-            replacement->AddRef();
+            s_lastBlurLogTick = nowTick;
+            printf_s("[BlurOverride] outTex=%p historyReady=%d motionAmount=%.3f\n",
+                     g_RenderTargetManager.g_CurrentBlurTex,
+                     g_MotionBlurHistoryReady ? 1 : 0,
+                     g_MotionBlurAmount);
         }
     }
+
+    if (src1 && (addedSrc1Ref || src1 != nullptr)) src1->Release();
+    if (src0 && (addedSrc0Ref || src0 != nullptr)) src0->Release();
+    if (dstRT) dstRT->Release();
+
+    return 0;
 }
 
-void ScrubShaderCleanupTable()
+static void InstallSub6D3B80BlurHook()
 {
-    return;
-    int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
-    if (gameFlow < 3 || !g_Device || g_RenderTargetManager.g_DeviceResetInProgress)
+    PatchCall(0x006DBE8B, reinterpret_cast<void*>(&XNFS_Sub6D3B80_Hook));
+    PatchCall(0x006DBEB0, reinterpret_cast<void*>(&XNFS_Sub6D3B80_Hook));
+}
+
+static void __fastcall hkSub4467A0(void* self, void* /*edx*/, int arg0, float* outVec3)
+{
+    g_Sub4467A0(self, arg0, outVec3);
+    if (!outVec3)
         return;
 
-    for (int i = 0; i < 11; i++)
+    static DWORD s_lastCallLog = 0;
+    const DWORD callTick = GetTickCount();
+    if (callTick - s_lastCallLog >= 1000)
     {
-        uintptr_t entryBase = SHADER_CLEANUP_TABLE_ADDRESS + i * 0x1C;
-        void** fxPtr = (void**)(entryBase + 0x0C); // offset to ID3DXEffect*
+        s_lastCallLog = callTick;
+        printf_s("[MotionVec] sub_4467A0 called (out=%p)\n", outVec3);
+    }
 
-        if (*fxPtr && IsBadReadPtr(*fxPtr, 4))
-        {
-            printf_s("[Scrub] ❌ fx at index %d is unreadable (%p) — nulling out\n", i, *fxPtr);
-            *fxPtr = nullptr;
-        }
-        else if (*fxPtr)
-        {
-            __try
-            {
-                void** vtbl = *(void***)(*fxPtr);
-                if (IsBadReadPtr(vtbl, sizeof(void*)))
-                {
-                    printf_s("[Scrub] ⚠️ fx[%d] vtable unreadable — nulling\n", i);
-                    *fxPtr = nullptr;
-                }
-                else if (!IsBadCodePtr((FARPROC)vtbl[2]))
-                {
-                    printf_s("[Scrub] ✅ fx[%d] valid: %p (vtable: %p)\n", i, *fxPtr, vtbl);
-                }
-                else
-                {
-                    printf_s("[Scrub] ⚠️ fx[%d] has invalid vtable func ptr: %p — nulling\n", i, vtbl[2]);
-                    *fxPtr = nullptr;
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                printf_s("[Scrub] ⚠️ fx[%d] threw during vtable read — nulling\n", i);
-                *fxPtr = nullptr;
-            }
-        }
+    const float curr[3] = {outVec3[0], outVec3[1], outVec3[2]};
+    if (!g_HasLastCameraPos)
+    {
+        g_LastCameraPos[0] = curr[0];
+        g_LastCameraPos[1] = curr[1];
+        g_LastCameraPos[2] = curr[2];
+        g_HasLastCameraPos = true;
+        return;
+    }
+
+    g_MotionVec[0] = curr[0] - g_LastCameraPos[0];
+    g_MotionVec[1] = curr[1] - g_LastCameraPos[1];
+    g_MotionVec[2] = curr[2] - g_LastCameraPos[2];
+    g_MotionVec[3] = 0.0f;
+
+    g_LastCameraPos[0] = curr[0];
+    g_LastCameraPos[1] = curr[1];
+    g_LastCameraPos[2] = curr[2];
+
+    static DWORD s_lastLogTick = 0;
+    const DWORD nowTick = GetTickCount();
+    if (nowTick - s_lastLogTick >= 1000)
+    {
+        s_lastLogTick = nowTick;
+        printf_s("[MotionVec] sub_4467A0 vec (%.4f, %.4f, %.4f)\n",
+                 g_MotionVec[0], g_MotionVec[1], g_MotionVec[2]);
     }
 }
 
-void VisualTreatment_Reset()
+static HRESULT WINAPI hkSetTransform(LPDIRECT3DDEVICE9 device, D3DTRANSFORMSTATETYPE state,
+                                     const D3DMATRIX* matrix)
 {
-    if (g_pVisualTreatment && IsValidThis(*g_pVisualTreatment))
+    if (state == D3DTS_VIEW && matrix)
     {
-        void* vt = *g_pVisualTreatment;
+        g_LastViewMatrix = *reinterpret_cast<const D3DXMATRIX*>(matrix);
+        g_HasLastViewMatrix = true;
+    }
+    return g_RenderTargetManager.oSetTransform
+        ? g_RenderTargetManager.oSetTransform(device, state, matrix)
+        : D3D_OK;
+}
 
-        if (!vt) // <-- 🛑 ADD THIS CHECK
-        {
-            printf_s("[HotReload] ❌ vt was null in VisualTreatment_Reset() (early)\n");
-            return;
-        }
+static void InstallMotionVectorHook()
+{
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        printf_s("[Init] ❌ MH_Initialize failed for motion vector hook: %d\n", (int)initStatus);
+        return;
+    }
 
-        // ⚠️ force invalidate ptr+0x140 to trigger rebuild
-        void** fx140 = (void**)((char*)vt + 0x140);
-        *fx140 = nullptr;
-
-        ID3DXEffect** fxSlot = (ID3DXEffect**)((char*)vt + 0x18C);
-        if (IsValidShaderPointer(*fxSlot))
-        {
-            if (*fxSlot)
-            {
-                if (*fxSlot == g_RenderTargetManager.g_LastReloadedFx)
-                {
-                    g_RenderTargetManager.g_LastReloadedFx = nullptr;
-                }
-
-                for (int i = 0; i < 62; i++)
-                {
-                    if (g_SlotRetainedFx[i] == *fxSlot)
-                        g_SlotRetainedFx[i] = nullptr;
-                }
-
-                printf_s("🔧 Releasing fx at +0x18C (%p)\n", *fxSlot);
-                (*fxSlot)->Release();
-                *fxSlot = nullptr;
-            }
-        }
-        else
-            return;
-
-        // 🧪 Optional: Add null check if unsure about vt
-        if (vt)
-        {
-            IVisualTreatment_Reset(vt);
-            printf_s("[HotReload] ✅ Reset() called on IVisualTreatment at %p\n", vt);
-        }
-        else
-        {
-            printf_s("[HotReload] ❌ vt was null in VisualTreatment_Reset()\n");
-        }
+    if (MH_CreateHook(reinterpret_cast<LPVOID>(0x004499E0),
+                      reinterpret_cast<LPVOID>(&hkSub4499E0),
+                      reinterpret_cast<LPVOID*>(&g_Sub4499E0)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<LPVOID>(0x004499E0)) == MH_OK)
+    {
+        printf_s("[Init] ✅ sub_4499E0 motion vector hook installed\n");
     }
     else
     {
-        printf_s("[HotReload] ❌ g_pVisualTreatment invalid or null\n");
+        printf_s("[Init] ❌ Failed to hook sub_4499E0\n");
     }
+}
+
+static void InstallMotionVectorHook4467A0()
+{
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        printf_s("[Init] ❌ MH_Initialize failed for sub_4467A0 hook: %d\n", (int)initStatus);
+        return;
+    }
+
+    if (MH_CreateHook(reinterpret_cast<LPVOID>(0x004467A0),
+                      reinterpret_cast<LPVOID>(&hkSub4467A0),
+                      reinterpret_cast<LPVOID*>(&g_Sub4467A0)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<LPVOID>(0x004467A0)) == MH_OK)
+    {
+        printf_s("[Init] ✅ sub_4467A0 motion vector hook installed\n");
+    }
+    else
+    {
+        printf_s("[Init] ❌ Failed to hook sub_4467A0\n");
+    }
+}
+
+static void InstallMotionVectorVtablePatch()
+{
+    constexpr uintptr_t kSub4499E0_VtableSlot = 0x00893530;
+    auto* slot = reinterpret_cast<void**>(kSub4499E0_VtableSlot);
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
+    {
+        printf_s("[Init] ❌ Failed to unprotect motion vtable slot\n");
+        return;
+    }
+
+    g_Sub4499E0_VtableOrig = reinterpret_cast<Sub4499E0_t>(*slot);
+    *slot = reinterpret_cast<void*>(&hkSub4499E0);
+    VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
+    printf_s("[Init] ✅ sub_4499E0 vtable slot patched (orig=%p)\n", g_Sub4499E0_VtableOrig);
+}
+
+static void CopyScene(IDirect3DDevice9* device)
+{
+    if (!device) return;
+
+    if (!g_RenderTargetManager.g_BackBufferSurface ||
+        !g_RenderTargetManager.g_SceneCopySurface)
+        return;
+
+    // copy backbuffer (final, post-VT) -> SceneCopySurface
+    const HRESULT hr = device->StretchRect(
+        g_RenderTargetManager.g_BackBufferSurface,
+        nullptr,
+        g_RenderTargetManager.g_SceneCopySurface,
+        nullptr,
+        D3DTEXF_NONE
+    );
+    if (FAILED(hr))
+        return;
+
+    // publish "final scene copy" for blur-generation ONLY
+    g_RenderTargetManager.g_SceneCopyTex   = g_RenderTargetManager.g_SceneCopyTex; // (no-op, just clarity)
+    g_RenderTargetManager.g_LastSceneFullFrame = eFrameCounter;
+}
+
+static void UpdateMotionBlurFromEView()
+{
+    static char* eViewsBase = reinterpret_cast<char*>(0x009195E0);
+    void* viewPtr = nullptr;
+    for (int i = 0; i <= 0x16; ++i)
+    {
+        char* entry = eViewsBase + (i * 0x70);
+        if (IsBadReadPtr(entry, sizeof(void*)))
+            continue;
+        void* candidate = *reinterpret_cast<void**>(entry);
+        if (candidate && reinterpret_cast<uintptr_t>(candidate) > 0x10000)
+        {
+            viewPtr = candidate;
+            break;
+        }
+    }
+    if (!viewPtr)
+    {
+        g_MotionBlurAmount = 0.0f;
+        g_MotionVec[0] = g_MotionVec[1] = g_MotionVec[2] = g_MotionVec[3] = 0.0f;
+        return;
+    }
+
+    auto view = static_cast<char*>(viewPtr);
+    if (IsBadReadPtr(view, 0x200))
+    {
+        g_MotionBlurAmount = 0.0f;
+        g_MotionVec[0] = g_MotionVec[1] = g_MotionVec[2] = g_MotionVec[3] = 0.0f;
+        return;
+    }
+    // eView deltas identified by probe: 0x1D0, 0x1D4, 0x1D8
+    if (IsBadReadPtr(view + 0x1D0, sizeof(float) * 3))
+    {
+        g_MotionBlurAmount = 0.0f;
+        g_MotionVec[0] = g_MotionVec[1] = g_MotionVec[2] = g_MotionVec[3] = 0.0f;
+        return;
+    }
+    float curr[3] = {
+        *reinterpret_cast<float*>(view + 0x1D0),
+        *reinterpret_cast<float*>(view + 0x1D4),
+        *reinterpret_cast<float*>(view + 0x1D8)
+    };
+    static float last[3] = {};
+    static bool hasLast = false;
+    if (!hasLast)
+    {
+        last[0] = curr[0];
+        last[1] = curr[1];
+        last[2] = curr[2];
+        hasLast = true;
+        g_MotionBlurAmount = 0.0f;
+        g_MotionVec[0] = g_MotionVec[1] = g_MotionVec[2] = g_MotionVec[3] = 0.0f;
+        return;
+    }
+
+    float dx = curr[0] - last[0];
+    float dy = curr[1] - last[1];
+    float dz = curr[2] - last[2];
+    last[0] = curr[0];
+    last[1] = curr[1];
+    last[2] = curr[2];
+
+    float mag = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (!std::isfinite(mag) || mag <= 0.0001f)
+    {
+        g_MotionBlurAmount = 0.0f;
+        g_MotionVec[0] = g_MotionVec[1] = g_MotionVec[2] = g_MotionVec[3] = 0.0f;
+        return;
+    }
+
+    float invMag = 1.0f / mag;
+    g_MotionVec[0] = dx * invMag;
+    g_MotionVec[1] = dy * invMag;
+    g_MotionVec[2] = dz * invMag;
+    g_MotionVec[3] = 0.0f;
+
+    const float scale = mag * 0.002f;
+    g_MotionBlurAmount = (scale > 0.5f) ? 0.5f : scale;
+}
+
+static void __cdecl RenderDispatchHook(void* arg0, void* arg4)
+{
+    const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
+    if (gameFlow < 3 || g_RenderTargetManager.g_DeviceResetInProgress)
+    {
+        g_RenderDispatchOriginal(arg0, arg4);
+        return;
+    }
+
+    g_RenderDispatchOriginal(arg0, arg4);
+    UpdateMotionBlurFromEView();
 }
 
 bool ReplaceShaderSlot_RawEffect(
@@ -346,166 +558,154 @@ bool TryPatchSlotIfWritable(void* obj, size_t offset, ID3DXEffect* fx)
     return result;
 }
 
+static inline bool IsValidFx(ID3DXEffect* fx)
+{
+    if (!fx) return false;
+    __try {
+        void** vtbl = *(void***)fx;
+        return vtbl && vtbl[0] != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name = "")
 {
-    static uint32_t lastEnterLogFrame = 0;
-    if (eFrameCounter != lastEnterLogFrame)
-    {
-        lastEnterLogFrame = eFrameCounter;
-        printf_s("[BlurRebind] enter fx=%p blurTex=%p reset=%u\n",
-                 fx,
-                 g_RenderTargetManager.g_CurrentBlurTex,
-                 g_RenderTargetManager.g_DeviceResetInProgress ? 1u : 0u);
-    }
-    if (!fx)
-    {
-        printf_s("[BlurRebind] ❌ fx is null\n");
+    if (!IsValidFx(fx))
         return;
-    }
-
-    if (!g_RenderTargetManager.g_CurrentBlurTex || IsBadReadPtr(g_RenderTargetManager.g_CurrentBlurTex,
-                                                                sizeof(IDirect3DTexture9)))
-    {
-        printf_s("[BlurRebind] ❌ g_CurrentBlurTex is null or invalid\n");
-        return;
-    }
 
     if (g_RenderTargetManager.g_DeviceResetInProgress)
-    {
-        printf_s("[BlurRebind] ⚠️ Skipped during device reset\n");
         return;
-    }
 
+    // We want VT to sample the *scene* from your CopyScene() output (TexA),
+    // NOT the already-graded/non-VT image and NOT a random RT from SetRT hook.
+    IDirect3DTexture9* sceneTex = g_RenderTargetManager.g_LastSceneFullTex;
+    if (!sceneTex)
+        sceneTex = g_RenderTargetManager.g_SceneCopyTex;
+
+    // Blur/hist input must be a different texture than scene
+    IDirect3DTexture9* blurTex = (g_MotionBlurHistoryReady ? g_RenderTargetManager.g_CurrentBlurTex : nullptr);
+    if (blurTex == sceneTex)
+        blurTex = nullptr;
+
+    // --- locate params (names/semantics you actually use) ---
     D3DXHANDLE hDiffuse = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
-    if (!hDiffuse)
-        hDiffuse = fx->GetParameterByName(nullptr, "DiffuseMap");
-    if (!hDiffuse)
-        hDiffuse = fx->GetParameterBySemantic(nullptr, "DiffuseMap");
+    if (!hDiffuse) hDiffuse = fx->GetParameterByName(nullptr, "DiffuseMap");
+    if (!hDiffuse) hDiffuse = fx->GetParameterBySemantic(nullptr, "DiffuseMap");
 
     D3DXHANDLE hBlur = fx->GetParameterByName(nullptr, "MOTIONBLUR_TEXTURE");
-    if (!hBlur)
-        hBlur = fx->GetParameterByName(nullptr, "MOTIONBLUR");
-    if (!hBlur)
-        hBlur = fx->GetParameterBySemantic(nullptr, "MOTIONBLUR");
+    if (!hBlur) hBlur = fx->GetParameterByName(nullptr, "MOTIONBLUR");
+    if (!hBlur) hBlur = fx->GetParameterBySemantic(nullptr, "MOTIONBLUR");
+    if (!hBlur) hBlur = fx->GetParameterBySemantic(nullptr, "PREV");
 
-    if (!hDiffuse || !hBlur)
+    D3DXHANDLE hAmt = fx->GetParameterByName(nullptr, "XNFS_MotionBlurAmount");
+    if (!hAmt) hAmt = fx->GetParameterByName(nullptr, "MotionBlurAmount"); // optional fallback
+    D3DXHANDLE hBlurVector = fx->GetParameterByName(nullptr, "BLUR_VECTOR");
+    if (!hBlurVector) hBlurVector = fx->GetParameterByName(nullptr, "MotionBlurVector");
+    D3DXHANDLE hBlurParams = fx->GetParameterByName(nullptr, "IS_MOTIONBLUR_VIGNETTED");
+    if (!hBlurParams) hBlurParams = fx->GetParameterByName(nullptr, "MotionBlurParams");
+
+    D3DXHANDLE hTexelSize = fx->GetParameterByName(nullptr, "XNFS_TexelSize");
+    D3DXHANDLE hBlurDir = fx->GetParameterByName(nullptr, "XNFS_BlurDir");
+    D3DXHANDLE hBlurScale = fx->GetParameterByName(nullptr, "XNFS_BlurScale");
+
+    // --- bind scene ---
+    if (hDiffuse && sceneTex)
+        fx->SetTexture(hDiffuse, sceneTex);
+
+    // --- bind blur + amount ---
+    if (!blurTex || !hBlur)
     {
-        printf_s("[BlurRebind] ? Missing handles: DIFFUSE=%p BLUR=%p\n", hDiffuse, hBlur);
-        static uint32_t lastDumpFrame = 0;
-        if (eFrameCounter != lastDumpFrame)
+        if (hBlur) fx->SetTexture(hBlur, nullptr);
+        if (hAmt)  fx->SetFloat(hAmt, 0.0f);
+        g_MotionBlurAmount = 0.0f;
+    }
+    else
+    {
+        fx->SetTexture(hBlur, blurTex);
+
+        // if you want to drive it globally, keep g_MotionBlurAmount authoritative:
+        if (hAmt) fx->SetFloat(hAmt, g_MotionBlurAmount);
+    }
+
+    if (hBlurVector)
+        fx->SetVector(hBlurVector, reinterpret_cast<const D3DXVECTOR4*>(g_MotionVec));
+    if (hBlurParams)
+    {
+        const D3DXVECTOR4 params(g_MotionBlurAmount, 1.0f, 0.0f, 0.0f);
+        fx->SetVector(hBlurParams, &params);
+    }
+
+    if (hTexelSize)
+    {
+        UINT w = g_LastBackBufferW ? g_LastBackBufferW : 1;
+        UINT h = g_LastBackBufferH ? g_LastBackBufferH : 1;
+        if (sceneTex)
         {
-            lastDumpFrame = eFrameCounter;
-            D3DXEFFECT_DESC ed = {};
-            if (SUCCEEDED(fx->GetDesc(&ed)))
+            D3DSURFACE_DESC desc{};
+            if (SUCCEEDED(sceneTex->GetLevelDesc(0, &desc)) && desc.Width > 0 && desc.Height > 0)
             {
-                printf_s("[BlurRebind] ? Effect params: %u\n", ed.Parameters);
-                for (UINT i = 0; i < ed.Parameters; ++i)
-                {
-                    D3DXHANDLE p = fx->GetParameter(nullptr, i);
-                    if (!p)
-                        continue;
-                    D3DXPARAMETER_DESC pd = {};
-                    if (FAILED(fx->GetParameterDesc(p, &pd)))
-                        continue;
-                    if (pd.Class == D3DXPC_OBJECT && pd.Type == D3DXPT_TEXTURE)
-                    {
-                        printf_s("[BlurRebind] ? tex[%u] name=%s semantic=%s\n",
-                                 i,
-                                 pd.Name ? pd.Name : "(null)",
-                                 pd.Semantic ? pd.Semantic : "(null)");
-                    }
-                }
+                w = desc.Width;
+                h = desc.Height;
             }
         }
+        const D3DXVECTOR4 texel(1.0f / (float)w, 1.0f / (float)h, 0.0f, 0.0f);
+        fx->SetVector(hTexelSize, &texel);
     }
 
-    if (hDiffuse)
+    if (hBlurDir || hBlurScale)
     {
-        if (g_RenderTargetManager.g_LastSceneFullTex)
+        const float mvx = g_MotionVec[0];
+        const float mvy = g_MotionVec[1];
+        const float len = std::sqrt(mvx * mvx + mvy * mvy);
+        const float invLen = (len > 0.0001f) ? (1.0f / len) : 0.0f;
+        const bool enableBlur = (g_MotionBlurAmount > 0.0f);
+        if (hBlurDir)
         {
-            fx->SetTexture(hDiffuse, g_RenderTargetManager.g_LastSceneFullTex);
+            const float dirX = enableBlur ? (mvx * invLen) : 0.0f;
+            const float dirY = enableBlur ? (mvy * invLen) : 0.0f;
+            const D3DXVECTOR4 dir(dirX, dirY, 0.0f, 0.0f);
+            fx->SetVector(hBlurDir, &dir);
         }
-        else if (g_RenderTargetManager.g_MotionBlurTexA)
-        {
-            fx->SetTexture(hDiffuse, g_RenderTargetManager.g_MotionBlurTexA);
-        }
-        else
-        {
-            fx->SetTexture(hDiffuse, g_RenderTargetManager.g_CurrentBlurTex);
-        }
+        if (hBlurScale)
+            fx->SetFloat(hBlurScale, enableBlur ? len : 0.0f);
     }
 
-    if (hBlur)
-        fx->SetTexture(hBlur, g_RenderTargetManager.g_CurrentBlurTex);
-    fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP1_TEXTURE"), g_RenderTargetManager.g_ExposureTex);
-    fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP2_TEXTURE"), g_RenderTargetManager.g_VignetteTex);
-    fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE"), g_RenderTargetManager.g_BloomLUTTex);
-    fx->SetTexture(fx->GetParameterByName(nullptr, "MISCMAP4_TEXTURE"), g_RenderTargetManager.g_DofTex);
-    fx->SetTexture(fx->GetParameterByName(nullptr, "HEIGHTMAP_TEXTURE"), g_RenderTargetManager.g_DepthTex);
-
-    // BlurParams / XNFS_MotionBlurAmount
-    const D3DXVECTOR4 blurVec(1.0f, 0.2f, 1.0f, 0.0f);
-    D3DXHANDLE h = fx->GetParameterByName(nullptr, "BlurParams");
-    if (h)
-        fx->SetVector(h, &blurVec);
-    D3DXHANDLE hMb = fx->GetParameterByName(nullptr, "XNFS_MotionBlurAmount");
-    if (hMb)
-        fx->SetFloat(hMb, g_MotionBlurAmount);
-
-    static uint32_t lastBindLogFrame = 0;
-    if (eFrameCounter != lastBindLogFrame)
+    // Only bind the extra MISCMAP/DEPTH stuff for *non-VT* effects.
+    // VT already gets these from the game; stomping them is how you "see non-VT".
+    const bool isVT = (name == "IDI_VISUALTREATMENT_FX");
+    if (!isVT)
     {
-        lastBindLogFrame = eFrameCounter;
-        IDirect3DBaseTexture9* diff = nullptr;
-        IDirect3DBaseTexture9* blur = nullptr;
-        D3DXHANDLE hDiff = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
-        D3DXHANDLE hBlur = fx->GetParameterByName(nullptr, "MOTIONBLUR_TEXTURE");
-        if (hDiff)
-            fx->GetTexture(hDiff, &diff);
-        if (hBlur)
-            fx->GetTexture(hBlur, &blur);
-        printf_s("[BlurRebind] diff=%p blur=%p amount=%.3f\n", diff, blur, g_MotionBlurAmount);
-        SAFE_RELEASE(diff);
-        SAFE_RELEASE(blur);
+        if (auto h = fx->GetParameterByName(nullptr, "MISCMAP1_TEXTURE")) fx->SetTexture(h, g_RenderTargetManager.g_ExposureTex);
+        if (auto h = fx->GetParameterByName(nullptr, "MISCMAP2_TEXTURE")) fx->SetTexture(h, g_RenderTargetManager.g_VignetteTex);
+        if (auto h = fx->GetParameterByName(nullptr, "MISCMAP3_TEXTURE")) fx->SetTexture(h, g_RenderTargetManager.g_BloomLUTTex);
+        if (auto h = fx->GetParameterByName(nullptr, "MISCMAP4_TEXTURE")) fx->SetTexture(h, g_RenderTargetManager.g_DofTex);
+        if (auto h = fx->GetParameterByName(nullptr, "HEIGHTMAP_TEXTURE")) fx->SetTexture(h, g_RenderTargetManager.g_DepthTex);
     }
-
-    if (name == "IDI_VISUALTREATMENT_FX")
+    else
     {
-        if (g_RenderTargetManager.g_Width && g_RenderTargetManager.g_Height)
+        if (auto h = fx->GetParameterByName(nullptr, "HEIGHTMAP_TEXTURE"))
         {
-            const float texelX = 1.0f / static_cast<float>(g_RenderTargetManager.g_Width);
-            const float texelY = 1.0f / static_cast<float>(g_RenderTargetManager.g_Height);
-            D3DXHANDLE hOff0 = fx->GetParameterByName(nullptr, "DownSampleOffset0");
-            D3DXHANDLE hOff1 = fx->GetParameterByName(nullptr, "DownSampleOffset1");
-            if (hOff0 && hOff1)
-            {
-                const D3DXVECTOR4 off0(-1.5f * texelX, -1.5f * texelY,
-                                       0.5f * texelX, -1.5f * texelY);
-                const D3DXVECTOR4 off1(-1.5f * texelX, 0.5f * texelY,
-                                       0.5f * texelX, 0.5f * texelY);
-                fx->SetVector(hOff0, &off0);
-                fx->SetVector(hOff1, &off1);
-            }
+            IDirect3DBaseTexture9* current = nullptr;
+            fx->GetTexture(h, &current);
+            if (!current && g_RenderTargetManager.g_DepthTex)
+                fx->SetTexture(h, g_RenderTargetManager.g_DepthTex);
+            if (current)
+                current->Release();
         }
-
-        D3DXHANDLE tech = fx->GetTechniqueByName("visualtreatment_branching");
-        if (tech && SUCCEEDED(fx->ValidateTechnique(tech)))
-            fx->SetTechnique(tech);
-
-        fx->SetFloat(fx->GetParameterByName(nullptr, "g_fBloomScale"), 1.0f);
-        fx->SetFloat(fx->GetParameterByName(nullptr, "VisualEffectBrightness"), 1.0f);
-        fx->SetFloat(fx->GetParameterByName(nullptr, "Desaturation"), 0.0f);
-
-        float dofParams[4] = {1.0f, 0.1f, 0.1f, 0.0f};
-        fx->SetFloatArray(fx->GetParameterByName(nullptr, "DepthOfFieldParams"), dofParams, 4);
-
-        fx->SetBool(fx->GetParameterByName(nullptr, "bDepthOfFieldEnabled"), TRUE);
-        fx->SetBool(fx->GetParameterByName(nullptr, "bHDREnabled"), TRUE);
-        fx->SetFloat(fx->GetParameterByName(nullptr, "g_fAdaptiveLumCoeff"), 1.0f);
     }
 
-    if (FAILED(fx->CommitChanges()))
-        printf_s("[BlurRebind] ⚠️ CommitChanges failed\n");
+    // Commit is fine (and cheap) - but don't spam logs every call
+    fx->CommitChanges();
+
+    static DWORD s_lastBindLogTick = 0;
+    const DWORD nowTick = GetTickCount();
+    if (nowTick - s_lastBindLogTick >= 1000)
+    {
+        s_lastBindLogTick = nowTick;
+        printf_s("[VTBind] scene=%p blur=%p amt=%.3f\n",
+                 sceneTex, blurTex, g_MotionBlurAmount);
+    }
 }
 
 HRESULT WINAPI HookedCreateFromResource(
@@ -543,14 +743,7 @@ HRESULT WINAPI HookedCreateFromResource(
             D3DXCreateEffectFromFileAFn createFromFile = RealCreateFromFileA;
             if (!createFromFile)
             {
-                const char* kD3dxDlls[] = {"d3dx9_43.dll", "d3dx9_42.dll", "d3dx9_41.dll", "d3dx9_40.dll"};
-                HMODULE d3dx = nullptr;
-                for (const char* dll : kD3dxDlls)
-                {
-                    d3dx = GetModuleHandleA(dll);
-                    if (d3dx)
-                        break;
-                }
+                HMODULE d3dx = GetModuleHandleA("d3dx9_43.dll");
                 if (d3dx)
                     createFromFile = reinterpret_cast<D3DXCreateEffectFromFileAFn>(
                         GetProcAddress(d3dx, "D3DXCreateEffectFromFileA"));
@@ -594,7 +787,23 @@ HRESULT WINAPI HookedCreateFromResource(
     }
 
 track_effect:
-    if (isVisualFx || isOverbrightFx)
+    if (isVisualFx)
+    {
+        if (outEffect && *outEffect && IsValidEffectObject(*outEffect))
+        {
+            auto& existingFx = g_RenderTargetManager.g_ActiveEffects[pResource];
+            if (existingFx != *outEffect)
+            {
+                g_RenderTargetManager.g_ActiveEffects[pResource] = *outEffect;
+                g_RenderTargetManager.g_LastReloadedFx = *outEffect;
+                printf_s("[XNFS] ✅ Shader created and tracked (effect): %s (%p)\n",
+                         pResource, (void*)*outEffect);
+            }
+        }
+        return hr;
+    }
+
+    if (isOverbrightFx)
     {
         auto& existingFx = g_RenderTargetManager.g_ActiveEffects[pResource];
 
@@ -634,6 +843,7 @@ track_effect:
 static void* __cdecl HookedIVisualTreatmentGet()
 {
     static bool inHook = false;
+    static ID3DXEffect* lastFx = nullptr;
     if (inHook)
         return RealIVisualTreatmentGet ? RealIVisualTreatmentGet() : nullptr;
 
@@ -646,21 +856,29 @@ static void* __cdecl HookedIVisualTreatmentGet()
         if (!IsBadReadPtr(vt, sizeof(void*)))
         {
             ID3DXEffect* fx = *reinterpret_cast<ID3DXEffect**>((char*)vt + 0x18C);
-            if (IsValidShaderPointer(fx))
+            ID3DXEffect* fallbackFx = nullptr;
+            auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
+            if (it != g_RenderTargetManager.g_ActiveEffects.end() && IsValidEffectObject(it->second))
+                fallbackFx = it->second;
+
+            if (fx && !IsValidEffectObject(fx))
             {
-                auto& existingFx = g_RenderTargetManager.g_ActiveEffects["IDI_VISUALTREATMENT_FX"];
-                if (existingFx && existingFx != fx)
-                    existingFx->Release();
-                existingFx = fx;
-                existingFx->AddRef();
+                printf_s("[XNFS] VT slot invalid: %p\n", fx);
+                fx = fallbackFx;
+            }
+            else if (!fx)
+            {
+                fx = fallbackFx;
+            }
 
-                if (g_RenderTargetManager.g_LastReloadedFx)
-                    g_RenderTargetManager.g_LastReloadedFx->Release();
+            if (fx && fx != lastFx)
+            {
+                // VT effect is owned by the game; do not AddRef/Release.
+                g_RenderTargetManager.g_ActiveEffects["IDI_VISUALTREATMENT_FX"] = fx;
                 g_RenderTargetManager.g_LastReloadedFx = fx;
-                g_RenderTargetManager.g_LastReloadedFx->AddRef();
-
-                if (g_RenderTargetManager.g_CurrentBlurTex)
-                    ReloadBlurBindings(fx, "IDI_VISUALTREATMENT_FX");
+                lastFx = fx;
+                printf_s("[XNFS] VT active effect: %p\n", fx);
+                ReloadBlurBindings(fx, "IDI_VISUALTREATMENT_FX");
             }
         }
     }
@@ -711,6 +929,7 @@ static bool IsVisualTreatmentEffect(ID3DXEffect* fx)
     if (h)
         return true;
     h = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
+
     return h != nullptr;
 }
 
@@ -736,18 +955,18 @@ HRESULT WINAPI HookedCreateEffect(
 
     if (IsVisualTreatmentEffect(*outEffect))
     {
-        auto& existingFx = g_RenderTargetManager.g_ActiveEffects["IDI_VISUALTREATMENT_FX"];
-        if (existingFx != *outEffect)
+        if (IsValidEffectObject(*outEffect))
         {
-            // VT-owned effects can be recreated often; keep raw pointers without refcount changes.
-            existingFx = *outEffect;
-            g_RenderTargetManager.g_LastReloadedFx = *outEffect;
-            printf_s("[XNFS] ✅ Shader created and tracked (effect): IDI_VISUALTREATMENT_FX (%p)\n", *outEffect);
+            auto& existingFx = g_RenderTargetManager.g_ActiveEffects["IDI_VISUALTREATMENT_FX"];
+            if (existingFx != *outEffect)
+            {
+                g_RenderTargetManager.g_ActiveEffects["IDI_VISUALTREATMENT_FX"] = *outEffect;
+                g_RenderTargetManager.g_LastReloadedFx = *outEffect;
+                printf_s("[XNFS] ✅ Shader created and tracked (effect): IDI_VISUALTREATMENT_FX (%p)\n",
+                         (void*)*outEffect);
+            }
         }
-
-        const int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
-        if (gameFlow >= 3 && !g_RenderTargetManager.g_DeviceResetInProgress && g_RenderTargetManager.g_CurrentBlurTex)
-            ReloadBlurBindings(*outEffect, "IDI_VISUALTREATMENT_FX");
+        return hr;
     }
 
     return hr;
@@ -859,24 +1078,7 @@ static void TryInstallD3DXHooks()
     if (g_D3DXHooksInstalled)
         return;
 
-    const char* kD3dxDlls[] =
-    {
-        "d3dx9_43.dll",
-        "d3dx9_42.dll",
-        "d3dx9_41.dll",
-        "d3dx9_40.dll",
-    };
-
-    HMODULE d3dx = nullptr;
-    for (const char* dll : kD3dxDlls)
-    {
-        d3dx = GetModuleHandleA(dll);
-        if (d3dx)
-        {
-            printf_s("[Init] ? Found %s\n", dll);
-            break;
-        }
-    }
+    HMODULE d3dx = GetModuleHandleA("d3dx9_43.dll");
     if (!d3dx)
         return;
 
@@ -980,13 +1182,9 @@ void OnDeviceReset(LPDIRECT3DDEVICE9 device)
 
 void OnDeviceLost()
 {
-    int gameFlow = *reinterpret_cast<int*>(GAMEFLOWSTATUS_ADDR);
     g_RenderTargetManager.OnDeviceLost(); // Delegate to RenderTargetManager's cleanup
-    if (gameFlow >= 3)
-        ScrubShaderCleanupTable();
     printf_s("[XNFS] ✅ Delegated OnDeviceLost to RenderTargetManager\n");
 }
-
 
 HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
 {
@@ -1009,6 +1207,7 @@ HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
     if (coop == D3DERR_DEVICELOST)
     {
         printf_s("[XNFS] Device still lost, TestCooperativeLevel = 0x%08X\n", coop);
+        OnDeviceLost();
         g_RenderTargetManager.g_DeviceResetInProgress = false;
         return coop;
     }
@@ -1039,9 +1238,7 @@ HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
         params->BackBufferFormat = D3DFMT_UNKNOWN;
     }
 
-    OnDeviceLost(); // release safely
-
-    // device->EvictManagedResources();  // don't call — crashes in MW
+    // device->EvictManagedResources();  // don't call - crashes in MW
 
     HRESULT hr = g_RenderTargetManager.oReset(device, params);
 
@@ -1054,57 +1251,47 @@ HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params)
     return hr;
 }
 
-static void OnFramePresent()
+HRESULT WINAPI hkEndScene(IDirect3DDevice9* device)
 {
-    static bool forceApplied = false;
+    if (!device) return oEndScene(device);
 
-    if (!g_RenderTargetManager.g_LastReloadedFx || !IsValidShaderPointer(g_RenderTargetManager.g_LastReloadedFx))
-        return;
+    if (!g_Device) SetGameDevice(device);
 
-    ReloadBlurBindings(g_RenderTargetManager.g_LastReloadedFx);
+    return oEndScene(device);
+}
 
-    if (!forceApplied &&
-        g_pVisualTreatment && *g_pVisualTreatment && IsValidThis(*g_pVisualTreatment))
+HRESULT WINAPI hkPresent(IDirect3DDevice9* dev,
+                         const RECT* src, const RECT* dst,
+                         HWND wnd, const RGNDATA* dirty)
+{
+    if (!dev)
+        return oPresent(dev, src, dst, wnd, dirty);
+
+    if (!g_Device)
+        SetGameDevice(dev);
+
+    // Make sure g_BackBufferSurface is valid right now
+    // (hkSetRenderTarget usually sets it, but don't rely on it 100%)
+    if (!g_RenderTargetManager.g_BackBufferSurface)
     {
-        printf_s("[Debug] Trying to patch +0x18C on %p...\n", *g_pVisualTreatment);
-
-        if (TryPatchSlotIfWritable(*g_pVisualTreatment, 0x18C, g_RenderTargetManager.g_LastReloadedFx))
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
         {
-            printf_s("[Fallback] 🔧 Forced shader slot patch to g_LastReloadedFx at +0x18C\n");
-
-            ScrubShaderCleanupTable();
-            VisualTreatment_Reset();
-            *(BYTE*)LoadedFlagMaybe_ADDRESS = 1;
-            printf_s("[Fallback] ✅ Set LoadedFlagMaybe = 1 (0x00982C39)\n");
-
-            forceApplied = true;
+            SAFE_RELEASE(g_RenderTargetManager.g_BackBufferSurface);
+            g_RenderTargetManager.g_BackBufferSurface = backBuffer; // keep ref
         }
         else
         {
-            printf_s("[Fallback] ❌ TryPatchSlotIfWritable failed\n");
+            SAFE_RELEASE(backBuffer);
         }
     }
-}
 
+    if (!g_RenderTargetManager.g_DeviceResetInProgress)
+    {
+        // blur is driven from RenderDispatchHook
+    }
 
-// Hooked EndScene
-HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device)
-{
-    static uint32_t lastSceneLogFrame = 0;
-    if (!device) return oEndScene(device);
-    if (!g_Device) SetGameDevice(device);
-
-    OnFramePresent();
-
-    if (!g_RenderTargetManager.g_CurrentBlurSurface ||
-        !g_RenderTargetManager.g_MotionBlurTexA ||
-        !g_RenderTargetManager.g_MotionBlurTexB)
-        return oEndScene(device);
-
-    // 🔒 Save ALL render state (including viewport) and restore on exit
-    ScopedStateBlock _sb(device);
-
-    return oEndScene(device);
+    return oPresent(dev, src, dst, wnd, dirty);
 }
 
 HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3DSurface9* renderTarget)
@@ -1189,7 +1376,7 @@ HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3
                     {
                         g_SceneTargetBestArea = area;
                         g_SceneTargetThisFrame = renderTarget;
-                        g_LastSceneFullFrame = eFrameCounter;
+                        g_RenderTargetManager.g_LastSceneFullFrame = eFrameCounter;
                         if (g_RenderTargetManager.g_LastSceneFullSurface != renderTarget)
                         {
                             SAFE_RELEASE(g_RenderTargetManager.g_LastSceneFullSurface);
@@ -1220,6 +1407,17 @@ HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3
                             printf_s("[XNFS] ? Scene RT picked: %ux%u fmt=%u usage=%u ptr=%p\n",
                                      sd.Width, sd.Height, sd.Format, sd.Usage, renderTarget);
                         }
+
+                        static uint32_t lastRebindFrame = 0;
+                        if (lastRebindFrame != eFrameCounter)
+                        {
+                            lastRebindFrame = eFrameCounter;
+                            if (g_RenderTargetManager.g_LastReloadedFx)
+                            {
+                                ReloadBlurBindings(g_RenderTargetManager.g_LastReloadedFx,
+                                                   "IDI_VISUALTREATMENT_FX");
+                            }
+                        }
                     }
                 }
             }
@@ -1239,7 +1437,6 @@ HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3
 HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RECT* dest, HWND hwnd,
                              const RGNDATA* dirty)
 {
-    static uint32_t lastSceneLogFrame = 0;
     SetGameDevice(device);
 
     if (device)
@@ -1262,6 +1459,16 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RE
     }
 
     void** vtable = *reinterpret_cast<void***>(device);
+    
+    if (!oPresent)
+    {
+        DWORD oldProtect;
+        oPresent = reinterpret_cast<PresentFn>(vtable[17]);
+        VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+        vtable[17] = reinterpret_cast<void*>(&hkPresent);
+        VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
+        printf_s("[XNFS] ? hkPresent installed\n");
+    }
 
     if (!oEndScene)
     {
@@ -1272,7 +1479,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RE
         VirtualProtect(&vtable[42], sizeof(void*), oldProtect, &oldProtect);
         printf_s("[XNFS] ? hkEndScene installed via HookedPresent\n");
     }
-
+    
     if (!g_RenderTargetManager.oSetRenderTarget)
     {
         DWORD oldProtect;
@@ -1282,6 +1489,17 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RE
         vtable[37] = reinterpret_cast<void*>(&hkSetRenderTarget);
         VirtualProtect(&vtable[37], sizeof(void*), oldProtect, &oldProtect);
         printf_s("[XNFS] ? hkSetRenderTarget installed via HookedPresent\n");
+    }
+
+    if (!g_RenderTargetManager.oSetTransform)
+    {
+        DWORD oldProtect;
+        g_RenderTargetManager.oSetTransform =
+            reinterpret_cast<RenderTargetManager::SetTransform_t>(vtable[44]);
+        VirtualProtect(&vtable[44], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
+        vtable[44] = reinterpret_cast<void*>(&hkSetTransform);
+        VirtualProtect(&vtable[44], sizeof(void*), oldProtect, &oldProtect);
+        printf_s("[XNFS] ? hkSetTransform installed via HookedPresent\n");
     }
 
     return RealPresent(device, src, dest, hwnd, dirty);
@@ -1591,8 +1809,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
                 }
             }
 
-            injector::MakeJMP(0x00750B10, RenderDispatchHook, true);
-            PatchMotionBlurFix();
+        injector::MakeJMP(0x00750B10, RenderDispatchHook, true);
+        PatchMotionBlurFix();
+        InstallSub6D3B80BlurHook();
+        InstallMotionVectorHook();
+        InstallMotionVectorVtablePatch();
+        InstallMotionVectorHook4467A0();
 
             ApplyGraphicsManagerMainOriginal = (decltype(ApplyGraphicsManagerMainOriginal))
                 call_ApplyGraphicsManagerMainOriginal_ADDRESS;

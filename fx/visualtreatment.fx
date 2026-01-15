@@ -16,7 +16,9 @@ float4 BlackBloomIntensity_1;
 
 float4 DiffuseColour : DIFFUSECOLOUR;
 float XNFS_MotionBlurAmount;
-
+float2 XNFS_TexelSize;      // (1/width, 1/height)
+float2 XNFS_BlurDir;        // e.g. (1,0) or from motion vectors
+float  XNFS_BlurScale;      // strength
 // ------------------------------------------------------------------
 // Samplers
 // ------------------------------------------------------------------
@@ -64,10 +66,21 @@ sampler2D MISCMAP3_SAMPLER = sampler_state // BLOOM_SAMPLER
     MAGFILTER = LINEAR;
 };
 
-shared texture MOTIONBLUR_TEXTURE : MOTIONBLUR;
+shared texture HEIGHTMAP_TEXTURE : HeightMapTexture;
+sampler2D HEIGHTMAP_SAMPLER = sampler_state
+{
+    ASSIGN_TEXTURE(HEIGHTMAP_TEXTURE)
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MIPFILTER = NONE;
+    MINFILTER = LINEAR;
+    MAGFILTER = LINEAR;
+};
+
+shared texture MOTIONBLUR;
 sampler2D MOTIONBLUR_SAMPLER = sampler_state
 {
-    ASSIGN_TEXTURE(MOTIONBLUR_TEXTURE)
+    ASSIGN_TEXTURE(MOTIONBLUR)
     AddressU = CLAMP;
     AddressV = CLAMP;
     MIPFILTER = NONE;
@@ -137,56 +150,47 @@ VtoP_MOTIONBLUR VS_MotionBlur(const VS_INPUT_MOTIONBLUR IN)
     return OUT;
 }
 
-const float kWeights[8] = {6, 5, 4, 3, 2, 1, 1, 1};
-float4 PS_MotionBlur(const VtoP_MOTIONBLUR IN) : COLOR
+float4 PS_MotionBlur(float2 uv : TEXCOORD0) : COLOR
 {
-    float4 result = 0;
-    for (int i = 0; i < 8; ++i)
-    {
-        float4 blur = tex2D(MOTIONBLUR_SAMPLER, IN.tex[i]);
-        result += blur * (kWeights[i] / 23.0f);
-    }
-    return result;
-}
+    float2 stepUV = XNFS_BlurDir * XNFS_BlurScale * XNFS_TexelSize;
 
-VtoP VS_CompositeBlur(const VS_INPUT IN)
-{
-    VtoP OUT;
-    OUT.position = IN.position;
-    OUT.texcoord = IN.texcoord;
-    OUT.texcoord1 = IN.texcoord1;
-    OUT.color = IN.color * DiffuseColour;
-    return OUT;
-}
+    float4 sum = 0;
+    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV * -3);
+    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV * -2);
+    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV * -1);
+    sum += tex2D(DIFFUSEMAP_SAMPLER, uv);
+    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV *  1);
+    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV *  2);
+    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV *  3);
 
-float4 PS_CompositeBlur(const VtoP IN) : COLOR
-{
-    float4 screen = tex2D(DIFFUSEMAP_SAMPLER, IN.texcoord.xy);
-    float4 blur = tex2D(MOTIONBLUR_SAMPLER, IN.texcoord.xy);
-    float senseOfSpeed = saturate(XNFS_MotionBlurAmount);
-    float3 blended = lerp(screen.xyz, blur.xyz, senseOfSpeed);
-    return float4(blended, screen.w);
+    return sum / 7.0;
 }
 
 float4 PS_VisualTreatment_Low1(VS_INPUT i) : COLOR
 {
-    // FULL RES SCENE
-    float4 scene = tex2D(DIFFUSEMAP_SAMPLER, i.texcoord.xy);
+    float2 uv = i.texcoord.xy;
 
-    float4 spline = tex2D(MISCMAP3_SAMPLER, float2(scene.a, scene.r));
+    float4 scene4 = tex2D(DIFFUSEMAP_SAMPLER, uv);
+
+    float4 spline = tex2D(MISCMAP3_SAMPLER, float2(scene4.a, scene4.r));
     float splineR = spline.r;
 
-    float lum = dot(scene.rgb, LUMINANCE_VECTOR);
+    float lum = dot(scene4.rgb, LUMINANCE_VECTOR);
 
     float3 desat =
-        scene.rgb * Desaturation_0.rgb +
-        lum.xxx  * Desaturation_1.rgb;
+        scene4.rgb * Desaturation_0.rgb +
+        lum.xxx    * Desaturation_1.rgb;
 
     float blackBloom =
         splineR * BlackBloomIntensity_0.x +
         BlackBloomIntensity_1.x;
 
-    return float4(desat * blackBloom, 1.0);
+    float3 outRgb = desat * blackBloom;
+
+    // brightness/gain happen in pass2 in your original, but we keep safe scaling here:
+    outRgb *= VisualEffectBrightness;
+
+    return float4(outRgb, 1.0);
 }
 
 float4 PS_VisualTreatment_Low2(VS_INPUT i) : COLOR
@@ -210,8 +214,16 @@ float4 PS_VisualTreatment_Low2(VS_INPUT i) : COLOR
         add +
         vignette * VisualEffectVignette;
 
-    float4 blur = tex2D(MOTIONBLUR_SAMPLER, i.texcoord.xy);
-    outRgb = lerp(outRgb, blur.rgb, saturate(XNFS_MotionBlurAmount));
+    // Temporal blur blend (prev-frame buffer)
+    float4 blurSample = tex2D(MOTIONBLUR_SAMPLER, i.texcoord.xy);
+    float4 vignette = tex2D(MISCMAP2_SAMPLER, i.texcoord.xy);
+    float depth = tex2D(HEIGHTMAP_SAMPLER, i.texcoord.xy).x;
+    float zDist = (1 / (1 - depth));
+    float blurDepth = saturate(-zDist / 300 + 1.2);
+    float motionBlurMask = saturate(vignette.x) * blurDepth * XNFS_MotionBlurAmount;
+    float radialBlurMask = vignette.w * XNFS_MotionBlurAmount;
+    float blurAmount = saturate(motionBlurMask + radialBlurMask);
+    outRgb = lerp(outRgb, blurSample.rgb, blurAmount);
 
     return float4(outRgb, 1.0);
 }
@@ -256,8 +268,16 @@ float4 PS_VisualTreatment(float2 uv : TEXCOORD) : COLOR
     // ✅ vanilla final multiplier comes from gain.b (temp0.z)
     outRgb *= gain.b;
 
-    float4 blur = tex2D(MOTIONBLUR_SAMPLER, uv);
-    outRgb = lerp(outRgb, blur.rgb, saturate(XNFS_MotionBlurAmount));
+    // Temporal blur blend (prev-frame buffer)
+    float4 blurSample = tex2D(MOTIONBLUR_SAMPLER, uv);
+    float4 vignette = tex2D(MISCMAP2_SAMPLER, uv);
+    float depth = tex2D(HEIGHTMAP_SAMPLER, uv).x;
+    float zDist = (1 / (1 - depth));
+    float blurDepth = saturate(-zDist / 300 + 1.2);
+    float motionBlurMask = saturate(vignette.x) * blurDepth * XNFS_MotionBlurAmount;
+    float radialBlurMask = vignette.w * XNFS_MotionBlurAmount;
+    float blurAmount = saturate(motionBlurMask + radialBlurMask);
+    outRgb = lerp(outRgb, blurSample.rgb, blurAmount);
 
     return float4(outRgb, 1.0);
 }
@@ -305,15 +325,5 @@ technique motionblur <int shader = 1;>
         COMMON_VT_PASS_STATE
         VertexShader = compile vs_1_1 VS_MotionBlur();
         PixelShader = compile ps_2_0 PS_MotionBlur();
-    }
-}
-
-technique composite_blur <int shader = 1;>
-{
-    pass p0
-    {
-        COMMON_VT_PASS_STATE
-        VertexShader = compile vs_1_1 VS_CompositeBlur();
-        PixelShader = compile ps_2_0 PS_CompositeBlur();
     }
 }

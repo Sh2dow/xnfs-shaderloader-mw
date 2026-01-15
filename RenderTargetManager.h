@@ -1,9 +1,9 @@
 #pragma once
+#include "Hooks.h"
 
 #define SAFE_RELEASE(p) if (p) { p->Release(); p = nullptr; }
 #include <unordered_map>
 
-#include "Hooks.h"
 
 class RenderTargetManager
 {
@@ -14,6 +14,8 @@ public:
     bool g_ApplyScheduled = false;
     int g_ApplyGraphicsTriggerDelay = 0;
 
+    uint32_t g_LastSceneFullFrame = 0;
+    
     std::unordered_map<std::string, LPD3DXEFFECT> g_ActiveEffects;
 
     void* g_ApplyGraphicsManagerThis = nullptr;
@@ -43,9 +45,21 @@ public:
     IDirect3DSurface9* g_LastSceneFullSurface = nullptr;
     IDirect3DTexture9* g_LastSceneFullTex = nullptr;
 
+    // scene copy (final backbuffer copy, optional)
+    IDirect3DTexture9* g_SceneCopyTex     = nullptr;
+    IDirect3DSurface9* g_SceneCopySurface = nullptr;
+
+    // blur history ping-pong (what VT samples as "PREV/MOTIONBLUR")
+    IDirect3DTexture9* g_BlurHistoryTexA  = nullptr;
+    IDirect3DSurface9* g_BlurHistorySurfA = nullptr;
+    IDirect3DTexture9* g_BlurHistoryTexB  = nullptr;
+    IDirect3DSurface9* g_BlurHistorySurfB = nullptr;
+
     bool g_UseTexA = true;
     UINT g_Width = 0;
     UINT g_Height = 0;
+    bool g_PendingVTRebind = false;
+    IDirect3DTexture9* g_BackBufferTex = nullptr;
 
 
     typedef HRESULT (WINAPI*D3DXCreateEffectFromResourceAFn)(
@@ -90,12 +104,8 @@ public:
     Reset_t oReset = nullptr;
     using SetRenderTarget_t = HRESULT (WINAPI*)(LPDIRECT3DDEVICE9, DWORD, IDirect3DSurface9*);
     SetRenderTarget_t oSetRenderTarget = nullptr;
-    HRESULT WINAPI hkReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETERS* params);
-    HRESULT WINAPI hkEndScene(LPDIRECT3DDEVICE9 device);
-    HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3DSurface9* renderTarget);
-    HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RECT* dest, HWND hwnd,
-                                        const RGNDATA* dirty);
-
+    using SetTransform_t = HRESULT (WINAPI*)(LPDIRECT3DDEVICE9, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
+    SetTransform_t oSetTransform = nullptr;
 
     void OnDeviceLost();
 

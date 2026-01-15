@@ -9,8 +9,9 @@
 
 static const char* kCustomBlurFx = R"FX(
 texture DIFFUSEMAP_TEXTURE;
-texture PREV_TEXTURE;
-sampler DIFFUSEMAP_SAMPLER = sampler_state
+texture MOTIONBLUR_TEXTURE;
+texture DEPTHBUFFER_TEXTURE;
+sampler2D DIFFUSEMAP_SAMPLER = sampler_state
 {
     Texture = <DIFFUSEMAP_TEXTURE>;
     AddressU = CLAMP;
@@ -20,9 +21,19 @@ sampler DIFFUSEMAP_SAMPLER = sampler_state
     MAGFILTER = LINEAR;
 };
 
-sampler PREV_SAMPLER = sampler_state
+sampler2D MOTIONBLUR_SAMPLER = sampler_state
 {
-    Texture = <PREV_TEXTURE>;
+    Texture = <MOTIONBLUR_TEXTURE>;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MIPFILTER = NONE;
+    MINFILTER = LINEAR;
+    MAGFILTER = LINEAR;
+};
+
+sampler2D DEPTHBUFFER_SAMPLER = sampler_state
+{
+    Texture = <DEPTHBUFFER_TEXTURE>;
     AddressU = CLAMP;
     AddressV = CLAMP;
     MIPFILTER = NONE;
@@ -32,6 +43,8 @@ sampler PREV_SAMPLER = sampler_state
 
 float2 BlurTexelSize;
 float MotionBlurBlend;
+float2 MotionVec;
+float MotionBlurScale;
 
 struct VS_IN
 {
@@ -77,14 +90,15 @@ float4 ps_blur(VS_OUT IN) : COLOR
     float2 uv6 = IN.tex67.xy;
     float2 uv7 = IN.tex67.zw;
 
-    float4 c = tex2D(DIFFUSEMAP_SAMPLER, uv0) * 0.22;
-    c += tex2D(DIFFUSEMAP_SAMPLER, uv1) * 0.16;
-    c += tex2D(DIFFUSEMAP_SAMPLER, uv2) * 0.14;
-    c += tex2D(DIFFUSEMAP_SAMPLER, uv3) * 0.12;
-    c += tex2D(DIFFUSEMAP_SAMPLER, uv4) * 0.12;
-    c += tex2D(DIFFUSEMAP_SAMPLER, uv5) * 0.10;
-    c += tex2D(DIFFUSEMAP_SAMPLER, uv6) * 0.08;
-    c += tex2D(DIFFUSEMAP_SAMPLER, uv7) * 0.06;
+    float4 c = tex2D(DIFFUSEMAP_SAMPLER, uv0) * (6.0 / 23.0);
+    c += tex2D(DIFFUSEMAP_SAMPLER, uv1) * (5.0 / 23.0);
+    c += tex2D(DIFFUSEMAP_SAMPLER, uv2) * (4.0 / 23.0);
+    c += tex2D(DIFFUSEMAP_SAMPLER, uv3) * (3.0 / 23.0);
+    c += tex2D(DIFFUSEMAP_SAMPLER, uv4) * (2.0 / 23.0);
+    c += tex2D(DIFFUSEMAP_SAMPLER, uv5) * (1.0 / 23.0);
+    c += tex2D(DIFFUSEMAP_SAMPLER, uv6) * (1.0 / 23.0);
+    c += tex2D(DIFFUSEMAP_SAMPLER, uv7) * (1.0 / 23.0);
+    c.a = tex2D(DEPTHBUFFER_SAMPLER, uv0).x;
     return c;
 }
 
@@ -98,7 +112,7 @@ float4 ps_copy(VS_OUT IN) : COLOR
 float4 ps_temporal(VS_OUT IN) : COLOR
 {
     float4 curr = tex2D(DIFFUSEMAP_SAMPLER, IN.tex01.xy);
-    float4 prev = tex2D(PREV_SAMPLER, IN.tex01.xy);
+    float4 prev = tex2D(MOTIONBLUR_SAMPLER, IN.tex01.xy);
     return lerp(curr, prev, MotionBlurBlend);
 }
 

@@ -1,17 +1,22 @@
 #include <d3d9.h>
 #include "Hooks.h"
 #include "RenderTargetManager.h"
+#include "Globals.h"
 #include "Validators.h"
 
 void RenderTargetManager::OnDeviceLost()
 {
-    g_DeviceResetInProgress = true;
-
     SAFE_RELEASE(g_MotionBlurTexA);
     SAFE_RELEASE(g_MotionBlurTexB);
     SAFE_RELEASE(g_CurrentBlurSurface);
     SAFE_RELEASE(g_MotionBlurSurfaceA);
     SAFE_RELEASE(g_MotionBlurSurfaceB);
+    SAFE_RELEASE(g_SceneCopySurface);
+    SAFE_RELEASE(g_SceneCopyTex);
+    SAFE_RELEASE(g_BlurHistoryTexA);
+    SAFE_RELEASE(g_BlurHistorySurfA);
+    SAFE_RELEASE(g_BlurHistoryTexB);
+    SAFE_RELEASE(g_BlurHistorySurfB);
     g_CurrentBlurTex = nullptr;
 
     // Skip OnLostDevice for tracked effects here; some are stale and
@@ -32,6 +37,7 @@ void RenderTargetManager::OnDeviceLost()
     SAFE_RELEASE(g_LastSceneSurface)
     SAFE_RELEASE(g_LastSceneFullSurface)
     SAFE_RELEASE(g_LastSceneFullTex)
+    g_MotionBlurHistoryReady = false;
 }
 
 bool RenderTargetManager::OnDeviceReset(LPDIRECT3DDEVICE9 device)
@@ -65,8 +71,14 @@ bool RenderTargetManager::OnDeviceReset(LPDIRECT3DDEVICE9 device)
                                         D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_MotionBlurTexA, nullptr);
     HRESULT hr2 = device->CreateTexture(g_Width, g_Height, 1, D3DUSAGE_RENDERTARGET,
                                         D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_MotionBlurTexB, nullptr);
+    HRESULT hr3 = device->CreateTexture(g_Width, g_Height, 1, D3DUSAGE_RENDERTARGET,
+                                        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_SceneCopyTex, nullptr);
+    HRESULT hr4 = device->CreateTexture(g_Width, g_Height, 1, D3DUSAGE_RENDERTARGET,
+                                        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_BlurHistoryTexA, nullptr);
+    HRESULT hr5 = device->CreateTexture(g_Width, g_Height, 1, D3DUSAGE_RENDERTARGET,
+                                        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_BlurHistoryTexB, nullptr);
 
-    if (FAILED(hr1) || FAILED(hr2))
+    if (FAILED(hr1) || FAILED(hr2) || FAILED(hr3) || FAILED(hr4) || FAILED(hr5))
     {
         printf_s("[RenderTargetManager] ❌ Failed to create motion blur textures\n");
         return false;
@@ -75,12 +87,16 @@ bool RenderTargetManager::OnDeviceReset(LPDIRECT3DDEVICE9 device)
     g_UseTexA = true;
     g_CurrentBlurTex = g_MotionBlurTexA;
     if (FAILED(g_MotionBlurTexA->GetSurfaceLevel(0, &g_MotionBlurSurfaceA)) ||
-        FAILED(g_MotionBlurTexB->GetSurfaceLevel(0, &g_MotionBlurSurfaceB)))
+        FAILED(g_MotionBlurTexB->GetSurfaceLevel(0, &g_MotionBlurSurfaceB)) ||
+        FAILED(g_SceneCopyTex->GetSurfaceLevel(0, &g_SceneCopySurface)) ||
+        FAILED(g_BlurHistoryTexA->GetSurfaceLevel(0, &g_BlurHistorySurfA)) ||
+        FAILED(g_BlurHistoryTexB->GetSurfaceLevel(0, &g_BlurHistorySurfB)))
     {
         printf_s("[RenderTargetManager] ? Failed to get blur surfaces\n");
         return false;
     }
     g_CurrentBlurSurface = g_MotionBlurSurfaceA;
+    g_MotionBlurHistoryReady = false;
     if (!g_CurrentBlurSurface)
     {
         printf_s("[RenderTargetManager] ? Failed to get surface level\n");
