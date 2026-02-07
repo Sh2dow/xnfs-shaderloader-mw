@@ -95,6 +95,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="EffectManager.h" />
+    <ClInclude Include="ExposureStandalone.h" />
     <ClInclude Include="Globals.h" />
     <ClInclude Include="Hooks.h" />
     <ClInclude Include="Log.h" />
@@ -107,6 +108,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EffectManager.cpp" />
+    <ClCompile Include="ExposureStandalone.cpp" />
     <ClCompile Include="Globals.cpp" />
     <ClCompile Include="dllmain.cpp">
       <CompileAsManaged Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">false</CompileAsManaged>

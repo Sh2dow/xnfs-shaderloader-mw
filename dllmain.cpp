@@ -19,6 +19,7 @@
 #include "Globals.h"
 #include "MotionBlurPass.h"
 #include "Validators.h"
+#include "ExposureStandalone.h"
 
 // -------------------- GLOBALS --------------------
 #define CHECKMARK(x) ((x) ? "OK" : "MISSING")
@@ -26,6 +27,10 @@
 #define SAFE_RELEASE(p) if (p) { p->Release(); p = nullptr; }
 
 void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name);
+
+static ExposureStandalone::ExposureSampler g_ExposureSampler;
+static bool g_ExposureInitialized = false;
+static DWORD g_ExposureLastTick = 0;
 
 static void PatchMotionBlurFix()
 {
@@ -470,6 +475,46 @@ static void __cdecl RenderDispatchHook(void* arg0, void* arg4)
     }
 
     g_RenderDispatchOriginal(arg0, arg4);
+
+    if (!g_RenderTargetManager.g_DeviceResetInProgress)
+    {
+        IDirect3DDevice9* dev = g_Device;
+        if (dev)
+        {
+            if (!g_ExposureInitialized)
+            {
+                g_ExposureInitialized = g_ExposureSampler.Init(dev);
+            }
+
+            if (g_ExposureInitialized)
+            {
+                IDirect3DSurface9* backBuffer = nullptr;
+                if (SUCCEEDED(dev->GetRenderTarget(0, &backBuffer)) && backBuffer)
+                {
+                    g_ExposureSampler.SampleLuminance(backBuffer);
+                    backBuffer->Release();
+                }
+
+                const DWORD nowTick = GetTickCount();
+                float dt = 1.0f / 60.0f;
+                if (g_ExposureLastTick != 0)
+                    dt = (nowTick - g_ExposureLastTick) / 1000.0f;
+                g_ExposureLastTick = nowTick;
+
+                g_ExposureSampler.UpdateExposure(dt, 0.0f);
+
+                auto it = g_RenderTargetManager.g_ActiveEffects.find("IDI_VISUALTREATMENT_FX");
+                if (it != g_RenderTargetManager.g_ActiveEffects.end() && IsValidEffectObject(it->second))
+                {
+                    ID3DXEffect* fx = it->second;
+                    D3DXHANDLE hExposure = fx->GetParameterByName(nullptr, "Exposure");
+                    if (hExposure)
+                        fx->SetFloat(hExposure, g_ExposureSampler.GetExposure());
+                }
+            }
+        }
+    }
+
     UpdateMotionBlurFromEView();
 }
 
@@ -1161,6 +1206,12 @@ void OnDeviceReset(LPDIRECT3DDEVICE9 device)
 
     g_RenderTargetManager.g_DeviceResetInProgress = false;
 
+    if (g_ExposureInitialized)
+    {
+        g_ExposureSampler.Shutdown();
+        g_ExposureInitialized = false;
+    }
+
     // Reload effect states only if render targets were rebuilt
     if (g_RenderTargetManager.g_CurrentBlurTex)
     {
@@ -1183,6 +1234,11 @@ void OnDeviceReset(LPDIRECT3DDEVICE9 device)
 void OnDeviceLost()
 {
     g_RenderTargetManager.OnDeviceLost(); // Delegate to RenderTargetManager's cleanup
+    if (g_ExposureInitialized)
+    {
+        g_ExposureSampler.Shutdown();
+        g_ExposureInitialized = false;
+    }
     printf_s("[XNFS] ✅ Delegated OnDeviceLost to RenderTargetManager\n");
 }
 

@@ -7,6 +7,7 @@ float VisualEffectBrightness;
 float VisualEffectRadialBlur;
 float VisualEffectVignette = {1};
 float RadialBlurOffset = {0.1};
+float exposure : Exposure;
 float4 ColourBloomTint = {0.517, 0.8, 0.9, 1};
 float4 Desaturation;
 float4 Desaturation_0;
@@ -166,68 +167,6 @@ float4 PS_MotionBlur(float2 uv : TEXCOORD0) : COLOR
     return sum / 7.0;
 }
 
-float4 PS_VisualTreatment_Low1(VS_INPUT i) : COLOR
-{
-    float2 uv = i.texcoord.xy;
-
-    float4 scene4 = tex2D(DIFFUSEMAP_SAMPLER, uv);
-
-    float4 spline = tex2D(MISCMAP3_SAMPLER, float2(scene4.a, scene4.r));
-    float splineR = spline.r;
-
-    float lum = dot(scene4.rgb, LUMINANCE_VECTOR);
-
-    float3 desat =
-        scene4.rgb * Desaturation_0.rgb +
-        lum.xxx    * Desaturation_1.rgb;
-
-    float blackBloom =
-        splineR * BlackBloomIntensity_0.x +
-        BlackBloomIntensity_1.x;
-
-    float3 outRgb = desat * blackBloom;
-
-    // brightness/gain happen in pass2 in your original, but we keep safe scaling here:
-    outRgb *= VisualEffectBrightness;
-
-    return float4(outRgb, 1.0);
-}
-
-float4 PS_VisualTreatment_Low2(VS_INPUT i) : COLOR
-{
-    // Full-resolution scene
-    float4 scene = tex2D(DIFFUSEMAP_SAMPLER, i.texcoord.xy);
-
-    // Spline LUT (uses scene.a, scene.r like PC VT)
-    float2 splineUV = float2(scene.a, scene.r);
-    float splineG = tex2D(MISCMAP3_SAMPLER, splineUV).g;
-
-    // Colour bloom contribution
-    float bloom = ColourBloomIntensity * splineG;
-    float3 add = scene.rgb * (ColourBloomTint.rgb * bloom);
-
-    // Vignette comes from GAINMAP
-    float vignette = tex2D(MISCMAP2_SAMPLER, i.texcoord.xy).r;
-
-    float3 outRgb =
-        scene.rgb +
-        add +
-        vignette * VisualEffectVignette;
-
-    // Temporal blur blend (prev-frame buffer)
-    float4 blurSample = tex2D(MOTIONBLUR_SAMPLER, i.texcoord.xy);
-    float4 vignette = tex2D(MISCMAP2_SAMPLER, i.texcoord.xy);
-    float depth = tex2D(HEIGHTMAP_SAMPLER, i.texcoord.xy).x;
-    float zDist = (1 / (1 - depth));
-    float blurDepth = saturate(-zDist / 300 + 1.2);
-    float motionBlurMask = saturate(vignette.x) * blurDepth * XNFS_MotionBlurAmount;
-    float radialBlurMask = vignette.w * XNFS_MotionBlurAmount;
-    float blurAmount = saturate(motionBlurMask + radialBlurMask);
-    outRgb = lerp(outRgb, blurSample.rgb, blurAmount);
-
-    return float4(outRgb, 1.0);
-}
-
 float4 PS_VisualTreatment(float2 uv : TEXCOORD) : COLOR
 {
     // MISCMAP1 is the packed control/source in vanilla
@@ -259,14 +198,14 @@ float4 PS_VisualTreatment(float2 uv : TEXCOORD) : COLOR
 
     float3 outRgb = desat * blackBloom + scene * (ColourBloomTint.rgb * colourBloom);
 
-    // ✅ vanilla vignette add (from misc1.r, not gain.r)
-    outRgb += vignetteMask * VisualEffectVignette;
-
     // brightness
     outRgb *= VisualEffectBrightness;
 
     // ✅ vanilla final multiplier comes from gain.b (temp0.z)
     outRgb *= gain.b;
+
+    // Exposure from CPU
+    outRgb *= exposure;
 
     // Temporal blur blend (prev-frame buffer)
     float4 blurSample = tex2D(MOTIONBLUR_SAMPLER, uv);
