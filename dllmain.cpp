@@ -13,6 +13,11 @@
 #include "d3dx9shader.h" // for ID3DXEffectCompiler
 
 // -------------------- GLOBALS --------------------
+
+std::string srcPath = "fx\\";
+
+std::string compileOutPath = "";
+
 #define SHADER_TABLE_PTR reinterpret_cast<ID3DXEffect**>(0x0094D9C4)
 
 LPDIRECT3DDEVICE9 g_Device = nullptr;
@@ -93,7 +98,7 @@ class FXIncludeHandler : public ID3DXInclude
 public:
     STDMETHOD(Open)(D3DXINCLUDE_TYPE, LPCSTR fileName, LPCVOID, LPCVOID* ppData, UINT* pBytes) override
     {
-        std::string fullPath = "fx/" + std::string(fileName);
+        std::string fullPath = srcPath + std::string(fileName);
         printf("[Include] Trying to open: %s\n", fullPath.c_str());
 
         FILE* f = fopen(fullPath.c_str(), "rb");
@@ -164,7 +169,7 @@ bool CompileAndDumpShader(const std::string& key, const std::string& fxPath)
     }
 
     // Write to game root folder IDI_*.FX
-    std::string outPath = key;
+    std::string outPath = compileOutPath + key;
     FILE* f = fopen(outPath.c_str(), "wb");
     if (!f)
     {
@@ -208,21 +213,23 @@ void LoadShaderOverrides()
     g_ShaderBuffers.clear();
     g_FxOverrides.clear();
 
-    DWORD attrs = GetFileAttributesA("fx");
+    // DWORD attrs = GetFileAttributesA((srcPath + "*.fx").c_str());
+    // DWORD attrs = GetFileAttributesA("fx");
+    DWORD attrs = GetFileAttributesA(srcPath.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
     {
-        printf("[Error] fx/ folder does not exist or is inaccessible.\n");
+        printf("[Error] %s folder does not exist or is inaccessible.\n", srcPath.c_str());
         return;
     }
 
-    printf("[Init] fx/ folder found, scanning for shaders...\n");
+    printf("[Init] %s folder found, scanning for shaders...\n", srcPath.c_str());
 
     WIN32_FIND_DATAA findData;
-    HANDLE hFind = FindFirstFileA("fx\\*.fx", &findData);
+    HANDLE hFind = FindFirstFileA((srcPath + "*.fx").c_str(), &findData);
 
     if (hFind == INVALID_HANDLE_VALUE)
     {
-        printf("[Init] No .fx files found in fx/ folder.\n");
+        printf("[Init] No .fx files found in %s folder.\n", srcPath.c_str());
         return;
     }
 
@@ -232,7 +239,7 @@ void LoadShaderOverrides()
         std::string name = fileName.substr(0, fileName.find_last_of('.'));
 
         std::string key = "IDI_" + ToUpper(name) + "_FX";
-        std::string fullPath = "fx/" + fileName;
+        std::string fullPath = srcPath + fileName;
         g_FxOverrides.insert(key); // ✅ REQUIRED for HookedCreateFromResource
 
         CompileAndDumpShader(key, fullPath);
@@ -312,7 +319,7 @@ HRESULT WINAPI HookedCreateFromResource(
 
     if (g_FxOverrides.count(pResource))
     {
-        std::string path = std::string(pResource); // assume key starts with IDI_
+        std::string path = std::string(compileOutPath + pResource); // assume key starts with IDI_
         FILE* f = fopen(path.c_str(), "rb");
         if (f)
         {
