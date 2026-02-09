@@ -1301,7 +1301,23 @@ void TryFullGraphicsReset()
 
     if (g_LastEView && g_pVisualTreatment && *g_pVisualTreatment)
     {
-        ReplaceShaderSlot((BYTE*)g_ApplyGraphicsSettingsThis, 0x18C, g_LastReloadedFx);
+        // These pointers can go stale across device resets / menu transitions. Re-resolve and validate
+        // before calling into game code to avoid failwithmessage/assert crashes.
+        void* applyThis = ResolveApplyGraphicsThis();
+        if (!applyThis)
+        {
+            printf_s("⚠️ Cannot reset visuals: failed to resolve ApplyGraphicsSettings thisptr\n");
+            return;
+        }
+        g_ApplyGraphicsSettingsThis = applyThis;
+
+        if (!IsValidThis(g_ApplyGraphicsManagerThis))
+        {
+            printf_s("⚠️ Cannot reset visuals: g_ApplyGraphicsManagerThis is null/invalid (%p)\n", g_ApplyGraphicsManagerThis);
+            return;
+        }
+
+        ReplaceShaderSlot((BYTE*)applyThis, 0x18C, g_LastReloadedFx);
 
         IVisualTreatment_Reset(*g_pVisualTreatment);
         printf_s("[HotReload] 🔁 Called IVisualTreatment::Reset()\n");
@@ -1314,7 +1330,13 @@ void TryFullGraphicsReset()
         ForceFrameRender();
         printf_s("[HotReload] ✅ ForceFrameRender (sub_6DE300) called\n");
 
-        ApplyGraphicsManagerMainOriginal(g_ApplyGraphicsManagerThis);
+        // Calling ApplyGraphicsManagerMain can trip the game's internal failwithmessage/assert
+        // depending on state (e.g., wrong object/state during Present). The visual reset and
+        // slot patch above are sufficient for hot reload, so keep this disabled for stability.
+        // If you want to experiment, re-enable behind a runtime toggle.
+        // if (!ApplyGraphicsManagerMainOriginal)
+        //     ApplyGraphicsManagerMainOriginal = (ApplyGraphicsManagerMain_t)0x004F17F0;
+        // ApplyGraphicsManagerMainOriginal(g_ApplyGraphicsManagerThis);
     }
     else
     {
@@ -1352,7 +1374,16 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* device,
 
             if (g_ApplyGraphicsSettingsThis && g_ApplyGraphicsManagerThis)
             {
-                ReplaceShaderSlot((BYTE*)g_ApplyGraphicsSettingsThis, 0x18C, g_LastReloadedFx);
+                void* applyThis = ResolveApplyGraphicsThis();
+                if (applyThis)
+                {
+                    g_ApplyGraphicsSettingsThis = applyThis;
+                    ReplaceShaderSlot((BYTE*)applyThis, 0x18C, g_LastReloadedFx);
+                }
+                else
+                {
+                    printf_s("⚠️ ApplyGraphicsSettings thisptr could not be resolved; skipping ReplaceShaderSlot\n");
+                }
 
                 if (g_pVisualTreatment && *g_pVisualTreatment)
                 {

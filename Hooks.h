@@ -16,7 +16,9 @@ namespace std {
 typedef void(__fastcall* ApplyGraphicsSettingsFn)(void* ecx, void* edx, void* arg1);
 extern ApplyGraphicsSettingsFn ApplyGraphicsSettingsOriginal;  // ✅ extern = DECLARATION ONLY
 
-typedef int (__thiscall* ApplyGraphicsManagerMain_t)(void* thisptr);
+// NOTE: This is a game function (not a C++ member) that takes the manager "this" as a stack argument.
+// Using __thiscall here can trigger __RTC_CheckEsp failures (0xC0000409) due to stack imbalance.
+typedef int (__stdcall* ApplyGraphicsManagerMain_t)(void* thisptr);
 extern ApplyGraphicsManagerMain_t ApplyGraphicsManagerMainOriginal;
 
 extern int g_ApplyGraphicsTriggerDelay;
