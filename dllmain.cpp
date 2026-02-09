@@ -764,7 +764,10 @@ static int __cdecl XNFS_Sub6D3B80_Hook(void* ctx, int a2, void* a3, void* a4, in
     //    "scene color" the game intends for the blur pass. It can be higher-res than the dst RT (supersampling).
     // 2) Our pre-VT capture (only if updated this frame).
     // 3) Engine stage0 / last-scene fallbacks.
-    if (a3 && !src0)
+    //
+    // IMPORTANT: prefer (a3) even if stage0 is bound. In many mod stacks stage0 can be post-blur or otherwise
+    // not the intended source, which makes even dbg_curr look blurry.
+    if (a3)
     {
         IDirect3DBaseTexture9* cand = nullptr;
         if (!IsBadReadPtr(a3, sizeof(void*)))
@@ -782,9 +785,11 @@ static int __cdecl XNFS_Sub6D3B80_Hook(void* ctx, int a2, void* a3, void* a4, in
             D3DSURFACE_DESC td{};
             if (t && SUCCEEDED(t->GetLevelDesc(0, &td)) && td.Width >= 64 && td.Height >= 64)
             {
+                if (src0) src0->Release();
                 src0 = cand;
                 src0->AddRef();
                 addedSrc0Ref = true;
+                gotStage0 = false; // (a3) overrides any engine-bound stage0 assumptions
             }
             if (t) t->Release();
         }
@@ -859,17 +864,14 @@ static int __cdecl XNFS_Sub6D3B80_Hook(void* ctx, int a2, void* a3, void* a4, in
         if (amountForPass <= 0.000001f)
             amountForPass = g_MotionBlurAmount;
 
-        // Small heuristic: if we had any motion update recently but amount is stuck at 0, use a visible minimum.
+        // Small heuristic: if we had any motion update recently but amount is stuck at 0, use a tiny minimum.
+        // Do NOT force a default nonzero amount; that creates a constant fullscreen haze at rest.
         if (amountForPass <= 0.000001f)
         {
             const DWORD ageMs = GetTickCount() - g_LastMotionUpdateTick;
             if (ageMs < 100)
                 amountForPass = 0.06f;
         }
-
-        // Deterministic fallback: if we still have no amount, use a sane default so the flow always works.
-        if (amountForPass <= 0.000001f)
-            amountForPass = 0.25f;
 
         // Allow forcing amount to validate the pipeline (F11 hold).
         // F9 is used for debug-cycle in MotionBlurPass in some setups.
@@ -883,13 +885,36 @@ static int __cdecl XNFS_Sub6D3B80_Hook(void* ctx, int a2, void* a3, void* a4, in
 
         // Vanilla motion blur is hard-disabled in PatchVanillaMotionBlurControl().
 
-        // 1) Update history (ping-pong)
+        // Update blur history (ping-pong). VisualTreatment will apply the blur using its own mask/vignette
+        // as long as we bind DIFFUSEMAP_TEXTURE=scene and MOTIONBLUR/PREV texture=our history.
         MotionBlurPass::RenderBlurOverride(dev, src0, src1, dstRT);
 
-        // 2) Composite to the engine's blur target. This bypasses VT and prevents later stages
-        // from "winning" due to technique ordering.
-        if (g_RenderTargetManager.g_CurrentBlurTex)
+        // Debug only: draw our composite/debug views into the engine blur target.
+        // Default behavior must NOT composite here, otherwise blur becomes effectively fullscreen and ignores VT.
+        //
+        // F9: cycle debug modes (0..7)
+        // F10 (hold): force magenta tint (proves our draw is visible)
+        static int s_dbgMode = 0;
+        static int s_dbgShowFrames = 0;
+        static SHORT s_prevF9 = 0;
+        const SHORT curF9 = GetAsyncKeyState(VK_F9);
+        if ((curF9 & 0x8000) && !(s_prevF9 & 0x8000))
+        {
+            s_dbgMode = (s_dbgMode + 1) % 8;
+            s_dbgShowFrames = 180; // ~3s at 60fps, enough to see the mode without holding keys
+        }
+        s_prevF9 = curF9;
+
+        const bool forceTint = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        MotionBlurPass::SetDebugMode(s_dbgMode);
+        MotionBlurPass::SetForceTint(forceTint);
+
+        const bool wantDebugView = forceTint || (s_dbgMode != 0 && s_dbgShowFrames > 0);
+        if (wantDebugView && g_RenderTargetManager.g_CurrentBlurTex)
+        {
             MotionBlurPass::CompositeToSurface(dev, src0, g_RenderTargetManager.g_CurrentBlurTex, dstRT, amountForPass);
+            if (s_dbgShowFrames > 0) --s_dbgShowFrames;
+        }
 
         static DWORD s_lastBlurLogTick = 0;
         const DWORD nowTick = GetTickCount();
@@ -1275,6 +1300,8 @@ static void EnsureDeviceVtableHooks(IDirect3DDevice9* dev)
 {
     if (!dev) 
         return;
+    if (g_RenderTargetManager.g_DeviceResetInProgress)
+        return;
     void** vtable = *reinterpret_cast<void***>(dev);
     if (!vtable) 
         return;
@@ -1290,23 +1317,9 @@ static void EnsureDeviceVtableHooks(IDirect3DDevice9* dev)
         VirtualProtect(&vtable[16], sizeof(void*), oldProtect, &oldProtect);
     }
 
-    // Ensure Present (index 17) is hooked (some setups never run our HookedPresent trampoline).
-    if (vtable[17] != reinterpret_cast<void*>(&hkPresent))
-    {
-        oPresent = reinterpret_cast<Present_t>(vtable[17]);
-        VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[17] = reinterpret_cast<void*>(&hkPresent);
-        VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
-    }
+    // Do NOT hook Present here. Present is commonly hooked by other mods; swapping it risks recursion and perf issues.
 
-    // Ensure EndScene (index 42) is hooked (our per-frame maintenance runs here).
-    if (vtable[42] != reinterpret_cast<void*>(&hkEndScene))
-    {
-        oEndScene = reinterpret_cast<EndScene_t>(vtable[42]);
-        VirtualProtect(&vtable[42], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[42] = reinterpret_cast<void*>(&hkEndScene);
-        VirtualProtect(&vtable[42], sizeof(void*), oldProtect, &oldProtect);
-    }
+    // Do NOT hook EndScene here. Hooking EndScene is high-risk in mod stacks (perf + reload stability).
 
     // Ensure SetTransform (index 44) stays hooked. Other mods can hot-swap vtables after us.
     if (vtable[44] != reinterpret_cast<void*>(&hkSetTransform))
@@ -1791,6 +1804,13 @@ void ReloadBlurBindings(ID3DXEffect* fx, const std::string& name = "")
             }
         }
 
+        // Bind optional motion blur mask (BlurMask.png) if the shader supports it (MW360Tweaks style).
+        // This should reduce blur on cars/center and prevents a uniform "tight blur on everything".
+        if (auto h = fx->GetParameterByName(nullptr, "MotionBlurMask"))
+            fx->SetTexture(h, g_RenderTargetManager.g_MotionBlurMaskTex);
+        else if (auto h2 = fx->GetParameterByName(nullptr, "MOTIONBLUR_MASK_TEXTURE"))
+            fx->SetTexture(h2, g_RenderTargetManager.g_MotionBlurMaskTex);
+
         // Capture the depth texture actually used by VT (if any). This is more reliable on PC builds
         // than our own g_DepthTex which may never be populated.
         {
@@ -1837,12 +1857,11 @@ HRESULT WINAPI HookedCreateFromResource(
     LPD3DXEFFECT* outEffect,
     LPD3DXBUFFER* outErrors)
 {
-    // We get a reliable device pointer here even when Present hook ownership belongs to another mod.
+    // We may see a valid device pointer here, but do NOT patch vtables from inside D3DX effect creation.
+    // ShaderLoader hot-reload/Reset paths can call into D3DX while the device is transitioning; vtable writes
+    // here have caused instability (0xc0000409) in practice. DeferredHookThread handles vtable installation.
     if (device)
-    {
         SetGameDevice(device);
-        EnsureDeviceVtableHooks(device);
-    }
 
     if (!device || !pResource)
     {
@@ -2224,71 +2243,9 @@ HRESULT WINAPI hkSetRenderTarget(LPDIRECT3DDEVICE9 device, DWORD index, IDirect3
 HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* src, const RECT* dest, HWND hwnd,
                              const RGNDATA* dirty)
 {
+    // Some mod stacks never route through our "HookedPresent" trampoline, and others already own Present.
+    // This function must stay side-effect free to avoid recursion, stack overflows, and shader reload crashes.
     SetGameDevice(device);
-
-    if (device)
-    {
-        IDirect3DSurface9* backBuffer = nullptr;
-        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
-        {
-            D3DSURFACE_DESC bbDesc{};
-            if (SUCCEEDED(backBuffer->GetDesc(&bbDesc)) &&
-                (bbDesc.Width != g_RenderTargetManager.g_Width || bbDesc.Height != g_RenderTargetManager.g_Height))
-            {
-                printf_s("[XNFS] ? Blur RT resize: %ux%u -> %ux%u\n",
-                         g_RenderTargetManager.g_Width, g_RenderTargetManager.g_Height,
-                         bbDesc.Width, bbDesc.Height);
-                g_RenderTargetManager.OnDeviceLost();
-                g_RenderTargetManager.OnDeviceReset(device);
-            }
-        }
-        SAFE_RELEASE(backBuffer);
-    }
-
-    void** vtable = *reinterpret_cast<void***>(device);
-
-    if (!oPresent)
-    {
-        DWORD oldProtect;
-        oPresent = reinterpret_cast<PresentFn>(vtable[17]);
-        VirtualProtect(&vtable[17], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[17] = reinterpret_cast<void*>(&hkPresent);
-        VirtualProtect(&vtable[17], sizeof(void*), oldProtect, &oldProtect);
-        // printf_s("[XNFS] ? hkPresent installed\n");
-    }
-
-    if (!oEndScene)
-    {
-        DWORD oldProtect;
-        oEndScene = reinterpret_cast<EndScene_t>(vtable[42]);
-        VirtualProtect(&vtable[42], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[42] = reinterpret_cast<void*>(&hkEndScene);
-        VirtualProtect(&vtable[42], sizeof(void*), oldProtect, &oldProtect);
-        printf_s("[XNFS] ? hkEndScene installed via HookedPresent\n");
-    }
-
-    if (!g_RenderTargetManager.oSetRenderTarget)
-    {
-        DWORD oldProtect;
-        g_RenderTargetManager.oSetRenderTarget =
-            reinterpret_cast<RenderTargetManager::SetRenderTarget_t>(vtable[37]);
-        VirtualProtect(&vtable[37], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[37] = reinterpret_cast<void*>(&hkSetRenderTarget);
-        VirtualProtect(&vtable[37], sizeof(void*), oldProtect, &oldProtect);
-        // printf_s("[XNFS] ? hkSetRenderTarget installed via HookedPresent\n");
-    }
-
-    if (!g_RenderTargetManager.oSetTransform)
-    {
-        DWORD oldProtect;
-        g_RenderTargetManager.oSetTransform =
-            reinterpret_cast<RenderTargetManager::SetTransform_t>(vtable[44]);
-        VirtualProtect(&vtable[44], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        vtable[44] = reinterpret_cast<void*>(&hkSetTransform);
-        VirtualProtect(&vtable[44], sizeof(void*), oldProtect, &oldProtect);
-        // printf_s("[XNFS] ? hkSetTransform installed via HookedPresent\n");
-    }
-
     return RealPresent(device, src, dest, hwnd, dirty);
 }
 
@@ -2894,24 +2851,11 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* device)
     if (!g_Device) 
         SetGameDevice(device);
 
-    // Safe per-frame maintenance point (works even when ShaderLoader is installed).
-    DetectShaderLoaderLate();
+    // Keep EndScene extremely lightweight. EndScene runs at full framerate and is a common integration point
+    // for other mods; heavy work here tanks FPS and increases crash risk under DXVK.
+    //
+    // Motion blur work happens inside the engine blur pass hook (XNFS_Sub6D3B80_Hook), not here.
     EnsureDeviceVtableHooks(device);
-
-    // Keep the vanilla blur dispatch reaching sub_6DBB20 so our callsite hooks (0x006DBE8B/0x006DBEB0) run.
-    EnsureDoMotionBlurDispatchEnabled();
-
-    // Drive motion amount/vector from the game camera/view data (preferred) and/or fallback hooks.
-    UpdateMotionBlurFromEView();
-
-    // Generate our blur history into g_CurrentBlurTex every frame (independent of vanilla blur dispatch).
-    MotionBlurPass::CustomMotionBlurHook();
-
-    // With ShaderLoader, effect pointers/handles can swap at runtime. Rebind our samplers/params once per frame.
-    RebindVisualTreatmentIfChanged();
-
-    // Diagnostics: confirm something isn't disabling DoMotionBlur dispatch behind our back.
-    LogDoMotionBlurDispatchStateOccasionally();
 
     // Control vanilla DoMotionBlur toggle per-frame:
     // - When our override is active, disable vanilla to avoid fullscreen blur stacking.
@@ -2976,7 +2920,7 @@ DWORD WINAPI DeferredHookThread(LPVOID)
     if (!vtable)
         return E_FAIL;
 
-    // Hook Reset
+    // Hook Reset only. Other hooks are installed via safer callsite/vtable paths to avoid shader reload crashes.
     g_RenderTargetManager.oReset = (Reset_t)vtable[16];
     DWORD oldProtect;
     VirtualProtect(&vtable[16], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
@@ -2987,6 +2931,11 @@ DWORD WINAPI DeferredHookThread(LPVOID)
     // No D3DX hooks (ShaderLoader compatibility).
     return 0;
 }
+
+// Disable heavy EndScene work by default (perf + stability). Flip to 1 only for targeted debugging.
+#ifndef XNFS_ENABLE_HEAVY_ENDSCENE
+#define XNFS_ENABLE_HEAVY_ENDSCENE 0
+#endif
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {

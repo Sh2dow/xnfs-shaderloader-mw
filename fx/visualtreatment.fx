@@ -69,6 +69,19 @@ sampler2D VIGNETTETEX_SAMPLER = sampler_state
     MAGFILTER = LINEAR;
 };
 
+// Optional extra blur mask (BlurMask.png) like MW360Tweaks.
+// When present, it should reduce blur on cars/center and prevent "tight blur on everything".
+shared texture MotionBlurMask : MotionBlurMask;
+sampler2D MotionBlurMask_SAMPLER = sampler_state
+{
+    ASSIGN_TEXTURE(MotionBlurMask)
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+    MIPFILTER = NONE;
+    MINFILTER = LINEAR;
+    MAGFILTER = LINEAR;
+};
+
 shared texture MISCMAP3_TEXTURE : SPLINE;
 sampler2D MISCMAP3_SAMPLER = sampler_state // BLOOM_SAMPLER
 {
@@ -180,6 +193,10 @@ float4 PS_VisualTreatment(float2 uv : TEXCOORD) : COLOR
     float motionBlurMask = saturate(uve.x) * blurDepth * XNFS_MotionBlurAmount;
     float radialBlurMask = uve.w * XNFS_MotionBlurAmount;
     float blurAmount = saturate(motionBlurMask + radialBlurMask);
+    // Apply optional user-provided mask (BlurMask.png). Accept both A and R.
+    float4 mbm = tex2D(MotionBlurMask_SAMPLER, uv);
+    float userMask = saturate(max(mbm.r, mbm.a));
+    blurAmount *= userMask;
     outRgb = lerp(outRgb, blurSample.rgb, blurAmount);
 
     return float4(outRgb, 1.0);
@@ -207,7 +224,7 @@ technique vt
 }
 
 
-technique visualtreatment_branching <int shader = 1;>
+technique visualtreatment_branching
 {
     pass p0s
     {

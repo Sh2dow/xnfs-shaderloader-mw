@@ -5,6 +5,10 @@ class MotionBlurPass
 {
 public:
     static void __cdecl CustomMotionBlurHook();
+    // Debug controls are driven externally (dllmain.cpp) so we can show debug views without
+    // forcing a fullscreen composite every frame.
+    static void SetDebugMode(int mode);     // 0..7
+    static void SetForceTint(bool enabled);
     static void __cdecl CompositeToSurface(
         IDirect3DDevice9* device,
         IDirect3DBaseTexture9* sceneTex,

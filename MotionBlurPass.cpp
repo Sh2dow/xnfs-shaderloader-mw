@@ -647,6 +647,22 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
     }
 }
 
+// -------------------- Debug Control --------------------
+int g_XnfsMotionBlurDbgMode = 0;
+bool g_XnfsMotionBlurForceTint = false;
+
+void MotionBlurPass::SetDebugMode(int mode)
+{
+    if (mode < 0) mode = 0;
+    if (mode > 7) mode = 7;
+    g_XnfsMotionBlurDbgMode = mode;
+}
+
+void MotionBlurPass::SetForceTint(bool enabled)
+{
+    g_XnfsMotionBlurForceTint = enabled;
+}
+
 void __cdecl MotionBlurPass::CompositeToSurface(
     IDirect3DDevice9* device,
     IDirect3DBaseTexture9* sceneTex,
@@ -714,7 +730,8 @@ void __cdecl MotionBlurPass::CompositeToSurface(
         : g_RenderTargetManager.g_MotionBlurMaskTex;
     if (hMask) fx->SetTexture(hMask, maskTex);
 
-    // Debug cycle (F9): (F8 is reserved in user's setup)
+    // Debug is driven externally (dllmain.cpp). This function must not poll keys directly,
+    // otherwise our "only draw debug when requested" gating breaks (missed edges, stuck modes).
     // 0: normal
     // 1: solid tint (proves our pass is visible)
     // 2: visualize abs(curr-prev) (proves history timing)
@@ -723,18 +740,12 @@ void __cdecl MotionBlurPass::CompositeToSurface(
     // 5: visualize MOTIONBLUR_MASK_TEXTURE (UVESVIGNETTE/BlurMask)
     // 6: visualize blurred texture (MOTIONBLUR_TEXTURE)
     // 7: visualize curr texture (DIFFUSEMAP_TEXTURE)
-    static int s_dbgMode = 0;
-    static SHORT s_prevKey = 0;
-    const SHORT curKey = GetAsyncKeyState(VK_F9);
-    if ((curKey & 0x8000) && !(s_prevKey & 0x8000))
-        s_dbgMode = (s_dbgMode + 1) % 8;
-    s_prevKey = curKey;
-
-    // Force-tint while holding F10 to prove our composite draw is actually visible.
-    // IMPORTANT: do not mutate s_dbgMode permanently (otherwise it "sticks" magenta).
-    const bool forceTint = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-
-    const int effectiveDbgMode = forceTint ? 1 : s_dbgMode;
+    extern int g_XnfsMotionBlurDbgMode;
+    extern bool g_XnfsMotionBlurForceTint;
+    int dbgMode = g_XnfsMotionBlurDbgMode;
+    if (dbgMode < 0) dbgMode = 0;
+    if (dbgMode > 7) dbgMode = 7;
+    const int effectiveDbgMode = g_XnfsMotionBlurForceTint ? 1 : dbgMode;
     const char* tech = "composite";
     if (effectiveDbgMode == 1) tech = "tint";
     else if (effectiveDbgMode == 2) tech = "dbg_diff";
@@ -745,7 +756,13 @@ void __cdecl MotionBlurPass::CompositeToSurface(
     else if (effectiveDbgMode == 7) tech = "dbg_curr";
     const char* const techs[] = {tech};
     if (!EffectManager::TrySetTechnique(fx, techs, sizeof(techs) / sizeof(techs[0])))
-        goto cleanup;
+    {
+        // If the technique lookup fails (e.g. effect got hot-reloaded or is in a bad state),
+        // fall back to a deterministic visible output so debug doesn't look "stuck".
+        const char* const fallbackTechs[] = {"tint"};
+        if (!EffectManager::TrySetTechnique(fx, fallbackTechs, sizeof(fallbackTechs) / sizeof(fallbackTechs[0])))
+            goto cleanup;
+    }
 
     // No periodic logging here: this code runs at gameplay framerate; logging tanks FPS under DXVK.
 
