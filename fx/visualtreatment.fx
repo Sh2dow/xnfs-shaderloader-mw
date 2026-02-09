@@ -7,7 +7,6 @@ float VisualEffectBrightness;
 float VisualEffectRadialBlur;
 float VisualEffectVignette = {1};
 float RadialBlurOffset = {0.1};
-float exposure : Exposure;
 float4 ColourBloomTint = {0.517, 0.8, 0.9, 1};
 float4 Desaturation;
 float4 Desaturation_0;
@@ -51,6 +50,20 @@ sampler2D MISCMAP2_SAMPLER = sampler_state
     ASSIGN_TEXTURE(MISCMAP2_TEXTURE)
     AddressU = CLAMP;
     AddressV = WRAP; // Use mirror for split screen so the vignette works
+    MIPFILTER = NONE;
+    MINFILTER = LINEAR;
+    MAGFILTER = LINEAR;
+};
+
+// Game-side vignette mask texture (UVESVIGNETTE). The engine loads this by name and binds it to a parameter
+// typically called VIGNETTETEX in the original shader setup. This is the correct mask for radial/motion blur
+// falloff; do not approximate it with GAINMAP (often near-white) or you'll get fullscreen haze.
+shared texture VIGNETTETEX : VIGNETTETEX;
+sampler2D VIGNETTETEX_SAMPLER = sampler_state
+{
+    ASSIGN_TEXTURE(VIGNETTETEX)
+    AddressU = CLAMP;
+    AddressV = CLAMP;
     MIPFILTER = NONE;
     MINFILTER = LINEAR;
     MAGFILTER = LINEAR;
@@ -117,56 +130,6 @@ VtoP vertex_shader_passthru(VS_INPUT IN)
     return o;
 }
 
-struct VS_INPUT_MOTIONBLUR
-{
-    float4 position : POSITION;
-    float4 tex0 : TEXCOORD0;
-    float4 tex1 : TEXCOORD1;
-    float4 tex2 : TEXCOORD2;
-    float4 tex3 : TEXCOORD3;
-    float4 tex4 : TEXCOORD4;
-    float4 tex5 : TEXCOORD5;
-    float4 tex6 : TEXCOORD6;
-    float4 tex7 : TEXCOORD7;
-};
-
-struct VtoP_MOTIONBLUR
-{
-    float4 position : POSITION;
-    float2 tex[8] : TEXCOORD0;
-};
-
-VtoP_MOTIONBLUR VS_MotionBlur(const VS_INPUT_MOTIONBLUR IN)
-{
-    VtoP_MOTIONBLUR OUT;
-    OUT.position = IN.position;
-    OUT.tex[0] = IN.tex0.xy;
-    OUT.tex[1] = IN.tex1.xy;
-    OUT.tex[2] = IN.tex2.xy;
-    OUT.tex[3] = IN.tex3.xy;
-    OUT.tex[4] = IN.tex4.xy;
-    OUT.tex[5] = IN.tex5.xy;
-    OUT.tex[6] = IN.tex6.xy;
-    OUT.tex[7] = IN.tex7.xy;
-    return OUT;
-}
-
-float4 PS_MotionBlur(float2 uv : TEXCOORD0) : COLOR
-{
-    float2 stepUV = XNFS_BlurDir * XNFS_BlurScale * XNFS_TexelSize;
-
-    float4 sum = 0;
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV * -3);
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV * -2);
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV * -1);
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv);
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV *  1);
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV *  2);
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + stepUV *  3);
-
-    return sum / 7.0;
-}
-
 float4 PS_VisualTreatment(float2 uv : TEXCOORD) : COLOR
 {
     // MISCMAP1 is the packed control/source in vanilla
@@ -198,23 +161,24 @@ float4 PS_VisualTreatment(float2 uv : TEXCOORD) : COLOR
 
     float3 outRgb = desat * blackBloom + scene * (ColourBloomTint.rgb * colourBloom);
 
+    // ✅ vanilla vignette add (from misc1.r, not gain.r)
+    outRgb += vignetteMask * VisualEffectVignette;
+
     // brightness
     outRgb *= VisualEffectBrightness;
 
     // ✅ vanilla final multiplier comes from gain.b (temp0.z)
     outRgb *= gain.b;
 
-    // Exposure from CPU
-    outRgb *= exposure;
-
     // Temporal blur blend (prev-frame buffer)
     float4 blurSample = tex2D(MOTIONBLUR_SAMPLER, uv);
-    float4 vignette = tex2D(MISCMAP2_SAMPLER, uv);
+    // UVESVIGNETTE provides the intended radial/motion blur falloff mask.
+    float4 uve = tex2D(VIGNETTETEX_SAMPLER, uv);
     float depth = tex2D(HEIGHTMAP_SAMPLER, uv).x;
     float zDist = (1 / (1 - depth));
     float blurDepth = saturate(-zDist / 300 + 1.2);
-    float motionBlurMask = saturate(vignette.x) * blurDepth * XNFS_MotionBlurAmount;
-    float radialBlurMask = vignette.w * XNFS_MotionBlurAmount;
+    float motionBlurMask = saturate(uve.x) * blurDepth * XNFS_MotionBlurAmount;
+    float radialBlurMask = uve.w * XNFS_MotionBlurAmount;
     float blurAmount = saturate(motionBlurMask + radialBlurMask);
     outRgb = lerp(outRgb, blurSample.rgb, blurAmount);
 
@@ -231,9 +195,10 @@ float4 PS_VisualTreatment(float2 uv : TEXCOORD) : COLOR
     ZFunc = 4;               \
     CullMode = 1;
 
-technique vt <int shader = 3;>
+
+technique vt
 {
-    pass p1
+    pass p0
     {
         COMMON_VT_PASS_STATE
         VertexShader = compile vs_1_1 vertex_shader_passthru();
@@ -241,28 +206,13 @@ technique vt <int shader = 3;>
     }
 }
 
+
 technique visualtreatment_branching <int shader = 1;>
 {
-    pass p1
+    pass p0s
     {
         COMMON_VT_PASS_STATE
         VertexShader = compile vs_1_1 vertex_shader_passthru();
-        PixelShader = compile ps_2_0 PS_VisualTreatment_Low1();
-    }
-    pass p2
-    {
-        COMMON_VT_PASS_STATE
-        VertexShader = compile vs_1_1 vertex_shader_passthru();
-        PixelShader = compile ps_2_0 PS_VisualTreatment_Low2();
-    }
-}
-
-technique motionblur <int shader = 1;>
-{
-    pass p0
-    {
-        COMMON_VT_PASS_STATE
-        VertexShader = compile vs_1_1 VS_MotionBlur();
-        PixelShader = compile ps_2_0 PS_MotionBlur();
+        PixelShader = compile ps_2_0 PS_VisualTreatment();
     }
 }

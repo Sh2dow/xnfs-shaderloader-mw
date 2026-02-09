@@ -99,7 +99,7 @@ namespace ExposureStandalone
 
         m_readbackSurface->UnlockRect();
 
-        const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        const float lum = 0.6125 * r + 0.5154 * g + 0.0721 * b;
         m_state.currentFrameLuminance = ClampMin(lum, m_cfg.minAdaptedLuminance);
         return true;
     }

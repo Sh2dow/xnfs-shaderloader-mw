@@ -16,9 +16,9 @@ namespace ExposureStandalone
 
     struct ExposureState
     {
-        float currentFrameLuminance = 1.0f;
-        float adaptedLuminance = 0.5f;
-        float exposure = 1.0f;
+        float currentFrameLuminance = 0.75f;
+        float adaptedLuminance = 0.75f;
+        float exposure = 0.75f;
         float luminanceTimer = 0.0f;
         bool forceSnap = false;
     };

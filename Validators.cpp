@@ -2,7 +2,7 @@
 #include "Hooks.h"
 #include <unordered_map>
 #include <windows.h>
-#define printf_s(...) asi_log::Log(__VA_ARGS__)
+// Use the shared logging macro from Hooks.h (keeps build consistent).
 
 inline bool IsValidCodePtr(void* ptr)
 {

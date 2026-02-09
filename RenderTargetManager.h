@@ -2,6 +2,7 @@
 #include "Hooks.h"
 
 #define SAFE_RELEASE(p) if (p) { p->Release(); p = nullptr; }
+#include <string>
 #include <unordered_map>
 
 
@@ -15,6 +16,9 @@ public:
     int g_ApplyGraphicsTriggerDelay = 0;
 
     uint32_t g_LastSceneFullFrame = 0;
+    // Frame index when g_SceneColorTex was last updated from g_LastSceneFullSurface.
+    // Used to avoid sampling stale/cleared scene captures (causes dark/blank output).
+    uint32_t g_SceneColorFrame = 0;
     
     std::unordered_map<std::string, LPD3DXEFFECT> g_ActiveEffects;
 
@@ -40,10 +44,24 @@ public:
     IDirect3DTexture9* g_ExposureTex = nullptr;
     IDirect3DTexture9* g_BloomLUTTex = nullptr;
     IDirect3DTexture9* g_DepthTex = nullptr;
+    // Captured from the live VisualTreatment effect (HEIGHTMAP/DOF). Used for depth-masked blur.
+    IDirect3DTexture9* g_VTDepthTex = nullptr;
+    // Captured from the live VisualTreatment effect (MISCMAP2 / GAINMAP / UVESVIGNETTE).
+    // Reused as a blur mask to fade blur near the lower center (existing game behavior).
+    IDirect3DTexture9* g_VTGainMapTex = nullptr;
+    // Optional blur mask (e.g. from MW360Tweaks BlurMask.png). Used to keep cars/center sharper.
+    IDirect3DTexture9* g_MotionBlurMaskTex = nullptr;
+    // INTZ depth texture used as both depth-stencil and shader-readable depth map (X360Stuff-style).
+    IDirect3DTexture9* g_IntzDepthTex = nullptr;
+    IDirect3DSurface9* g_IntzDepthSurface = nullptr;
     IDirect3DSurface9* g_BackBufferSurface = nullptr;
     IDirect3DSurface9* g_LastSceneSurface = nullptr;
     IDirect3DSurface9* g_LastSceneFullSurface = nullptr;
     IDirect3DTexture9* g_LastSceneFullTex = nullptr;
+
+    // Dedicated stable scene-color capture for our blur pipeline (copied from the chosen scene RT).
+    IDirect3DTexture9* g_SceneColorTex = nullptr;
+    IDirect3DSurface9* g_SceneColorSurface = nullptr;
 
     // scene copy (final backbuffer copy, optional)
     IDirect3DTexture9* g_SceneCopyTex     = nullptr;
@@ -106,6 +124,11 @@ public:
     SetRenderTarget_t oSetRenderTarget = nullptr;
     using SetTransform_t = HRESULT (WINAPI*)(LPDIRECT3DDEVICE9, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
     SetTransform_t oSetTransform = nullptr;
+    using SetDepthStencilSurface_t = HRESULT (WINAPI*)(LPDIRECT3DDEVICE9, IDirect3DSurface9*);
+    SetDepthStencilSurface_t oSetDepthStencilSurface = nullptr;
+
+    // Tracks the last depth-stencil surface the game attempted to set (for restoration).
+    IDirect3DSurface9* g_LastGameDepthSurface = nullptr;
 
     void OnDeviceLost();
 

@@ -24,9 +24,12 @@ void __cdecl MotionBlurPass::CustomMotionBlurHook()
     if (!device)
         return;
 
-    // Source for blur is FINAL image copy (post-VT)
-    IDirect3DTexture9* src = g_RenderTargetManager.g_SceneCopyTex;
+    // Source for blur must be the full scene color (pre-VT), not the post-VT copy.
+    // Post-VT can contain UI/front-end overlays and causes "garbage" blur in tunnels.
+    IDirect3DTexture9* src = g_RenderTargetManager.g_LastSceneFullTex;
     if (!src)
+        src = g_RenderTargetManager.g_SceneCopyTex;
+    if (!src || !g_RenderTargetManager.g_LastSceneFullTex)
         return;
 
     // Pick ping-pong destination (history)
@@ -60,7 +63,26 @@ void __cdecl MotionBlurPass::CustomMotionBlurHook()
             return;
     }
 
-    // Run blur: src(post-VT) -> dst(history)
+    // Always keep history initialized to a valid scene copy. This prevents undefined RT sampling
+    // and allows VT to bind PREV/MOTIONBLUR even when blur amount is zero.
+    if (!g_MotionBlurHistoryReady || g_MotionBlurAmount <= 0.0f)
+    {
+        IDirect3DSurface9* srcSurf = nullptr;
+        if (SUCCEEDED(src->GetSurfaceLevel(0, &srcSurf)) && srcSurf)
+        {
+            device->StretchRect(srcSurf, nullptr, dstSurf, nullptr, D3DTEXF_NONE);
+            srcSurf->Release();
+        }
+        g_RenderTargetManager.g_CurrentBlurTex     = dstTex;
+        g_RenderTargetManager.g_CurrentBlurSurface = dstSurf;
+        g_MotionBlurHistoryReady = true;
+        g_RenderTargetManager.g_UseTexA = !g_RenderTargetManager.g_UseTexA;
+        g_RenderTargetManager.g_PendingVTRebind = true;
+        g_CustomMotionBlurRanThisFrame = true;
+        return;
+    }
+
+    // Run blur: src(pre-VT full scene) -> dst(history)
     RenderBlurPass(device, src, dstTex, dstSurf);
 
     // Publish history for VT sampling (next frame / same frame if timing allows)
@@ -71,7 +93,6 @@ void __cdecl MotionBlurPass::CustomMotionBlurHook()
     // flip for next frame
     g_RenderTargetManager.g_UseTexA = !g_RenderTargetManager.g_UseTexA;
 
-    g_MotionBlurAmount = 0.20f;
     g_RenderTargetManager.g_PendingVTRebind = true;
 
     g_CustomMotionBlurRanThisFrame = true;
@@ -183,12 +204,13 @@ void __cdecl MotionBlurPass::RenderBlurPass(
     IDirect3DBaseTexture9* oldDiffuse = nullptr;
     if (hDiffuse)
         fx->GetTexture(hDiffuse, &oldDiffuse);
-    printf_s("[Blur] hDiffuse=%p\n", hDiffuse);
+    // Quiet by default (logging here tanks FPS).
 
     if (hDiffuse)
         fx->SetTexture(hDiffuse, srcTex);
     if (hDepth)
-        fx->SetTexture(hDepth, g_RenderTargetManager.g_DepthTex);
+        fx->SetTexture(hDepth, g_RenderTargetManager.g_VTDepthTex ? g_RenderTargetManager.g_VTDepthTex
+                                                                  : g_RenderTargetManager.g_DepthTex);
     if (hMotionVec)
     {
         const float mv[2] = {g_MotionVec[0], g_MotionVec[1]};
@@ -208,14 +230,18 @@ void __cdecl MotionBlurPass::RenderBlurPass(
                                            blurScale / (float)sd.Height, 0.0f, 0.0f));
     }
     D3DXHANDLE hBlend = fx->GetParameterByName(nullptr, "MotionBlurBlend");
+    // MotionBlurScale was previously used to multiplex debug modes inside a single ps_2_0 shader,
+    // but that easily exceeds ps_2_0 temp registers. We now select dedicated debug techniques instead.
     if (hBlend)
         fx->SetFloat(hBlend, g_MotionBlurAmount);
 
     {
-        const char* const techs[] = {"blur"};
+        // Only use the explicit technique name. If this fails, we want a hard failure
+        // (so "disabling motionblur in the .fx" actually shows up during testing).
+        const char* const techs[] = {"motionblur"};
         if (!EffectManager::TrySetTechnique(fx, techs, sizeof(techs) / sizeof(techs[0])))
         {
-            printf_s("[Blur] TrySetTechnique failed\n");
+            printf_s("[Blur] ❌ Technique 'motionblur' missing/invalid in custom FX\n");
             goto cleanup;
         }
     }
@@ -233,7 +259,7 @@ void __cdecl MotionBlurPass::RenderBlurPass(
     }
     else
     {
-        printf_s("[Blur] passes=%u\n", passes);
+        // Quiet by default (logging here tanks FPS).
         for (UINT i = 0; i < passes; ++i)
         {
             if (SUCCEEDED(fx->BeginPass(i)))
@@ -304,7 +330,7 @@ cleanup:
     SAFE_RELEASE(oldRT);
 
     g_RenderTargetManager.g_CurrentBlurTex = dstTex;
-    g_RenderTargetManager.g_CurrentBlurSurface = g_RenderTargetManager.g_MotionBlurSurfaceA;
+    g_RenderTargetManager.g_CurrentBlurSurface = dstSurface;
 }
 
 void __cdecl MotionBlurPass::RenderBlurOverride(
@@ -314,6 +340,13 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
     IDirect3DSurface9* dstSurface)
 {
     if (!device || !src0)
+        return;
+
+    // Defensive: engine can hand us stale pointers during reload/transitions.
+    // MSVC debug fill (0xEEEEEEEE) indicates freed/uninitialized memory.
+    if (IsBadReadPtr(src0, sizeof(void*)) || IsBadReadPtr(*(void**)src0, sizeof(void*)))
+        return;
+    if (dstSurface && (IsBadReadPtr(dstSurface, sizeof(void*)) || IsBadReadPtr(*(void**)dstSurface, sizeof(void*))))
         return;
 
     if (!EffectManager::EnsureCustomBlurEffect(device))
@@ -326,27 +359,6 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
     // Preserve device state for the engine pipeline.
     ScopedStateBlock stateBlock(device);
 
-    if (g_MotionBlurAmount <= 0.0f)
-    {
-        if (dstSurface)
-        {
-            IDirect3DTexture9* srcTex = nullptr;
-            IDirect3DSurface9* srcSurf = nullptr;
-            if (src0 && SUCCEEDED(src0->QueryInterface(__uuidof(IDirect3DTexture9),
-                                                       reinterpret_cast<void**>(&srcTex))) &&
-                srcTex && SUCCEEDED(srcTex->GetSurfaceLevel(0, &srcSurf)))
-            {
-                device->StretchRect(srcSurf, nullptr, dstSurface, nullptr, D3DTEXF_NONE);
-            }
-            SAFE_RELEASE(srcSurf);
-            SAFE_RELEASE(srcTex);
-        }
-        g_MotionBlurHistoryReady = false;
-        g_RenderTargetManager.g_CurrentBlurTex = nullptr;
-        g_RenderTargetManager.g_CurrentBlurSurface = nullptr;
-        return;
-    }
-
     IDirect3DSurface9* targetSurf = g_RenderTargetManager.g_UseTexA
         ? g_RenderTargetManager.g_BlurHistorySurfA
         : g_RenderTargetManager.g_BlurHistorySurfB;
@@ -355,6 +367,55 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
         : g_RenderTargetManager.g_BlurHistoryTexB;
     if (!targetSurf || !targetTex)
         return;
+
+    if (IsBadReadPtr(targetSurf, sizeof(void*)) || IsBadReadPtr(*(void**)targetSurf, sizeof(void*)))
+        return;
+    if (IsBadReadPtr(targetTex, sizeof(void*)) || IsBadReadPtr(*(void**)targetTex, sizeof(void*)))
+        return;
+
+    // When amount is zero, still keep history initialized and stable (copy current scene).
+    // This prevents vanilla or uninitialized data from showing up as "blur garbage".
+    if (g_MotionBlurAmount <= 0.0f)
+    {
+        IDirect3DTexture9* srcTex = nullptr;
+        IDirect3DSurface9* srcSurf = nullptr;
+        if (!IsBadReadPtr(src0, sizeof(void*)) &&
+            SUCCEEDED(src0->QueryInterface(__uuidof(IDirect3DTexture9),
+                                           reinterpret_cast<void**>(&srcTex))) &&
+            srcTex && SUCCEEDED(srcTex->GetSurfaceLevel(0, &srcSurf)) && srcSurf)
+        {
+            device->StretchRect(srcSurf, nullptr, targetSurf, nullptr, D3DTEXF_NONE);
+        }
+        SAFE_RELEASE(srcSurf);
+        SAFE_RELEASE(srcTex);
+
+        g_RenderTargetManager.g_CurrentBlurTex = targetTex;
+        g_RenderTargetManager.g_CurrentBlurSurface = targetSurf;
+        g_MotionBlurHistoryReady = true;
+        g_RenderTargetManager.g_UseTexA = !g_RenderTargetManager.g_UseTexA;
+        g_RenderTargetManager.g_PendingVTRebind = true;
+        return;
+    }
+
+    // First valid blur frame: seed the history target with the current scene so we never sample
+    // undefined RT memory (this is the source of "dark fragments"/frontend ghosts).
+    if (!g_MotionBlurHistoryReady || !src1)
+    {
+        IDirect3DTexture9* srcTex = nullptr;
+        IDirect3DSurface9* srcSurf = nullptr;
+        if (SUCCEEDED(src0->QueryInterface(__uuidof(IDirect3DTexture9),
+                                           reinterpret_cast<void**>(&srcTex))) &&
+            srcTex && SUCCEEDED(srcTex->GetSurfaceLevel(0, &srcSurf)) && srcSurf)
+        {
+            device->StretchRect(srcSurf, nullptr, targetSurf, nullptr, D3DTEXF_NONE);
+        }
+        SAFE_RELEASE(srcSurf);
+        SAFE_RELEASE(srcTex);
+
+        g_RenderTargetManager.g_CurrentBlurTex = targetTex;
+        g_RenderTargetManager.g_CurrentBlurSurface = targetSurf;
+        g_MotionBlurHistoryReady = true;
+    }
 
     D3DSURFACE_DESC sd{};
     targetSurf->GetDesc(&sd);
@@ -381,11 +442,12 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
     if (hDiffuse)
         fx->SetTexture(hDiffuse, src0);
     if (hDepth)
-        fx->SetTexture(hDepth, g_RenderTargetManager.g_DepthTex);
+        fx->SetTexture(hDepth, g_RenderTargetManager.g_VTDepthTex ? g_RenderTargetManager.g_VTDepthTex
+                                                                  : g_RenderTargetManager.g_DepthTex);
 
     D3DXHANDLE hPrev = fx->GetParameterByName(nullptr, "MOTIONBLUR_TEXTURE");
-    if (hPrev && src1)
-        fx->SetTexture(hPrev, src1);
+    if (hPrev)
+        fx->SetTexture(hPrev, src1 ? src1 : nullptr);
 
     D3DXHANDLE hMotionVec = fx->GetParameterByName(nullptr, "MotionVec");
     if (hMotionVec)
@@ -415,7 +477,9 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
                                            blurScale / (float)sd.Height, 0.0f, 0.0f));
     }
 
-    const char* const techs[] = {"blur"};
+    // Support both our external file (`fx/motionblur.fx` uses technique `motionblur`)
+    // and the embedded fallback (`EffectManager.cpp` uses technique `blur`).
+    const char* const techs[] = {"motionblur", "blur"};
     if (!EffectManager::TrySetTechnique(fx, techs, sizeof(techs) / sizeof(techs[0])))
         return;
 
@@ -438,9 +502,25 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
                 const float uBase[4] = {0.0f, 1.0f, 0.0f, 1.0f};
                 const float vBase[4] = {0.0f, 0.0f, 1.0f, 1.0f};
                 const float blurScales[7] = {0.01f, 0.02f, 0.03f, 0.04f, 0.05f, 0.06f, 0.07f};
-                const float motionU = g_MotionVec[0];
-                const float motionV = g_MotionVec[1];
-                const float motionZ = g_MotionVec[2];
+
+                float motionU = g_MotionVec[0];
+                float motionV = g_MotionVec[1];
+                float motionZ = g_MotionVec[2];
+                const bool hasMotion = (std::fabs(motionU) + std::fabs(motionV) >= 1e-4f);
+                // If we don't have real motion vectors, do NOT blur. Any fake fallback direction
+                // creates a constant fullscreen haze (exact symptom you're seeing).
+                if (hasMotion)
+                {
+                    const float mvScale = max(0.0f, min(1.0f, g_MotionBlurAmount));
+                    motionU *= mvScale;
+                    motionV *= mvScale;
+                }
+                else
+                {
+                    motionU = 0.0f;
+                    motionV = 0.0f;
+                    motionZ = 0.0f;
+                }
 
                 for (int vi = 0; vi < 4; ++vi)
                 {
@@ -457,10 +537,18 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
                     float baseV = v0 - 0.5f;
                     for (int si = 0; si < 7; ++si)
                     {
-                        const float scale = blurScales[si];
-                        const float blurFactor = 1.0f - motionZ * scale;
-                        const float offsetU = baseU * blurFactor + motionU * scale + 0.5f;
-                        const float offsetV = baseV * blurFactor + motionV * scale + 0.5f;
+                        float offsetU = u0;
+                        float offsetV = v0;
+                        if (hasMotion)
+                        {
+                            const float scale = blurScales[si];
+                            const float blurFactor = 1.0f - motionZ * scale;
+                            offsetU = baseU * blurFactor + motionU * scale + 0.5f;
+                            offsetV = baseV * blurFactor + motionV * scale + 0.5f;
+                            // Avoid sampling outside; clamp prevents weird wrap artifacts under DXVK.
+                            offsetU = max(0.0f, min(1.0f, offsetU));
+                            offsetV = max(0.0f, min(1.0f, offsetV));
+                        }
                         uvs[si][0] = offsetU;
                         uvs[si][1] = offsetV;
                         uvs[si][2] = 0.0f;
@@ -557,4 +645,156 @@ void __cdecl MotionBlurPass::RenderBlurOverride(
             }
         }
     }
+}
+
+void __cdecl MotionBlurPass::CompositeToSurface(
+    IDirect3DDevice9* device,
+    IDirect3DBaseTexture9* sceneTex,
+    IDirect3DBaseTexture9* historyTex,
+    IDirect3DSurface9* dstSurface,
+    float amount)
+{
+    if (!device || !sceneTex || !historyTex || !dstSurface)
+        return;
+
+    if (!EffectManager::EnsureCustomBlurEffect(device))
+        return;
+    ID3DXEffect* fx = g_RenderTargetManager.g_CustomBlurEffect;
+    if (!fx)
+        return;
+
+    ScopedStateBlock stateBlock(device);
+
+    // Set RT
+    IDirect3DSurface9* oldRT = nullptr;
+    if (FAILED(device->GetRenderTarget(0, &oldRT)) || !oldRT)
+        return;
+
+    if (FAILED(device->SetRenderTarget(0, dstSurface)))
+    {
+        SAFE_RELEASE(oldRT);
+        return;
+    }
+
+    D3DSURFACE_DESC sd{};
+    dstSurface->GetDesc(&sd);
+    D3DVIEWPORT9 vp{};
+    vp.X = 0;
+    vp.Y = 0;
+    vp.Width = sd.Width;
+    vp.Height = sd.Height;
+    vp.MinZ = 0.0f;
+    vp.MaxZ = 1.0f;
+    device->SetViewport(&vp);
+
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+
+    // Params
+    D3DXHANDLE hDiffuse = fx->GetParameterByName(nullptr, "DIFFUSEMAP_TEXTURE");
+    D3DXHANDLE hPrev = fx->GetParameterByName(nullptr, "MOTIONBLUR_TEXTURE");
+    D3DXHANDLE hBlend = fx->GetParameterByName(nullptr, "MotionBlurBlend");
+    D3DXHANDLE hScale = fx->GetParameterByName(nullptr, "MotionBlurScale");
+    D3DXHANDLE hDepth = fx->GetParameterByName(nullptr, "DEPTHBUFFER_TEXTURE");
+    D3DXHANDLE hMask = fx->GetParameterByName(nullptr, "MOTIONBLUR_MASK_TEXTURE");
+    if (!hMask) hMask = fx->GetParameterByName(nullptr, "MotionBlurMask");
+
+    if (hDiffuse) fx->SetTexture(hDiffuse, sceneTex);
+    if (hPrev) fx->SetTexture(hPrev, historyTex);
+    if (hBlend) fx->SetFloat(hBlend, amount);
+    // (MotionBlurScale intentionally unused)
+    if (hDepth) fx->SetTexture(hDepth, g_RenderTargetManager.g_VTDepthTex ? g_RenderTargetManager.g_VTDepthTex
+                                                                          : g_RenderTargetManager.g_DepthTex);
+    // Prefer the game-provided VT gainmap/vignette (UVESVIGNETTE) as mask; fall back to BlurMask.png,
+    // and then to the default 1x1 white created in OnDeviceReset.
+    IDirect3DTexture9* maskTex = g_RenderTargetManager.g_VTGainMapTex
+        ? g_RenderTargetManager.g_VTGainMapTex
+        : g_RenderTargetManager.g_MotionBlurMaskTex;
+    if (hMask) fx->SetTexture(hMask, maskTex);
+
+    // Debug cycle (F9): (F8 is reserved in user's setup)
+    // 0: normal
+    // 1: solid tint (proves our pass is visible)
+    // 2: visualize abs(curr-prev) (proves history timing)
+    // 3: visualize history alpha (prev.a)
+    // 4: visualize DEPTHBUFFER_TEXTURE (if bound)
+    // 5: visualize MOTIONBLUR_MASK_TEXTURE (UVESVIGNETTE/BlurMask)
+    // 6: visualize blurred texture (MOTIONBLUR_TEXTURE)
+    // 7: visualize curr texture (DIFFUSEMAP_TEXTURE)
+    static int s_dbgMode = 0;
+    static SHORT s_prevKey = 0;
+    const SHORT curKey = GetAsyncKeyState(VK_F9);
+    if ((curKey & 0x8000) && !(s_prevKey & 0x8000))
+        s_dbgMode = (s_dbgMode + 1) % 8;
+    s_prevKey = curKey;
+
+    // Force-tint while holding F10 to prove our composite draw is actually visible.
+    // IMPORTANT: do not mutate s_dbgMode permanently (otherwise it "sticks" magenta).
+    const bool forceTint = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+
+    const int effectiveDbgMode = forceTint ? 1 : s_dbgMode;
+    const char* tech = "composite";
+    if (effectiveDbgMode == 1) tech = "tint";
+    else if (effectiveDbgMode == 2) tech = "dbg_diff";
+    else if (effectiveDbgMode == 3) tech = "dbg_alpha";
+    else if (effectiveDbgMode == 4) tech = "dbg_depth";
+    else if (effectiveDbgMode == 5) tech = "dbg_mask";
+    else if (effectiveDbgMode == 6) tech = "dbg_blur";
+    else if (effectiveDbgMode == 7) tech = "dbg_curr";
+    const char* const techs[] = {tech};
+    if (!EffectManager::TrySetTechnique(fx, techs, sizeof(techs) / sizeof(techs[0])))
+        goto cleanup;
+
+    // No periodic logging here: this code runs at gameplay framerate; logging tanks FPS under DXVK.
+
+    IDirect3DVertexDeclaration9* oldDecl = nullptr;
+    if (g_RenderTargetManager.g_ScreenQuadDecl)
+        device->GetVertexDeclaration(&oldDecl);
+    if (g_RenderTargetManager.g_ScreenQuadDecl)
+        device->SetVertexDeclaration(g_RenderTargetManager.g_ScreenQuadDecl);
+
+    UINT passes = 0;
+    if (SUCCEEDED(fx->Begin(&passes, 0)))
+    {
+        for (UINT i = 0; i < passes; ++i)
+        {
+            if (SUCCEEDED(fx->BeginPass(i)))
+            {
+                RenderTargetManager::QuadVertex8 v[4]{};
+                const float x[4] = {-1.0f, 1.0f, -1.0f, 1.0f};
+                const float y[4] = {1.0f, 1.0f, -1.0f, -1.0f};
+                const float u[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+                const float w[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+                for (int vi = 0; vi < 4; ++vi)
+                {
+                    v[vi].x = x[vi];
+                    v[vi].y = y[vi];
+                    v[vi].z = 0.0f;
+                    v[vi].rhw = 1.0f;
+                    const float uv4[4] = {u[vi], w[vi], 0.0f, 0.0f};
+                    memcpy(v[vi].t0, uv4, sizeof(uv4));
+                    memcpy(v[vi].t1, uv4, sizeof(uv4));
+                    memcpy(v[vi].t2, uv4, sizeof(uv4));
+                    memcpy(v[vi].t3, uv4, sizeof(uv4));
+                    memcpy(v[vi].t4, uv4, sizeof(uv4));
+                    memcpy(v[vi].t5, uv4, sizeof(uv4));
+                    memcpy(v[vi].t6, uv4, sizeof(uv4));
+                    memcpy(v[vi].t7, uv4, sizeof(uv4));
+                }
+                device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(RenderTargetManager::QuadVertex8));
+                fx->EndPass();
+            }
+        }
+        fx->End();
+    }
+
+    if (g_RenderTargetManager.g_ScreenQuadDecl)
+        device->SetVertexDeclaration(oldDecl);
+    SAFE_RELEASE(oldDecl);
+
+cleanup:
+    device->SetRenderTarget(0, oldRT);
+    SAFE_RELEASE(oldRT);
 }

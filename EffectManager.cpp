@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <windows.h>
 
 #include "Globals.h"
 
@@ -116,6 +117,51 @@ float4 ps_temporal(VS_OUT IN) : COLOR
     return lerp(curr, prev, MotionBlurBlend);
 }
 
+float4 ps_composite(VS_OUT IN) : COLOR
+{
+    float2 uv = IN.tex01.xy;
+    float4 curr = tex2D(DIFFUSEMAP_SAMPLER, uv);
+
+    // Our MOTIONBLUR_TEXTURE is a *directionally blurred version of the current frame*.
+    // Do NOT treat it as previous-frame history (temporal blend = global haze).
+    float4 blurred = tex2D(MOTIONBLUR_SAMPLER, uv);
+
+    // Debug modes (set from code via MotionBlurScale):
+    // - > 2.5: visualize depth texture (DEPTHBUFFER_SAMPLER) as grayscale
+    // - > 1.5: visualize abs(curr-blurred) as grayscale
+    // - > 0.5: visualize blurred.a (history alpha) as grayscale
+    if (MotionBlurScale > 2.5f)
+    {
+        float d = tex2D(DEPTHBUFFER_SAMPLER, uv).x;
+        d = saturate(d);
+        return float4(d, d, d, 1.0f);
+    }
+    if (MotionBlurScale > 1.5f)
+    {
+        float3 d = abs(curr.rgb - blurred.rgb);
+        float v = saturate(dot(d, float3(0.3333, 0.3333, 0.3333)) * 4.0f);
+        return float4(v, v, v, 1.0f);
+    }
+    if (MotionBlurScale > 0.5f)
+    {
+        float d = saturate(blurred.a);
+        return float4(d, d, d, 1.0f);
+    }
+
+    // Amount cap: keep it subtle.
+    float amt = saturate(MotionBlurBlend);
+    amt = min(amt * 0.65, 0.20);
+
+    // Edge mask (X360 vignette intent): blur mostly at edges.
+    float2 center = float2(0.5, 0.55);
+    float2 d = uv - center;
+    float r = length(d);
+    float edge = smoothstep(0.15, 0.55, r);
+    edge *= edge;
+
+    return lerp(curr, blurred, amt * edge);
+}
+
 float4 ps_tint(VS_OUT IN) : COLOR
 {
     return float4(1.0f, 0.0f, 1.0f, 1.0f);
@@ -148,6 +194,15 @@ technique temporal
     }
 }
 
+technique composite
+{
+    pass p0
+    {
+        VertexShader = compile vs_2_0 vs_main();
+        PixelShader = compile ps_2_0 ps_composite();
+    }
+}
+
 technique tint
 {
     pass p0
@@ -175,6 +230,98 @@ bool EffectManager::EnsureCustomBlurEffect(IDirect3DDevice9* device)
     if (!device) return false;
     if (g_RenderTargetManager.g_CustomBlurEffect) return true;
 
+    auto fileExists = [](const char* p) -> bool
+    {
+        if (!p || !*p) return false;
+        DWORD attr = GetFileAttributesA(p);
+        return (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+    };
+
+    // Prefer file-based FX so ShaderLoader hot-reload can replace the shader without us hooking D3DX.
+    // If missing or compile fails, fall back to the embedded string.
+    {
+        using D3DXCreateEffectFromFileAFn = HRESULT (WINAPI*)(
+            LPDIRECT3DDEVICE9,
+            LPCSTR,
+            const D3DXMACRO*,
+            LPD3DXINCLUDE,
+            DWORD,
+            LPD3DXEFFECTPOOL,
+            LPD3DXEFFECT*,
+            LPD3DXBUFFER*);
+
+        HMODULE d3dx = GetModuleHandleA("d3dx9_43.dll");
+        if (!d3dx)
+            d3dx = LoadLibraryA("d3dx9_43.dll");
+        if (d3dx)
+        {
+            auto createFromFile = reinterpret_cast<D3DXCreateEffectFromFileAFn>(
+                GetProcAddress(d3dx, "D3DXCreateEffectFromFileA"));
+            if (createFromFile)
+            {
+                // Prefer a shader next to our ASI (SCRIPTS folder) so edits actually take effect.
+                // Fallback to the game's fx\motionblur.fx.
+                char fxPathBuf[MAX_PATH]{};
+                const char* fxPath = nullptr;
+
+                if (g_RenderTargetManager.g_hModule)
+                {
+                    char modPath[MAX_PATH]{};
+                    if (GetModuleFileNameA(g_RenderTargetManager.g_hModule, modPath, MAX_PATH))
+                    {
+                        // strip filename
+                        for (int i = (int)strlen(modPath) - 1; i >= 0; --i)
+                        {
+                            if (modPath[i] == '\\' || modPath[i] == '/')
+                            {
+                                modPath[i] = '\0';
+                                break;
+                            }
+                        }
+                        // <moddir>\fx\motionblur.fx
+                        sprintf_s(fxPathBuf, "%s\\fx\\motionblur.fx", modPath);
+                        if (fileExists(fxPathBuf))
+                            fxPath = fxPathBuf;
+                    }
+                }
+                if (!fxPath && fileExists("fx\\motionblur.fx"))
+                    fxPath = "fx\\motionblur.fx";
+
+                static bool s_loggedFxPath = false;
+                if (!s_loggedFxPath)
+                {
+                    s_loggedFxPath = true;
+                    if (fxPath)
+                        printf_s("[XNFS] ? motionblur.fx selected: %s\n", fxPath);
+                    else
+                        printf_s("[XNFS] ? motionblur.fx not found (expected <ASI dir>\\fx\\motionblur.fx or fx\\motionblur.fx)\n");
+                }
+
+                if (fxPath && fileExists(fxPath))
+                {
+                    ID3DXBuffer* errors = nullptr;
+                    HRESULT hrFile = createFromFile(
+                        device, fxPath, nullptr, nullptr,
+                        D3DXSHADER_SKIPOPTIMIZATION, nullptr,
+                        &g_RenderTargetManager.g_CustomBlurEffect, &errors);
+                    if (SUCCEEDED(hrFile) && g_RenderTargetManager.g_CustomBlurEffect)
+                    {
+                        printf_s("[XNFS] ✅ Loaded custom blur FX from file: %s (%p)\n",
+                                 fxPath, g_RenderTargetManager.g_CustomBlurEffect);
+                        if (errors) errors->Release();
+                        return true;
+                    }
+                    if (errors)
+                    {
+                        const char* errText = (const char*)errors->GetBufferPointer();
+                        printf_s("[XNFS] ⚠️ motionblur.fx compile failed: %s\n", errText ? errText : "(null)");
+                        errors->Release();
+                    }
+                }
+            }
+        }
+    }
+
     ID3DXBuffer* errors = nullptr;
     HRESULT hr = D3DXCreateEffect(
         device,
@@ -191,7 +338,8 @@ bool EffectManager::EnsureCustomBlurEffect(IDirect3DDevice9* device)
     {
         if (errors)
         {
-            printf_s("[XNFS] ? Custom blur FX compile failed: %s\n", (const char*)errors->GetBufferPointer());
+            const char* errText = (const char*)errors->GetBufferPointer();
+            printf_s("[XNFS] ? Custom blur FX compile failed: %s\n", errText ? errText : "(null)");
             errors->Release();
         }
         else
